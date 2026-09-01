@@ -27,10 +27,5 @@ def generate_launch_description():
             package='solution_4to1mux',
             executable='manipulation_node',
             output='screen',
-        ),
-        Node(
-            package='solution_4to1mux',
-            executable='solution_coordinator',
-            output='screen',
-        ),
+        )
     ])

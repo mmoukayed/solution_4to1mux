@@ -25,6 +25,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'perception_node = solution_4to1mux.perception_node:main',
+            'navigation_node = solution_4to1mux.navigation_node:main',
+            'manipulation_node = solution_4to1mux.manipulation_node:main',
         ],
     },
 )

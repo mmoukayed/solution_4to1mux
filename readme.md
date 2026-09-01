@@ -1,11 +1,16 @@
-# Setting Up Solution
-in a regular shell, clone the repo into the `src` folder of the `erc_sim_2026` folder
+# ERC 4To1MUX Solution
+## Setting Up Solution
+In a regular shell, clone the repo into the `src` folder of the `erc_sim_2026` folder
 
-```git clone https://github.com/mmoukayed/solution_4to1mux.git```
+`
+git clone https://github.com/mmoukayed/solution_4to1mux.git
+`
 
-Then run 
+Then back in the main `erc_sim_2026` folder, run:
 ```
-../docker/attach.sh
+./docker/up.sh --build
+./docker/attach.sh
+colcon build --symlink-install
 source install/setup.bash
 ```
 
