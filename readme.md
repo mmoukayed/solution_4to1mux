@@ -15,7 +15,7 @@ cd ..
 ./docker/attach.sh
 colcon build --symlink-install
 source install/setup.bash
-ros2 launch erc_bringup solution.launch.py
+ros2 launch erc_bringup simulation.launch.py
 ```
 These commands will download and build the whole project and then run the simulation
 
