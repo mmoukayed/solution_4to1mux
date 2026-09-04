@@ -21,10 +21,10 @@ class PerceptionNode(Node):
             (10.0 - depth_display) / 10.0 * 255
         ).astype(np.uint8)
 
-        h, w = cv_image.shape
-        depth = cv_image[h // 2, w // 2]
-        self.get_logger().info(f'Center depth: {depth:.2f} m')
-        # Now cv_image is a normal OpenCV/numpy image
+        # h, w = cv_image.shape
+        # depth = cv_image[h // 2, w // 2]
+        # self.get_logger().info(f'Center depth: {depth:.2f} m')
+        
         cv2.imwrite("depth_cam.png", depth_display)
 
     def __init__(self):

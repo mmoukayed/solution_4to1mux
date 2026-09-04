@@ -6,12 +6,15 @@ from cv_bridge import CvBridge
 import cv2
 
 class ManipulationNode(Node):
+    def _handle_odometer(self, msg: Twist):
+        self.get_logger().info(msg)
 
     def __init__(self):
         super().__init__('navigation_node')
         self.timer = self.create_timer(0.1, self.tick)
         self.bridge = CvBridge()
-
+        self.odom = self.create_subscription(Twist, "/odom", self._handle_odometer, 10)
+        
     def tick(self):
         msg = Twist()
 
