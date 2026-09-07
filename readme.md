@@ -40,6 +40,7 @@ Then similar to the previous section, once inside the docker shell:
 ```
 colcon build --symlink-install
 source install/setup.bash
+ros2 launch erc_bringup solution.launch.py
 ```
 The start command for our program should be as mentioned in the guidelines:
 ```
