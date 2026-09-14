@@ -40,7 +40,8 @@ def bare_nav():
                   book_search_timeout=24., head_scan_dwell=1.8, max_book_recoveries=1,
                   scan_half_width=2.6, scan_step=.65, scan_observe_time=1.0,
                   shelf_keepout_distance=.62, arm_stow_timeout=10.0,
-                  arm_stow_settle_time=2.5, grasp_base_retreat=.25)
+                  arm_stow_settle_time=2.5, grasp_base_retreat=.25,
+                  grasp_base_return_advance=.28)
     n.p = values.__getitem__
     n.now = lambda: 10.0
     n.pose = np.array([0., 0., 0.])
@@ -407,8 +408,8 @@ def test_grasp_stages_retreat_prealign_and_base_advance_before_close():
     n.result = True
     n.tick()
     assert n.state == State.RETURN_FOR_GRAB
-    assert n.goal[0] == pytest.approx(0.)
-    n.pose[0] = 0.
+    assert n.goal[0] == pytest.approx(.03)
+    n.pose[0] = .03
     n.tick()
     assert n.state == State.WAIT_FOR_GRAB
     assert n.finish_grab_pub.messages[-1].data

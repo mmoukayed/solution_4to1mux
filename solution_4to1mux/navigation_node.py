@@ -71,6 +71,9 @@ class NavigationNode(Node):
             'scan_half_width': 2.6, 'scan_step': 0.65, 'scan_observe_time': 1.0,
             'docking_speed': 0.25, 'book_search_timeout': 24.0,
             'grasp_base_retreat': 0.25,
+            # Keep a 3 cm buffer above the shelf keepout while returning to
+            # the book. Manipulation uses the same 0.28 m compensation.
+            'grasp_base_return_advance': 0.28,
             'max_book_recoveries': 2, 'head_scan_dwell': 1.8,
         }
         for key, value in defaults.items():
@@ -134,7 +137,7 @@ class NavigationNode(Node):
         self.wall_sample, self.sim_sample = time.monotonic(), self.now()
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(5.0, self.wall_status, clock=self.wall_clock)
-        self.get_logger().info(f'Navigation BUILD 4.1 (staged clear-arm grasp + shelf keepout): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
+        self.get_logger().info(f'Navigation BUILD 4.3 (safe return + deeper grasp): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -534,6 +537,12 @@ class NavigationNode(Node):
         self.move(vx, vy, omega)
         return False
 
+    def shelf_limited_return_arrived(self, goal):
+        """Accept a close return stopped solely by the hard shelf boundary."""
+        return (self.last_gate.startswith('shelf_keepout') and
+                math.hypot(*(goal[:2]-self.pose[:2])) <= 0.06 and
+                abs(wrap(goal[2]-self.pose[2])) < 0.04)
+
     @staticmethod
     def target_goal(msg, standoff, lateral=0.0):
         heading = yaw(msg.pose.orientation)
@@ -641,12 +650,15 @@ class NavigationNode(Node):
                 self.fail(f'Pregrasp failed: {self.manip_failure or "read /manipulation/failure for the controller error"}')
             elif self.result is True:
                 heading = self.pose[2]
-                advance = self.p('grasp_base_retreat')
+                advance = self.p('grasp_base_return_advance')
                 self.goal = np.r_[self.pose[:2]+advance*np.array([math.cos(heading), math.sin(heading)]), heading]
                 self.result = None
                 self.transition(State.RETURN_FOR_GRAB)
         elif self.state == State.RETURN_FOR_GRAB:
-            if self.drive_to(self.goal, keep_heading=True):
+            arrived = self.drive_to(self.goal, keep_heading=True)
+            if arrived or self.shelf_limited_return_arrived(self.goal):
+                if not arrived:
+                    self.get_logger().warn('Return-to-grab stopped by the shelf keepout at the safe boundary; starting the compensated arm close.')
                 self.result = None
                 self.transition(State.WAIT_FOR_GRAB)
                 self.finish_grab_pub.publish(Bool(data=True))

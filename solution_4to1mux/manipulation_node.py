@@ -36,10 +36,17 @@ class ManipulationNode(Node):
         super().__init__('manipulation_node')
         for name, value in {
             'gripper_open': 0.066, 'gripper_closed': 0.0,
-            'grasp_insert_depth': 0.04, 'pregrasp_distance': 0.10,
+            # Insert past the measured spine rather than asking the base to
+            # violate its shelf keepout.  Offset right 1.5 cm to centre the
+            # fingers when the right finger was contacting first.
+            'grasp_insert_depth': 0.07, 'grasp_right_offset': 0.015,
+            'pregrasp_distance': 0.10,
             'lift_distance': 0.025, 'extract_distance': 0.10,
-            'grasp_base_advance': 0.25,
+            # Must match navigation.grasp_base_return_advance.  This offsets
+            # the prealignment target while the base is backed out.
+            'grasp_base_advance': 0.28,
             'target_max_age': 2.0, 'gripper_timeout': 8.0,
+            'grip_contact_hold': 1.0, 'grip_recommand_period': 0.4,
             'motion_timeout_margin': 8.0, 'planning_timeout': 60.0,
             'bin_inset': 0.12, 'bin_release_height': 0.21,
         }.items():
@@ -90,7 +97,7 @@ class ManipulationNode(Node):
         self.deadline = 0.0
         self.warned_at = -100.0
         self.create_timer(0.1, self.tick)
-        self.get_logger().info('Manipulation BUILD 4.1: staged prealignment + close/lift grasp, shelf retract, dock-distance guard.')
+        self.get_logger().info('Manipulation BUILD 4.5: deep, held bilateral-close staged grasp.')
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -176,7 +183,7 @@ class ManipulationNode(Node):
         self.phase = 'planning'
         self.deadline = self.now()+self.p('planning_timeout')
         current = np.array([self.joints[n] for n in self.model.names])
-        params = {key: self.p(key) for key in ('grasp_insert_depth', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'bin_inset', 'bin_release_height')}
+        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'bin_inset', 'bin_release_height')}
         self.plan_future = self.pool.submit(self.plan, sequence, point, normal, current, params)
         self.get_logger().info(f'{sequence}: planning for camera target in base frame {point.round(3)}')
 
@@ -188,6 +195,9 @@ class ManipulationNode(Node):
             # A book closer than ~0.45 m means the base ended up jammed against
             # the shelf; swinging the arm from there hits the shelf boards.
             raise ValueError(f'Dock distance wrong for a safe grasp: book at {point[0]:.2f} m in base frame, need 0.45-1.05 m; redock.')
+        # +y is robot-left in base_footprint; the requested correction is to
+        # robot-right, away from the finger that was striking the book first.
+        point = point+np.array([0.0, -params.get('grasp_right_offset', 0.0), 0.0]) if sequence in ('grab', 'prepare_grab', 'finish_grab') else point
         facing = rotation([0, 0, 1], math.atan2(normal[1], normal[0]))
         if sequence == 'grab':
             grasp = point+normal*params['grasp_insert_depth']
@@ -298,6 +308,7 @@ class ManipulationNode(Node):
             self.gripper_pub.publish(self.trajectory([GRIPPER_JOINT], [value], duration))
             self.deadline = self.now()+self.p('gripper_timeout')
             self.contact_since = None
+            self.last_close_command = self.now() if self.phase == 'close' else None
         else:
             self.deadline = self.now()+duration+3.0
 
@@ -361,11 +372,17 @@ class ManipulationNode(Node):
             if self.fresh(self.joint_stamp) and abs(self.joints.get(GRIPPER_JOINT, -1)-self.p('gripper_open')) < 0.006 and self.now()-self.phase_started > 0.8:
                 self.next_phase()
         elif self.phase == 'close':
+            # The public gripper interface is position-only and 0.0 is its
+            # physical hard-close limit. Reassert it while seating the book so
+            # a controller update cannot relax the clamp before the lift.
+            if self.now()-self.last_close_command >= self.p('grip_recommand_period'):
+                self.gripper_pub.publish(self.trajectory([GRIPPER_JOINT], [self.p('gripper_closed')], 0.5))
+                self.last_close_command = self.now()
             book = self.held_book()
             if book:
                 if self.contact_since is None:
                     self.contact_since = self.now()
-                if self.now()-self.contact_since >= 0.35:
+                if self.now()-self.contact_since >= self.p('grip_contact_hold'):
                     self.holding_book = book
                     self.next_phase()
             else:

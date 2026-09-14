@@ -2,7 +2,15 @@
 
 This package targets the **ERC simulator supplied in the 11 September 2026 ZIP**, ROS 2 Humble and Gazebo Harmonic. It uses the right arm only. Launch the simulator first, then launch this package.
 
-**Current build: 4.1.** Startup must print `Navigation BUILD 4.1` and `Manipulation BUILD 4.1` — if it does not, the rebuild did not take and you are running older code.
+**Current build: 4.5.** Startup must print `Navigation BUILD 4.3` and `Manipulation BUILD 4.5` — if it does not, the rebuild did not take and you are running older code.
+
+- **Build 4.5:** the gripper remains at its physical closed limit (0.0); the public simulator interface exposes no effort/force command above that. To improve retention, the staged grasp inserts 0.07 m past the perceived spine (was 0.06), repeatedly reasserts the hard-close command while seating, and requires 1.0 s of stable bilateral finger/book contact before lifting or extracting.
+
+- **Build 4.4:** restores the declared `pregrasp_distance` parameter required by the staged planner. Its absence caused `prepare_grab` to terminate the manipulation node with `ParameterNotDeclaredException` before any arm command was sent.
+
+- **Build 4.3:** return-for-grab now targets 0.28 m after the 0.25 m retreat, preserving a 3 cm buffer above the virtual shelf keepout. If the hard shelf gate stops only the final centimetres, navigation accepts that safe position and starts the compensated close rather than freezing in `RETURN_FOR_GRAB`. The gripper target moves 1.5 cm to robot-right and inserts 0.06 m past the measured spine (was 0.04 m), so it wraps around the book without requiring unsafe extra base motion.
+
+- **Build 4.2:** after prealignment, the base returns 0.30 m after its 0.25 m retreat, placing it 5 cm closer than the original dock for a more secure pickup. Manipulation offsets its prealignment target by the identical 0.30 m, preserving the intended final gripper/book alignment. The gripper's closed command remains 0.0—the simulator clamp's physical closed limit, so no higher software force command exists.
 
 - **Build 4.1:** grasping is staged around the shelf clearance. At the finished dock position the base reverses 0.25 m; manipulation opens the gripper and moves the right arm to a prealignment pose offset by the same 0.25 m. The base then returns straight to the dock, carrying the held arm into the book alignment, and only then does manipulation close, lift, extract and verify the grasp. This prevents the arm's transition from the raised stow pose from catching boards above the selected row.
 
