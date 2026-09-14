@@ -39,7 +39,7 @@ class ManipulationNode(Node):
             # Insert past the measured spine rather than asking the base to
             # violate its shelf keepout.  Offset right 1.5 cm to centre the
             # fingers when the right finger was contacting first.
-            'grasp_insert_depth': 0.07, 'grasp_right_offset': 0.015,
+            'grasp_insert_depth': 0.085, 'grasp_right_offset': 0.015,
             'pregrasp_distance': 0.10,
             'lift_distance': 0.025, 'extract_distance': 0.10,
             # Must match navigation.grasp_base_return_advance.  This offsets
@@ -97,7 +97,7 @@ class ManipulationNode(Node):
         self.deadline = 0.0
         self.warned_at = -100.0
         self.create_timer(0.1, self.tick)
-        self.get_logger().info('Manipulation BUILD 4.5: deep, held bilateral-close staged grasp.')
+        self.get_logger().info('Manipulation BUILD 4.6: palm-seated, held bilateral-close staged grasp.')
 
     def p(self, name):
         return self.get_parameter(name).value

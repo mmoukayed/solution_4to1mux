@@ -2,7 +2,9 @@
 
 This package targets the **ERC simulator supplied in the 11 September 2026 ZIP**, ROS 2 Humble and Gazebo Harmonic. It uses the right arm only. Launch the simulator first, then launch this package.
 
-**Current build: 4.5.** Startup must print `Navigation BUILD 4.3` and `Manipulation BUILD 4.5` — if it does not, the rebuild did not take and you are running older code.
+**Current build: 4.6.** Startup must print `Navigation BUILD 4.4` and `Manipulation BUILD 4.6` — if it does not, the rebuild did not take and you are running older code.
+
+- **Build 4.6:** `ALIGN_BOOK` now immediately accepts a near-goal stop caused only by the virtual shelf keepout and begins the staged grasp; it no longer waits through the old 8 s blocked interval before recovery. A genuinely blocked path now recovers after 3 s. The arm inserts 0.085 m past the detected spine, seating the book against the gripper's inner body/backplate for lift support while preserving the base keepout.
 
 - **Build 4.5:** the gripper remains at its physical closed limit (0.0); the public simulator interface exposes no effort/force command above that. To improve retention, the staged grasp inserts 0.07 m past the perceived spine (was 0.06), repeatedly reasserts the hard-close command while seating, and requires 1.0 s of stable bilateral finger/book contact before lifting or extracting.
 

@@ -70,6 +70,7 @@ class NavigationNode(Node):
             'arm_stow_timeout': 10.0, 'arm_stow_settle_time': 2.5,
             'scan_half_width': 2.6, 'scan_step': 0.65, 'scan_observe_time': 1.0,
             'docking_speed': 0.25, 'book_search_timeout': 24.0,
+            'align_block_timeout': 3.0,
             'grasp_base_retreat': 0.25,
             # Keep a 3 cm buffer above the shelf keepout while returning to
             # the book. Manipulation uses the same 0.28 m compensation.
@@ -137,7 +138,7 @@ class NavigationNode(Node):
         self.wall_sample, self.sim_sample = time.monotonic(), self.now()
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(5.0, self.wall_status, clock=self.wall_clock)
-        self.get_logger().info(f'Navigation BUILD 4.3 (safe return + deeper grasp): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
+        self.get_logger().info(f'Navigation BUILD 4.4 (fast shelf-limited alignment): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -627,11 +628,10 @@ class NavigationNode(Node):
             # sit out the 90 s phase timeout against a blocked docking path —
             # back out and reacquire instead.
             self.goal = self.clamped_dock_goal(self.goal)
-            if self.blocked_since is not None and self.now()-self.blocked_since > 8.0:
-                self.get_logger().warn(f'Docking path blocked for 8 s (gate={self.last_gate}); backing out to reacquire the book.')
-                self.recover_book_view()
-                return
-            if self.drive_to(self.goal, tolerance=0.025, docking=True):
+            arrived = self.drive_to(self.goal, tolerance=0.025, docking=True)
+            if arrived or self.shelf_limited_return_arrived(self.goal):
+                if not arrived:
+                    self.get_logger().warn('ALIGN_BOOK reached the shelf keepout boundary; continuing with the compensated staged grasp.')
                 if self.observation('book') is None:
                     self.transition(State.REACQUIRE_BOOK)
                     return
@@ -639,6 +639,9 @@ class NavigationNode(Node):
                 retreat = self.p('grasp_base_retreat')
                 self.goal = np.r_[self.pose[:2]-retreat*np.array([math.cos(heading), math.sin(heading)]), heading]
                 self.transition(State.BACK_OUT_FOR_GRASP)
+            elif self.blocked_since is not None and self.now()-self.blocked_since > self.p('align_block_timeout'):
+                self.get_logger().warn(f'Docking path blocked for {self.p("align_block_timeout"):.0f} s (gate={self.last_gate}); backing out to reacquire the book.')
+                self.recover_book_view()
         elif self.state == State.BACK_OUT_FOR_GRASP:
             if self.drive_to(self.goal, keep_heading=True):
                 self.result = None

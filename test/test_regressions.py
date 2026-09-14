@@ -41,7 +41,7 @@ def bare_nav():
                   scan_half_width=2.6, scan_step=.65, scan_observe_time=1.0,
                   shelf_keepout_distance=.62, arm_stow_timeout=10.0,
                   arm_stow_settle_time=2.5, grasp_base_retreat=.25,
-                  grasp_base_return_advance=.28)
+                  grasp_base_return_advance=.28, align_block_timeout=3.0)
     n.p = values.__getitem__
     n.now = lambda: 10.0
     n.pose = np.array([0., 0., 0.])
