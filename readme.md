@@ -2,9 +2,11 @@
 
 This package targets the **ERC simulator supplied in the 11 September 2026 ZIP**, ROS 2 Humble and Gazebo Harmonic. It uses the right arm only. Launch the simulator first, then launch this package.
 
-**Current build: 3.6.** Startup must print `Navigation BUILD 3.6` and `Manipulation BUILD 3.5` — if it does not, the rebuild did not take and you are running older code.
+**Current build: 4.1.** Startup must print `Navigation BUILD 4.1` and `Manipulation BUILD 4.1` — if it does not, the rebuild did not take and you are running older code.
 
-- **Build 3.6:** before `ALIGN_BOOK`, navigation stops and folds `arm_left_2_joint` and `arm_right_2_joint` to the simulator's compact/home value of -1.83 rad. It waits for fresh `/joint_states` feedback confirming both folds before the base is allowed to dock. This keeps the parked arms from catching the shelf; the right arm is then free for the existing grasp plan after docking.
+- **Build 4.1:** grasping is staged around the shelf clearance. At the finished dock position the base reverses 0.25 m; manipulation opens the gripper and moves the right arm to a prealignment pose offset by the same 0.25 m. The base then returns straight to the dock, carrying the held arm into the book alignment, and only then does manipulation close, lift, extract and verify the grasp. This prevents the arm's transition from the raised stow pose from catching boards above the selected row.
+
+- **Build 4.0:** before `ALIGN_BOOK`, navigation stops and sends the calibrated complete trajectory for each arm. Left: `[0.0, 1.25, 0.0, -1.0, -0.4, 0.0, 0.0]`; right: `[0.0, 1.25, 0.0, -1.0, 0.4, 0.0, 0.0]`. Exact fresh `/joint_states` confirmation proceeds immediately; otherwise it allows the controllers' 2 s trajectory plus a 0.5 s settle period, avoiding a false stow timeout while still refusing stale joint feedback.
 
 - **Build 3.5:** a grasp is refused with a `redock` reason when the book sits closer than 0.45 m in the base frame (base jammed against the shelf — swinging the arm from there hits the boards). Navigation reacts by backing straight out 0.35 m and re-docking (bounded by `max_book_recoveries`) instead of failing or wedging the arm.
 

@@ -38,6 +38,7 @@ class ManipulationNode(Node):
             'gripper_open': 0.066, 'gripper_closed': 0.0,
             'grasp_insert_depth': 0.04, 'pregrasp_distance': 0.10,
             'lift_distance': 0.025, 'extract_distance': 0.10,
+            'grasp_base_advance': 0.25,
             'target_max_age': 2.0, 'gripper_timeout': 8.0,
             'motion_timeout_margin': 8.0, 'planning_timeout': 60.0,
             'bin_inset': 0.12, 'bin_release_height': 0.21,
@@ -62,6 +63,7 @@ class ManipulationNode(Node):
         self.holding_pub = self.create_publisher(Bool, '/manipulation/holding_book', 10)
         self.failure_pub = self.create_publisher(String, '/manipulation/failure', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.grab_pub = self.create_publisher(Bool, '/manipulation/grab_complete', 10)
+        self.prepared_pub = self.create_publisher(Bool, '/manipulation/grab_prepared', 10)
         self.place_pub = self.create_publisher(Bool, '/manipulation/place_complete', 10)
         self.create_subscription(String, '/robot_description', self.on_description,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -69,6 +71,8 @@ class ManipulationNode(Node):
         for name in ('book', 'bin'):
             self.create_subscription(PoseStamped, f'/perception/{name}_pose', lambda m, n=name: self.targets.update({n: m}), 10)
         self.create_subscription(Bool, '/manipulation/request_grab', lambda m: self.request('grab') if m.data else None, 10)
+        self.create_subscription(Bool, '/manipulation/request_prepare_grab', lambda m: self.request('prepare_grab') if m.data else None, 10)
+        self.create_subscription(Bool, '/manipulation/request_finish_grab', lambda m: self.request('finish_grab') if m.data else None, 10)
         self.create_subscription(Bool, '/manipulation/request_place', lambda m: self.request('place') if m.data else None, 10)
         self.create_subscription(Bool, '/manipulation/cancel', lambda m: self.abort('Cancelled by navigation') if m.data and self.active else None, 10)
         self.create_subscription(Contacts, '/contacts', self.on_contacts, qos_profile_sensor_data)
@@ -86,7 +90,7 @@ class ManipulationNode(Node):
         self.deadline = 0.0
         self.warned_at = -100.0
         self.create_timer(0.1, self.tick)
-        self.get_logger().info('Manipulation BUILD 3.5: clamped gripper topic + joint/contact feedback, shelf retract, dock-distance guard.')
+        self.get_logger().info('Manipulation BUILD 4.1: staged prealignment + close/lift grasp, shelf retract, dock-distance guard.')
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -150,7 +154,7 @@ class ManipulationNode(Node):
         if sequence == 'place' and not self.holding_book:
             self.report(sequence, False, 'Cannot place: no verified grasp.')
             return
-        target = self.targets.get('book' if sequence == 'grab' else 'bin')
+        target = self.targets.get('book' if sequence in ('grab', 'prepare_grab', 'finish_grab') else 'bin')
         if target is None or target.header.frame_id != 'odom' or not self.fresh(Time.from_msg(target.header.stamp).nanoseconds/1e9, self.p('target_max_age')):
             self.report(sequence, False, 'No fresh target pose in odom; inspect RGB-D perception.')
             return
@@ -172,7 +176,7 @@ class ManipulationNode(Node):
         self.phase = 'planning'
         self.deadline = self.now()+self.p('planning_timeout')
         current = np.array([self.joints[n] for n in self.model.names])
-        params = {key: self.p(key) for key in ('grasp_insert_depth', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'bin_inset', 'bin_release_height')}
+        params = {key: self.p(key) for key in ('grasp_insert_depth', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'bin_inset', 'bin_release_height')}
         self.plan_future = self.pool.submit(self.plan, sequence, point, normal, current, params)
         self.get_logger().info(f'{sequence}: planning for camera target in base frame {point.round(3)}')
 
@@ -180,7 +184,7 @@ class ManipulationNode(Node):
         """Compute all waypoints before any actuator moves; never guess joint angles."""
         if not np.isfinite(point).all() or point[0] < 0.2 or point[0] > 1.15:
             raise ValueError(f'Target is not in front of the arm at reachable distance: {point}')
-        if sequence == 'grab' and not 0.45 <= point[0] <= 1.05:
+        if sequence in ('grab', 'prepare_grab', 'finish_grab') and not 0.45 <= point[0] <= 1.05:
             # A book closer than ~0.45 m means the base ended up jammed against
             # the shelf; swinging the arm from there hits the shelf boards.
             raise ValueError(f'Dock distance wrong for a safe grasp: book at {point[0]:.2f} m in base frame, need 0.45-1.05 m; redock.')
@@ -191,6 +195,16 @@ class ManipulationNode(Node):
             lifted = grasp+np.array([0, 0, params['lift_distance']])
             extracted = lifted-normal*params['extract_distance']
             targets = [('pregrasp', pre), ('insert', grasp), ('lift', lifted), ('extract', extracted)]
+        elif sequence == 'prepare_grab':
+            # At the backed-out base pose, solve an arm configuration that
+            # reaches the grasp point only after navigation advances the base.
+            # This keeps the arm below/clear of the shelf during its swing.
+            targets = [('prealign', point+normal*(params['grasp_insert_depth']-params['grasp_base_advance']))]
+        elif sequence == 'finish_grab':
+            grasp = point+normal*params['grasp_insert_depth']
+            lifted = grasp+np.array([0, 0, params['lift_distance']])
+            extracted = lifted-normal*params['extract_distance']
+            targets = [('lift', lifted), ('extract', extracted)]
         else:
             release = point+normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
             targets = [('over_bin', release+np.array([0, 0, 0.06])), ('lower_to_bin', release)]
@@ -222,6 +236,12 @@ class ManipulationNode(Node):
             return [('open_gripper', 'open', None, 1.0), motions[0], motions[1],
                     ('close_gripper', 'close', None, 1.0), motions[2], motions[3],
                     ('verify_book_held', 'verify', None, 0.8)]
+        if sequence == 'prepare_grab':
+            return [('open_gripper', 'open', None, 1.0), motions[0]]
+        if sequence == 'finish_grab':
+            self.retreat_target = motions[-1][2]
+            return [('close_gripper', 'close', None, 1.0), motions[0], motions[1],
+                    ('verify_book_held', 'verify', None, 0.8)]
         return motions+[('release_book', 'open', None, 1.0),
                         ('verify_delivery', 'delivery', None, 3.0)]
 
@@ -249,8 +269,10 @@ class ManipulationNode(Node):
         self.phase_name, self.phase, self.phase_target, duration = self.phases.pop(0)
         # Fingers cross the shelf front at 'insert' and are clear again once
         # 'extract' has succeeded (i.e. when 'verify_book_held' starts).
-        if self.active == 'grab':
+        if self.active in ('grab', 'finish_grab'):
             if self.phase_name == 'insert':
+                self.arm_in_shelf = True
+            elif self.phase_name == 'close_gripper' and self.active == 'finish_grab':
                 self.arm_in_shelf = True
             elif self.phase_name == 'verify_book_held':
                 self.arm_in_shelf = False
@@ -402,7 +424,9 @@ class ManipulationNode(Node):
     def report(self, sequence, success, reason):
         if not success:
             self.failure_pub.publish(String(data=f'{sequence}: {reason}'))
-        (self.grab_pub if sequence == 'grab' else self.place_pub).publish(Bool(data=success))
+        publisher = (self.prepared_pub if sequence == 'prepare_grab' else
+                     self.grab_pub if sequence in ('grab', 'finish_grab') else self.place_pub)
+        publisher.publish(Bool(data=success))
         (self.get_logger().info if success else self.get_logger().error)(f'{sequence}: {reason}')
 
 

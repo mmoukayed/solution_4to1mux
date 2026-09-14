@@ -39,8 +39,8 @@ def bare_nav():
                   phase_timeout=90, search_direction='right', docking_speed=.25,
                   book_search_timeout=24., head_scan_dwell=1.8, max_book_recoveries=1,
                   scan_half_width=2.6, scan_step=.65, scan_observe_time=1.0,
-                  shelf_keepout_distance=.62, dock_arm_2_stow=-1.83,
-                  arm_stow_timeout=5.0)
+                  shelf_keepout_distance=.62, arm_stow_timeout=10.0,
+                  arm_stow_settle_time=2.5, grasp_base_retreat=.25)
     n.p = values.__getitem__
     n.now = lambda: 10.0
     n.pose = np.array([0., 0., 0.])
@@ -54,6 +54,7 @@ def bare_nav():
     n.book_diagnostics = 'test diagnostics'
     n.book_recoveries = 0
     n.cancel_pub = Pub()
+    n.prepare_grab_pub, n.finish_grab_pub, n.grab_pub = Pub(), Pub(), Pub()
     n.bin_mode_pub = Pub()
     n.warned = {}
     n.log = Logger()
@@ -365,13 +366,52 @@ def test_both_arms_fold_before_base_enters_align_book():
     n.tick()
     assert n.state == State.STOW_ARMS_FOR_DOCK
     n.tick()
-    for publisher in (n.left_arm_pub, n.right_arm_pub):
+    expected = ((n.left_arm_pub, [0.0, 1.25, 0.0, -1.0, -0.4, 0.0, 0.0]),
+                (n.right_arm_pub, [0.0, 1.25, 0.0, -1.0, 0.4, 0.0, 0.0]))
+    for publisher, pose in expected:
         command = publisher.messages[-1]
         assert len(command.joint_names) == 7
-        assert command.points[0].positions[1] == pytest.approx(-1.83)
-    n.arm_joints['arm_left_2_joint'] = n.arm_joints['arm_right_2_joint'] = -1.83
+        assert command.points[0].positions == pytest.approx(pose)
+    for side, pose in (('left', expected[0][1]), ('right', expected[1][1])):
+        for index, value in enumerate(pose, 1):
+            n.arm_joints[f'arm_{side}_{index}_joint'] = value
     n.tick()
     assert n.state == State.ALIGN_BOOK
+
+
+def test_calibrated_arm_stow_settle_does_not_wait_for_exact_gazebo_feedback():
+    n = bare_nav()
+    n.look = lambda *args, **kwargs: None
+    n.state = State.FIND_BOOK
+    n.observations['book'] = target(1., 0., .935)
+    n.tick()
+    n.tick()  # Publish the two-second calibrated trajectories.
+    n.now = lambda: 12.6
+    n.arm_joint_stamp = 12.6
+    n.tick()
+    assert n.state == State.ALIGN_BOOK
+
+
+def test_grasp_stages_retreat_prealign_and_base_advance_before_close():
+    n = bare_nav()
+    n.look = lambda *args, **kwargs: None
+    n.state, n.goal = State.ALIGN_BOOK, n.pose.copy()
+    n.observations['book'] = target(.68, 0., .935)
+    n.tick()
+    assert n.state == State.BACK_OUT_FOR_GRASP
+    assert n.goal[0] == pytest.approx(-.25)
+    n.pose[0] = -.25
+    n.tick()
+    assert n.state == State.WAIT_FOR_PREGRASP
+    assert n.prepare_grab_pub.messages[-1].data
+    n.result = True
+    n.tick()
+    assert n.state == State.RETURN_FOR_GRAB
+    assert n.goal[0] == pytest.approx(0.)
+    n.pose[0] = 0.
+    n.tick()
+    assert n.state == State.WAIT_FOR_GRAB
+    assert n.finish_grab_pub.messages[-1].data
 
 
 def test_book_view_recovery_is_bounded_and_does_not_retry_a_grasp():

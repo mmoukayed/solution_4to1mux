@@ -19,6 +19,12 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from .geometry import body_velocity, forward_command, pose_xyz, scan_points, transform_matrix, wrap, yaw
 
 
+DOCK_STOW_POSES = {
+    'left': (0.0, 1.25, 0.0, -1.0, -0.4, 0.0, 0.0),
+    'right': (0.0, 1.25, 0.0, -1.0, 0.4, 0.0, 0.0),
+}
+
+
 class State(Enum):
     WAIT_INPUTS = auto()
     FIND_SHELF = auto()
@@ -27,6 +33,9 @@ class State(Enum):
     FIND_BOOK = auto()
     STOW_ARMS_FOR_DOCK = auto()
     ALIGN_BOOK = auto()
+    BACK_OUT_FOR_GRASP = auto()
+    WAIT_FOR_PREGRASP = auto()
+    RETURN_FOR_GRAB = auto()
     REACQUIRE_BOOK = auto()
     BACK_OUT_FOR_VIEW = auto()
     WAIT_FOR_GRAB = auto()
@@ -58,12 +67,10 @@ class NavigationNode(Node):
             # margin: a depth-biased book point must not put the bumper (or
             # the parked arm) against the shelf before the grasp starts.
             'shelf_keepout_distance': 0.62,
-            # The simulator's compact/home pose folds each arm at joint 2.
-            # Do this before close shelf docking so parked arms cannot catch
-            # a board while the base approaches.
-            'dock_arm_2_stow': -1.83, 'arm_stow_timeout': 5.0,
+            'arm_stow_timeout': 10.0, 'arm_stow_settle_time': 2.5,
             'scan_half_width': 2.6, 'scan_step': 0.65, 'scan_observe_time': 1.0,
             'docking_speed': 0.25, 'book_search_timeout': 24.0,
+            'grasp_base_retreat': 0.25,
             'max_book_recoveries': 2, 'head_scan_dwell': 1.8,
         }
         for key, value in defaults.items():
@@ -103,6 +110,8 @@ class NavigationNode(Node):
         self.right_arm_pub = self.create_publisher(JointTrajectory, '/arm_right_controller/joint_trajectory', 10)
         self.bin_mode_pub = self.create_publisher(Bool, '/perception/looking_for_bin', 10)
         self.grab_pub = self.create_publisher(Bool, '/manipulation/request_grab', 10)
+        self.prepare_grab_pub = self.create_publisher(Bool, '/manipulation/request_prepare_grab', 10)
+        self.finish_grab_pub = self.create_publisher(Bool, '/manipulation/request_finish_grab', 10)
         self.place_pub = self.create_publisher(Bool, '/manipulation/request_place', 10)
         self.cancel_pub = self.create_publisher(Bool, '/manipulation/cancel', 10)
         self.failure_pub = self.create_publisher(String, '/solution/failure', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -119,12 +128,13 @@ class NavigationNode(Node):
         self.create_subscription(String, '/manipulation/failure', self.on_manip_failure, QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_subscription(String, '/perception/book_diagnostics', self.on_book_diagnostics, 10)
         self.create_subscription(Bool, '/manipulation/grab_complete', lambda m: self.on_result(m, State.WAIT_FOR_GRAB), 10)
+        self.create_subscription(Bool, '/manipulation/grab_prepared', lambda m: self.on_result(m, State.WAIT_FOR_PREGRASP), 10)
         self.create_subscription(Bool, '/manipulation/place_complete', lambda m: self.on_result(m, State.WAIT_FOR_PLACE), 10)
         self.create_timer(0.05, self.tick)
         self.wall_sample, self.sim_sample = time.monotonic(), self.now()
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(5.0, self.wall_status, clock=self.wall_clock)
-        self.get_logger().info(f'Navigation BUILD 3.6 (arm stow + shelf keepout): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
+        self.get_logger().info(f'Navigation BUILD 4.1 (staged clear-arm grasp + shelf keepout): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -399,9 +409,10 @@ class NavigationNode(Node):
     def stow_arms_for_dock(self):
         """Fold both parked arms before the base enters the shelf keepout.
 
-        The joint-trajectory controllers require all seven joints in a topic
-        command.  Preserve the measured values of the other six and change
-        only joint 2, which is the compact/home fold requested here.
+        These are the calibrated, full seven-joint trajectories rather than
+        partial-joint edits.  The controller receives exactly the same shape
+        of command used for live calibration, and docking starts only after
+        feedback confirms the complete pose.
         """
         names = {
             'left': [f'arm_left_{i}_joint' for i in range(1, 8)],
@@ -411,22 +422,31 @@ class NavigationNode(Node):
                 name not in self.arm_joints for side in names.values() for name in side):
             self.warn('arm_feedback', 'Waiting for fresh left/right arm joint feedback before shelf docking.')
             return False
-        target = self.p('dock_arm_2_stow')
-        if all(abs(self.arm_joints[side[1]]-target) < 0.08 for side in names.values()):
+        if all(abs(self.arm_joints[name]-target) < 0.08
+               for side, joint_names in names.items()
+               for name, target in zip(joint_names, DOCK_STOW_POSES[side])):
             return True
-        if self.arm_stow_last is not None and self.now()-self.arm_stow_last < 0.5:
-            return False
-        for side, publisher in ((names['left'], self.left_arm_pub), (names['right'], self.right_arm_pub)):
+        if self.arm_stow_last is not None:
+            # Gazebo can visibly complete a trajectory while its constrained
+            # joint feedback remains a little off the requested values.  The
+            # topic command already has a two-second duration; after one full
+            # settle window and still-fresh feedback, continue rather than
+            # re-publishing forever and blocking at the shelf.
+            if self.now()-self.arm_stow_last < self.p('arm_stow_settle_time'):
+                return False
+            self.warn('arm_stow_settle',
+                      'Arm stow trajectory settled without exact joint feedback; continuing with the calibrated parked pose.')
+            return True
+        for side, publisher in (('left', self.left_arm_pub), ('right', self.right_arm_pub)):
             msg = JointTrajectory()
-            msg.joint_names = side
+            msg.joint_names = names[side]
             point = JointTrajectoryPoint()
-            point.positions = [float(self.arm_joints[name]) for name in side]
-            point.positions[1] = target
+            point.positions = list(DOCK_STOW_POSES[side])
             point.time_from_start.sec = 2
             msg.points = [point]
             publisher.publish(msg)
         self.arm_stow_last = self.now()
-        self.get_logger().info(f'Folding arm_left_2_joint and arm_right_2_joint to {target:.2f} rad before ALIGN_BOOK.')
+        self.get_logger().info('Stowing both arms to calibrated full poses before ALIGN_BOOK.')
         return False
 
     def recover_book_view(self):
@@ -606,9 +626,30 @@ class NavigationNode(Node):
                 if self.observation('book') is None:
                     self.transition(State.REACQUIRE_BOOK)
                     return
+                heading = self.pose[2]
+                retreat = self.p('grasp_base_retreat')
+                self.goal = np.r_[self.pose[:2]-retreat*np.array([math.cos(heading), math.sin(heading)]), heading]
+                self.transition(State.BACK_OUT_FOR_GRASP)
+        elif self.state == State.BACK_OUT_FOR_GRASP:
+            if self.drive_to(self.goal, keep_heading=True):
+                self.result = None
+                self.transition(State.WAIT_FOR_PREGRASP)
+                self.prepare_grab_pub.publish(Bool(data=True))
+        elif self.state == State.WAIT_FOR_PREGRASP:
+            self.stop()
+            if self.result is False:
+                self.fail(f'Pregrasp failed: {self.manip_failure or "read /manipulation/failure for the controller error"}')
+            elif self.result is True:
+                heading = self.pose[2]
+                advance = self.p('grasp_base_retreat')
+                self.goal = np.r_[self.pose[:2]+advance*np.array([math.cos(heading), math.sin(heading)]), heading]
+                self.result = None
+                self.transition(State.RETURN_FOR_GRAB)
+        elif self.state == State.RETURN_FOR_GRAB:
+            if self.drive_to(self.goal, keep_heading=True):
                 self.result = None
                 self.transition(State.WAIT_FOR_GRAB)
-                self.grab_pub.publish(Bool(data=True))
+                self.finish_grab_pub.publish(Bool(data=True))
         elif self.state == State.WAIT_FOR_GRAB:
             self.stop()
             if self.result is False:
