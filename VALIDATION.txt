@@ -1,0 +1,31 @@
+Validation performed 2026-09-14 — revision 3
+
+49 offline regression tests passed (41 existing + 4 new: virtual shelf wall
+blocks forward motion the LiDAR cannot see, wall does not block the normal
+docking standoff, deep-blob dock goals are clamped, and colour blobs measured
+behind the shelf-front plane are rejected).
+Shelf mesh analysis (erc_base_shelf.STL + world pose): inside a column aisle
+the only material near the 0.13244 m LiDAR plane is the bottom board's top
+edge at ~0.132 m; divider panels sit ~0.5 m to either side. This is why the
+scan-based clearance gate reported 'clear' during head-on shelf collisions.
+Marker plates spawn flush with the shelf front (x = SHELF_X - 0.245) and book
+spines sit on that plane (book centre at SHELF_X - 0.1, 0.25 m deep), so the
+confirmed column/book poses define the virtual wall plane exactly.
+python3 -m py_compile passed for all solution modules.
+IK reachability re-verified with the supplied ERC right-arm chain URDF for the
+new grasp geometry (insert 0.04 m, pregrasp 0.10 m) at all four test row
+heights and at 0.605/0.935/1.265/1.595 m: every waypoint solves within limits
+with < 1 mm position error.
+Behavioural checks (with ROS stand-ins):
+  - abort during 'close' with the arm past 'insert' opens the gripper and
+    sends arm+torso retract goals to the pregrasp joints, then reports failure;
+  - blocked rotation with no translation commanded backs straight out at
+    0.08 m/s when the rear is clear, and stays stopped when it is not;
+  - forward obstacle clearance capping is unchanged.
+
+NOT tested here: ROS networking, live controllers, Gazebo physics, mesh
+collisions, live grasp/delivery success, real perception accuracy. Run one
+Gazebo trial and, if 'close: timed out' persists, read the new failure text:
+it now reports exactly which fingertip/book contacts were seen and their age,
+distinguishing misalignment (one side only) from a silent /contacts bridge
+(none at all, despite the fingers visibly pressing the book).
