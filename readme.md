@@ -2,7 +2,27 @@
 
 This package targets the **ERC simulator supplied in the 11 September 2026 ZIP**, ROS 2 Humble and Gazebo Harmonic. It uses the right arm only. Launch the simulator first, then launch this package.
 
-**Current build: 4.6.** Startup must print `Navigation BUILD 4.4` and `Manipulation BUILD 4.6` — if it does not, the rebuild did not take and you are running older code.
+**Current build: 5.8.** Startup must print `Navigation BUILD 5.8` and `Manipulation BUILD 5.8` — if it does not, the rebuild did not take and you are running older code.
+
+- **Build 5.8:** the bin release point moves an additional 0.10 m back toward the robot: the inward bin offset is now 0.22 m (was 0.12 m).
+
+- **Build 5.7:** the release target was offset 0.12 m beyond the bin along the camera-to-bin normal, putting the held book over the far rim. The bin inset is now applied into the opening, centring the release over the bin interior.
+
+- **Build 5.6:** a bottom-row book can leave the elbow/gripper overlapping the shelf after the old 0.35 m withdrawal, so the high carry pose collided while its joints reshaped. `RETREAT_FROM_SHELF` now withdraws 0.80 m straight back, holding heading fixed, before it requests the carry pose. This keeps the carrying arm clear before `RETURN_TO_START` begins.
+
+- **Build 5.5:** the final release target was unreachable because the bin remained 1.534 m ahead of the arm (`0.425 m` best IK error). After its in-place rotation, the robot now advances forward only to the 0.95 m calibrated arm standoff (maximum 0.65 m advance) and then requests the lower-and-release motion. This path never issues a reverse command.
+
+- **Build 5.4:** direct bin lowering now tries the normal, inverted, and both quarter-turn wrist orientations, allowing a valid release IK solution from the calibrated upright carry pose. If placement still cannot plan, navigation retains the exact manipulation failure reason instead of hiding it behind the generic `Placement failed` message.
+
+- **Build 5.3:** `APPROACH_BIN` is rotation-only. It no longer corrects target-goal x/y after reaching the calibrated pre-table/drop position, so it cannot reverse away from the bin. When heading alignment completes, navigation skips the redundant pre-place/base-advance stage and directly requests the arm's lower-and-release sequence; this removes the `WAIT_FOR_PLACE_PREP` stall.
+
+- **Build 5.2:** after `RETREAT_FROM_SHELF`, navigation stops and requests a high carry pose before returning to the start. Manipulation preserves the measured `torso_lift_joint` value and moves only the right arm to your calibrated position: `[0.0, 1.25, 0.0, -1.0, 0.2, 1.7, 0.0]`. Only after its controller confirms completion does navigation enter `RETURN_TO_START`.
+
+- **Build 4.9:** the table/bin stop is now 0.95 m away (was 0.80), keeping the base turning footprint away from the movable bin. After the arm reaches its high pose, the protected final advance is 0.35 m. Placement planning no longer rejects the raw farther bin point before applying this compensation; the final IK waypoints remain the reachability check. A placement-plan error now publishes a normal failure instead of letting an rcutils logger exception terminate the manipulation node.
+
+- **Build 4.8:** bin search has its own counterclockwise default (`bin_search_direction:=left`) while retaining the full bounded sweep, so a west-facing start turns toward the south-facing bin. Bin approach now uses close-range docking rather than a travel-turn circle. Once a bin pose has set the dock goal, navigation immediately stages placement even if the close-up red detection goes stale; manipulation accepts that static bin pose for up to 30 s during the delivery sequence.
+
+- **Build 4.7:** delivery is staged to avoid the bin table: navigation stops 0.80 m in front of the detected bin/table, manipulation raises the held book to a high pose, navigation advances only 0.18 m under a virtual bin/table wall, then manipulation lowers above the bin, opens the gripper and verifies delivery. The bin pose now supplies this virtual wall just as the shelf pose protects close docking.
 
 - **Build 4.6:** `ALIGN_BOOK` now immediately accepts a near-goal stop caused only by the virtual shelf keepout and begins the staged grasp; it no longer waits through the old 8 s blocked interval before recovery. A genuinely blocked path now recovers after 3 s. The arm inserts 0.085 m past the detected spine, seating the book against the gripper's inner body/backplate for lift support while preserving the base keepout.
 

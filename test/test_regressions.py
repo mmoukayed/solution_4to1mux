@@ -16,7 +16,7 @@ from solution_4to1mux.geometry import (ArmKinematics, body_velocity, depth_media
                                       rotation, row_for_height, scan_points, wrap)
 from solution_4to1mux.digit_detector import DigitDetector
 from solution_4to1mux.navigation_node import NavigationNode, State
-from solution_4to1mux.manipulation_node import ManipulationNode
+from solution_4to1mux.manipulation_node import HIGH_CARRY_RIGHT_ARM, ManipulationNode
 from solution_4to1mux.perception_node import PerceptionNode
 restore_ros()
 # Retain the imported stand-in classes for these tests only; do not poison other imports.
@@ -206,6 +206,17 @@ def test_torso_duration_respects_actual_urdf_limit(model):
     assert model.duration(start, end) >= .35/.035
 
 
+def test_high_carry_pose_moves_only_arm_and_preserves_torso(model):
+    n = ManipulationNode.__new__(ManipulationNode)
+    n.model = model
+    current = np.zeros(8)
+    current[0] = .12
+    phase = n.plan_carry_raise(current)[0]
+    target = phase[2]
+    assert target[0] == pytest.approx(.12)
+    assert target[1:] == pytest.approx(HIGH_CARRY_RIGHT_ARM)
+
+
 def test_unreachable_target_rejected_before_motion(model):
     with pytest.raises(ValueError, match='IK failed'):
         model.solve([5, 0, 5], np.eye(3), np.zeros(8), attempts=1, iterations=15)
@@ -293,6 +304,35 @@ def test_small_docking_alignment_still_uses_mecanum_at_low_speed():
     assert command.linear.y > 0
     assert math.hypot(command.linear.x, command.linear.y) <= .25
     assert command.angular.z == 0
+
+
+def test_bin_dock_rotation_never_translates_the_already_ready_base():
+    n = bare_nav()
+    n.rotate_to(math.pi/2)
+    command = n.cmd_pub.messages[-1]
+    assert command.linear.x == 0
+    assert command.linear.y == 0
+    assert command.angular.z > 0
+
+
+def test_bin_rotation_does_not_use_turn_blocked_reverse_recovery():
+    n = bare_nav()
+    n.scans['front'] = (10., np.array([[.30, 0.]]))
+    n.rotate_to(math.pi/2)
+    command = n.cmd_pub.messages[-1]
+    assert command.linear.x == 0
+    assert command.linear.y == 0
+    assert command.angular.z == 0
+    assert n.last_gate == 'turning_envelope_blocked'
+
+
+def test_final_bin_advance_is_forward_only_and_stops_without_reversing():
+    n = bare_nav()
+    assert not n.drive_forward_to(np.array([.50, 0., 0.]))
+    assert n.cmd_pub.messages[-1].linear.x > 0
+    n.pose[0] = .51
+    assert n.drive_forward_to(np.array([.50, 0., 0.]))
+    assert n.cmd_pub.messages[-1].linear.x == 0
 
 
 def test_retreat_reverses_without_turning_carried_book():

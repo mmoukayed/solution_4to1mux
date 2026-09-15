@@ -25,6 +25,9 @@ from .geometry import ArmKinematics, pose_xyz, rotation, transform_matrix, yaw
 
 GRIPPER_JOINT = 'gripper_right_finger_joint'
 ARM_JOINTS = [f'arm_right_{i}_joint' for i in range(1, 8)]
+# User-calibrated high carry pose.  This is arm-only: torso_lift_joint remains
+# at its measured current value.
+HIGH_CARRY_RIGHT_ARM = np.array([0.0, 1.25, 0.0, -1.0, 0.2, 1.7, 0.0])
 
 
 def entity_name(value):
@@ -45,10 +48,16 @@ class ManipulationNode(Node):
             # Must match navigation.grasp_base_return_advance.  This offsets
             # the prealignment target while the base is backed out.
             'grasp_base_advance': 0.28,
+            # Must match navigation.place_base_advance.  The high pre-place
+            # target is compensated while the base is still before the table.
+            'place_base_advance': 0.35, 'place_clearance_height': 0.20,
             'target_max_age': 2.0, 'gripper_timeout': 8.0,
+            'placement_target_max_age': 30.0,
             'grip_contact_hold': 1.0, 'grip_recommand_period': 0.4,
             'motion_timeout_margin': 8.0, 'planning_timeout': 60.0,
-            'bin_inset': 0.12, 'bin_release_height': 0.21,
+            # The measured bin point is near the far half of its opening;
+            # release 22 cm back toward the robot for a centred drop.
+            'bin_inset': 0.22, 'bin_release_height': 0.21,
         }.items():
             self.declare_parameter(name, value)
         for key in ('gripper_open', 'gripper_closed'):
@@ -72,6 +81,8 @@ class ManipulationNode(Node):
         self.grab_pub = self.create_publisher(Bool, '/manipulation/grab_complete', 10)
         self.prepared_pub = self.create_publisher(Bool, '/manipulation/grab_prepared', 10)
         self.place_pub = self.create_publisher(Bool, '/manipulation/place_complete', 10)
+        self.place_prepared_pub = self.create_publisher(Bool, '/manipulation/place_prepared', 10)
+        self.carry_raised_pub = self.create_publisher(Bool, '/manipulation/carry_raised', 10)
         self.create_subscription(String, '/robot_description', self.on_description,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_subscription(JointState, '/joint_states', self.on_joints, qos_profile_sensor_data)
@@ -81,6 +92,9 @@ class ManipulationNode(Node):
         self.create_subscription(Bool, '/manipulation/request_prepare_grab', lambda m: self.request('prepare_grab') if m.data else None, 10)
         self.create_subscription(Bool, '/manipulation/request_finish_grab', lambda m: self.request('finish_grab') if m.data else None, 10)
         self.create_subscription(Bool, '/manipulation/request_place', lambda m: self.request('place') if m.data else None, 10)
+        self.create_subscription(Bool, '/manipulation/request_prepare_place', lambda m: self.request('prepare_place') if m.data else None, 10)
+        self.create_subscription(Bool, '/manipulation/request_finish_place', lambda m: self.request('finish_place') if m.data else None, 10)
+        self.create_subscription(Bool, '/manipulation/request_raise_carry', lambda m: self.request('raise_carry') if m.data else None, 10)
         self.create_subscription(Bool, '/manipulation/cancel', lambda m: self.abort('Cancelled by navigation') if m.data and self.active else None, 10)
         self.create_subscription(Contacts, '/contacts', self.on_contacts, qos_profile_sensor_data)
         self.create_subscription(Contacts, '/bin_contacts', self.on_bin_contacts, qos_profile_sensor_data)
@@ -97,7 +111,7 @@ class ManipulationNode(Node):
         self.deadline = 0.0
         self.warned_at = -100.0
         self.create_timer(0.1, self.tick)
-        self.get_logger().info('Manipulation BUILD 4.6: palm-seated, held bilateral-close staged grasp.')
+        self.get_logger().info('Manipulation BUILD 5.8: calibrated high right-arm carry + rear-centred bin release.')
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -158,11 +172,24 @@ class ManipulationNode(Node):
         if not self.ready():
             self.report(sequence, False, 'Missing robot description, fresh joint states, arm/torso actions or gripper topic subscriber.')
             return
-        if sequence == 'place' and not self.holding_book:
+        if sequence in ('place', 'prepare_place', 'finish_place', 'raise_carry') and not self.holding_book:
             self.report(sequence, False, 'Cannot place: no verified grasp.')
             return
+        if sequence == 'raise_carry':
+            self.active = sequence
+            self.token += 1
+            self.arm_in_shelf = False
+            self.retreat_target = None
+            self.phase = 'planning'
+            self.deadline = self.now()+self.p('planning_timeout')
+            current = np.array([self.joints[n] for n in self.model.names])
+            self.plan_future = self.pool.submit(self.plan_carry_raise, current)
+            self.get_logger().info('raise_carry: moving the held book to the predefined high right-arm carry pose.')
+            return
         target = self.targets.get('book' if sequence in ('grab', 'prepare_grab', 'finish_grab') else 'bin')
-        if target is None or target.header.frame_id != 'odom' or not self.fresh(Time.from_msg(target.header.stamp).nanoseconds/1e9, self.p('target_max_age')):
+        target_age = (self.p('placement_target_max_age') if sequence in ('place', 'prepare_place', 'finish_place')
+                      else self.p('target_max_age'))
+        if target is None or target.header.frame_id != 'odom' or not self.fresh(Time.from_msg(target.header.stamp).nanoseconds/1e9, target_age):
             self.report(sequence, False, 'No fresh target pose in odom; inspect RGB-D perception.')
             return
         try:
@@ -183,13 +210,13 @@ class ManipulationNode(Node):
         self.phase = 'planning'
         self.deadline = self.now()+self.p('planning_timeout')
         current = np.array([self.joints[n] for n in self.model.names])
-        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'bin_inset', 'bin_release_height')}
+        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'place_base_advance', 'place_clearance_height', 'bin_inset', 'bin_release_height')}
         self.plan_future = self.pool.submit(self.plan, sequence, point, normal, current, params)
         self.get_logger().info(f'{sequence}: planning for camera target in base frame {point.round(3)}')
 
     def plan(self, sequence, point, normal, current, params):
         """Compute all waypoints before any actuator moves; never guess joint angles."""
-        if not np.isfinite(point).all() or point[0] < 0.2 or point[0] > 1.15:
+        if not np.isfinite(point).all() or point[0] < 0.2:
             raise ValueError(f'Target is not in front of the arm at reachable distance: {point}')
         if sequence in ('grab', 'prepare_grab', 'finish_grab') and not 0.45 <= point[0] <= 1.05:
             # A book closer than ~0.45 m means the base ended up jammed against
@@ -215,14 +242,28 @@ class ManipulationNode(Node):
             lifted = grasp+np.array([0, 0, params['lift_distance']])
             extracted = lifted-normal*params['extract_distance']
             targets = [('lift', lifted), ('extract', extracted)]
+        elif sequence == 'prepare_place':
+            # Perception's bin normal points from the camera/robot toward the
+            # bin. Move against it to put the held book inside the opening;
+            # adding it overshot the far rim by the 12 cm inset.
+            release = point-normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
+            preplace = release-normal*params['place_base_advance']+np.array([0, 0, params['place_clearance_height']])
+            targets = [('raise_over_bin', preplace)]
+        elif sequence == 'finish_place':
+            release = point-normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
+            targets = [('lower_to_bin', release)]
         else:
-            release = point+normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
+            release = point-normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
             targets = [('over_bin', release+np.array([0, 0, 0.06])), ('lower_to_bin', release)]
         errors = []
         motions = None
         # Parallel fingers can grasp with either 0 or 180 degree wrist roll.
-        # Some shelf heights are unreachable with only one of those orientations.
-        for roll in (math.pi, 0.0):
+        # A bin release may also require the wrist sideways while lowering from
+        # the calibrated upright carry pose, so try quarter turns as well.
+        rolls = ((math.pi, 0.0, math.pi/2, -math.pi/2)
+                 if sequence in ('place', 'prepare_place', 'finish_place')
+                 else (math.pi, 0.0))
+        for roll in rolls:
             orientation = facing @ rotation([1, 0, 0], roll)
             q = current.copy()
             candidate = []
@@ -252,8 +293,22 @@ class ManipulationNode(Node):
             self.retreat_target = motions[-1][2]
             return [('close_gripper', 'close', None, 1.0), motions[0], motions[1],
                     ('verify_book_held', 'verify', None, 0.8)]
+        if sequence == 'prepare_place':
+            return motions
+        if sequence == 'finish_place':
+            return motions+[('release_book', 'open', None, 1.0),
+                            ('verify_delivery', 'delivery', None, 3.0)]
         return motions+[('release_book', 'open', None, 1.0),
                         ('verify_delivery', 'delivery', None, 3.0)]
+
+    def plan_carry_raise(self, current):
+        """Move the held book to the fixed top-shelf carry pose, without torso motion."""
+        target = current.copy()
+        target[0] = current[0]
+        target[1:] = HIGH_CARRY_RIGHT_ARM
+        if np.max(np.abs(target-current)) <= 0.005:
+            return []
+        return [('raise_carried_book', 'motion', target, self.model.duration(current, target, 1.0))]
 
     def trajectory(self, names, positions, duration):
         msg = JointTrajectory()
@@ -441,10 +496,19 @@ class ManipulationNode(Node):
     def report(self, sequence, success, reason):
         if not success:
             self.failure_pub.publish(String(data=f'{sequence}: {reason}'))
-        publisher = (self.prepared_pub if sequence == 'prepare_grab' else
+        publisher = (self.carry_raised_pub if sequence == 'raise_carry' else
+                     self.prepared_pub if sequence == 'prepare_grab' else
+                     self.place_prepared_pub if sequence == 'prepare_place' else
                      self.grab_pub if sequence in ('grab', 'finish_grab') else self.place_pub)
         publisher.publish(Bool(data=success))
-        (self.get_logger().info if success else self.get_logger().error)(f'{sequence}: {reason}')
+        try:
+            (self.get_logger().info if success else self.get_logger().error)(f'{sequence}: {reason}')
+        except ValueError as error:
+            # rcutils can reject a severity change while a callback is already
+            # unwinding an exception. The failure has already been published;
+            # never let diagnostic logging kill the manipulation node.
+            if 'severity' not in str(error).lower():
+                raise
 
 
 def main():

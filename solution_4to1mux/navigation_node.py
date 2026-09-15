@@ -40,9 +40,12 @@ class State(Enum):
     BACK_OUT_FOR_VIEW = auto()
     WAIT_FOR_GRAB = auto()
     RETREAT_FROM_SHELF = auto()
+    WAIT_FOR_CARRY_RAISE = auto()
     RETURN_TO_START = auto()
     FIND_BIN = auto()
     APPROACH_BIN = auto()
+    WAIT_FOR_PLACE_PREP = auto()
+    APPROACH_BIN_FOR_PLACE = auto()
     WAIT_FOR_PLACE = auto()
     DONE = auto()
     FAILED = auto()
@@ -58,10 +61,15 @@ class NavigationNode(Node):
             'shelf_column_number': 1, 'linear_speed': 0.85, 'strafe_speed': 0.25,
             'rotate_speed': 0.85, 'search_rotate_speed': 0.45,
             'search_direction': 'right',
+            # The fixed bin is normally behind the west-facing start pose;
+            # begin its complete sweep counterclockwise.
+            'bin_search_direction': 'left',
             'phase_timeout': 90.0, 'grab_timeout': 120.0, 'place_timeout': 90.0,
             'startup_settle_time': 1.0, 'reading_max_age': 1.0,
             'book_standoff': 0.68, 'book_lateral_offset': -0.18,
-            'bin_standoff': 0.62, 'obstacle_margin': 0.12,
+            'bin_standoff': 0.95, 'bin_final_advance_max': 0.65,
+            'place_base_advance': 0.35,
+            'obstacle_margin': 0.12,
             # Minimum base-centre distance from the shelf-front plane while
             # docking.  This deliberately leaves more than the footprint
             # margin: a depth-biased book point must not put the bumper (or
@@ -75,6 +83,10 @@ class NavigationNode(Node):
             # Keep a 3 cm buffer above the shelf keepout while returning to
             # the book. Manipulation uses the same 0.28 m compensation.
             'grasp_base_return_advance': 0.28,
+            # The arm's calibrated high-carry pose sweeps a large arc.  A
+            # bottom-row grasp needs this full straight withdrawal before that
+            # pose is commanded, otherwise its elbow can still hit the shelf.
+            'carry_raise_retreat': 0.80,
             'max_book_recoveries': 2, 'head_scan_dwell': 1.8,
         }
         for key, value in defaults.items():
@@ -116,7 +128,10 @@ class NavigationNode(Node):
         self.grab_pub = self.create_publisher(Bool, '/manipulation/request_grab', 10)
         self.prepare_grab_pub = self.create_publisher(Bool, '/manipulation/request_prepare_grab', 10)
         self.finish_grab_pub = self.create_publisher(Bool, '/manipulation/request_finish_grab', 10)
+        self.raise_carry_pub = self.create_publisher(Bool, '/manipulation/request_raise_carry', 10)
         self.place_pub = self.create_publisher(Bool, '/manipulation/request_place', 10)
+        self.prepare_place_pub = self.create_publisher(Bool, '/manipulation/request_prepare_place', 10)
+        self.finish_place_pub = self.create_publisher(Bool, '/manipulation/request_finish_place', 10)
         self.cancel_pub = self.create_publisher(Bool, '/manipulation/cancel', 10)
         self.failure_pub = self.create_publisher(String, '/solution/failure', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.state_pub = self.create_publisher(String, '/solution/state', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -133,12 +148,14 @@ class NavigationNode(Node):
         self.create_subscription(String, '/perception/book_diagnostics', self.on_book_diagnostics, 10)
         self.create_subscription(Bool, '/manipulation/grab_complete', lambda m: self.on_result(m, State.WAIT_FOR_GRAB), 10)
         self.create_subscription(Bool, '/manipulation/grab_prepared', lambda m: self.on_result(m, State.WAIT_FOR_PREGRASP), 10)
+        self.create_subscription(Bool, '/manipulation/carry_raised', lambda m: self.on_result(m, State.WAIT_FOR_CARRY_RAISE), 10)
         self.create_subscription(Bool, '/manipulation/place_complete', lambda m: self.on_result(m, State.WAIT_FOR_PLACE), 10)
+        self.create_subscription(Bool, '/manipulation/place_prepared', lambda m: self.on_result(m, State.WAIT_FOR_PLACE_PREP), 10)
         self.create_timer(0.05, self.tick)
         self.wall_sample, self.sim_sample = time.monotonic(), self.now()
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(5.0, self.wall_status, clock=self.wall_clock)
-        self.get_logger().info(f'Navigation BUILD 4.4 (fast shelf-limited alignment): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
+        self.get_logger().info(f'Navigation BUILD 5.8 (bottom-row carry clearance + rear-centred bin release): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -236,6 +253,16 @@ class NavigationNode(Node):
         The dock goal and the wall must come from the same plane family so the
         goal always stays reachable on the robot side of the wall.
         """
+        # A bin sits on a table whose top edge can be invisible to the base
+        # LiDAR. During placement use its observed front plane as the virtual
+        # wall; otherwise use the confirmed shelf marker.
+        if self.state in (State.FIND_BIN, State.APPROACH_BIN,
+                          State.WAIT_FOR_PLACE_PREP, State.APPROACH_BIN_FOR_PLACE,
+                          State.WAIT_FOR_PLACE):
+            msg = self.observations.get('bin')
+            if msg is not None:
+                heading = yaw(msg.pose.orientation)
+                return pose_xyz(msg)[:2], np.array([math.cos(heading), math.sin(heading)])
         # The confirmed overhead marker is flush with the shelf front and is
         # a more stable wall reference than a colour/depth book point.  Keep
         # the book as a fallback for the close-up case where the marker has
@@ -284,7 +311,7 @@ class NavigationNode(Node):
             self.warn('deep_goal', f'Dock goal was {depth:+.2f} m of the shelf plane; clamped to {minimum:.2f} m in front. Book depth estimate is suspect.')
         return goal
 
-    def move(self, vx=0.0, vy=0.0, omega=0.0):
+    def move(self, vx=0.0, vy=0.0, omega=0.0, allow_turn_recovery=True):
         # Require fresh front AND rear scans for holonomic translation/rotation.
         if len(self.scans) < 2 or not all(self.fresh(v[0]) for v in self.scans.values()):
             self.stop()
@@ -347,7 +374,7 @@ class NavigationNode(Node):
             omega = 0.0
             self.last_gate = 'turning_envelope_blocked'
             self.warn('turn', 'Obstacle inside turning envelope; rotation stopped.')
-            if vx == 0.0 and vy == 0.0:
+            if allow_turn_recovery and vx == 0.0 and vy == 0.0:
                 # Rotation needed but blocked, and no translation commanded either:
                 # without this the robot freezes at the shelf until the phase times
                 # out. Back straight out (if the rear is clear) to regain turning room.
@@ -374,7 +401,8 @@ class NavigationNode(Node):
         self.get_logger().info(f'-> {state.name}')
         if state in (State.FIND_SHELF, State.FIND_BIN):
             self.search_origin = self.pose[2]
-            direction = -1 if self.p('search_direction') == 'right' else 1
+            search_direction = self.p('bin_search_direction') if state == State.FIND_BIN else self.p('search_direction')
+            direction = -1 if search_direction == 'right' else 1
             self.search_angles = [direction*math.radians(a) for a in (70, -70, 155, -155)]
             self.search_index = 0
             self.search_pause = self.now()+0.5
@@ -538,6 +566,28 @@ class NavigationNode(Node):
         self.move(vx, vy, omega)
         return False
 
+    def rotate_to(self, heading):
+        """Align heading without changing the already-valid base position."""
+        error = wrap(heading-self.pose[2])
+        if abs(error) < 0.04:
+            self.stop()
+            return True
+        omega = float(np.clip(1.6*error, -self.p('rotate_speed'), self.p('rotate_speed')))
+        # At the bin, reversing during a blocked rotation moves the base away
+        # from its calibrated drop position. Stop and retry rotation instead.
+        self.move(omega=omega, allow_turn_recovery=False)
+        return False
+
+    def drive_forward_to(self, goal, tolerance=0.03):
+        """Advance along the current heading only; never back away from a bin."""
+        heading = np.array([math.cos(self.pose[2]), math.sin(self.pose[2])])
+        remaining = float((goal[:2]-self.pose[:2]) @ heading)
+        if remaining <= tolerance:
+            self.stop()
+            return True
+        self.move(vx=min(self.p('docking_speed'), 1.8*remaining))
+        return False
+
     def shelf_limited_return_arrived(self, goal):
         """Accept a close return stopped solely by the hard shelf boundary."""
         return (self.last_gate.startswith('shelf_keepout') and
@@ -555,7 +605,8 @@ class NavigationNode(Node):
     def tick(self):
         elapsed = self.now()-self.entered
         self.bin_mode_pub.publish(Bool(data=self.state in (
-            State.RETURN_TO_START, State.FIND_BIN, State.APPROACH_BIN, State.WAIT_FOR_PLACE)))
+            State.RETURN_TO_START, State.FIND_BIN, State.APPROACH_BIN,
+            State.WAIT_FOR_PLACE_PREP, State.APPROACH_BIN_FOR_PLACE, State.WAIT_FOR_PLACE)))
         if self.state in (State.DONE, State.FAILED):
             self.stop()
             return
@@ -571,8 +622,9 @@ class NavigationNode(Node):
             elif elapsed > self.p('phase_timeout'):
                 self.fail('Startup timed out: inspect perception/manipulation logs for missing inputs/controllers.')
             return
-        if self.state in (State.RETREAT_FROM_SHELF, State.RETURN_TO_START,
-                          State.FIND_BIN, State.APPROACH_BIN) and not self.fresh(self.holding_stamp, 1.5):
+        if self.state in (State.RETREAT_FROM_SHELF, State.WAIT_FOR_CARRY_RAISE, State.RETURN_TO_START,
+                          State.FIND_BIN, State.APPROACH_BIN, State.WAIT_FOR_PLACE_PREP,
+                          State.APPROACH_BIN_FOR_PLACE) and not self.fresh(self.holding_stamp, 1.5):
             self.fail('Book contact lost while carrying, or manipulation feedback stopped.')
             return
         if self.state in (State.FIND_BOOK, State.REACQUIRE_BOOK) and elapsed > self.p('book_search_timeout'):
@@ -680,12 +732,24 @@ class NavigationNode(Node):
                     return
                 self.fail(f'Grasp failed: {self.manip_failure or "read /manipulation/failure for the controller or contact error"}')
             elif self.result is True:
-                # Keep heading and book height fixed until the entire book clears the shelf.
+                # The upright carry configuration moves its elbow through a
+                # broad arc. Back straight out first, especially for a book
+                # taken from the bottom shelf, before changing arm shape.
                 heading = self.pose[2]
-                self.goal = np.r_[self.pose[:2]-0.35*np.array([math.cos(heading), math.sin(heading)]), heading]
+                retreat = self.p('carry_raise_retreat')
+                self.goal = np.r_[self.pose[:2]-retreat*np.array([math.cos(heading), math.sin(heading)]), heading]
+                self.get_logger().info(f'Grasp verified; withdrawing {retreat:.2f} m before the high carry pose.')
                 self.transition(State.RETREAT_FROM_SHELF)
         elif self.state == State.RETREAT_FROM_SHELF:
             if self.drive_to(self.goal, keep_heading=True):
+                self.result = None
+                self.transition(State.WAIT_FOR_CARRY_RAISE)
+                self.raise_carry_pub.publish(Bool(data=True))
+        elif self.state == State.WAIT_FOR_CARRY_RAISE:
+            self.stop()
+            if self.result is False:
+                self.fail(f'Carry raise failed: {self.manip_failure or "see manipulation log"}')
+            elif self.result is True:
                 self.transition(State.RETURN_TO_START)
         elif self.state == State.RETURN_TO_START:
             self.look(tilt=-0.1)
@@ -701,17 +765,31 @@ class NavigationNode(Node):
                 self.search()
         elif self.state == State.APPROACH_BIN:
             self.look(self.observations.get('bin'))
-            if self.drive_to(self.goal):
-                if self.observation('bin') is None:
-                    self.warn('bin', 'Docked; waiting for a fresh collection-bin pose.')
-                    return
+            # The return/start pose is the calibrated table standoff.  Once
+            # the bin is found, only face it: correcting target-goal x/y here
+            # made the base reverse away from the ready-to-drop position.
+            if self.rotate_to(self.goal[2]):
+                # The high carry pose cannot reach a bin 1.53 m away (the
+                # observed failure was a 0.425 m IK position error). Advance
+                # only toward the bin until the calibrated 0.95 m arm standoff
+                # is reached; unlike target-goal docking this cannot reverse.
+                bin_pose = self.observations.get('bin')
+                heading = np.array([math.cos(self.pose[2]), math.sin(self.pose[2])])
+                distance = (float((pose_xyz(bin_pose)[:2]-self.pose[:2]) @ heading)
+                            if bin_pose is not None else self.p('bin_standoff'))
+                advance = float(np.clip(distance-self.p('bin_standoff'), 0.0,
+                                         self.p('bin_final_advance_max')))
+                self.goal = np.r_[self.pose[:2]+advance*heading, self.pose[2]]
+                self.transition(State.APPROACH_BIN_FOR_PLACE)
+        elif self.state == State.APPROACH_BIN_FOR_PLACE:
+            if self.drive_forward_to(self.goal):
                 self.result = None
                 self.transition(State.WAIT_FOR_PLACE)
-                self.place_pub.publish(Bool(data=True))
+                self.finish_place_pub.publish(Bool(data=True))
         elif self.state == State.WAIT_FOR_PLACE:
             self.stop()
             if self.result is False:
-                self.fail('Placement failed; see manipulation log.')
+                self.fail(f'Placement failed: {self.manip_failure or "manipulation returned false without a reason; inspect its preceding log."}')
             elif self.result is True:
                 self.transition(State.DONE)
 
