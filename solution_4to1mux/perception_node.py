@@ -46,7 +46,9 @@ class PerceptionNode(Node):
             'template_dir': str(Path(get_package_share_directory('solution_4to1mux')) / 'templates'),
             'depth_frame': 'head_front_camera_depth_optical_frame',
             'depth_max_skew': 0.20, 'observation_max_age': 0.8,
-            'column_half_width': 0.43, 'top_book_marker_offset': 0.665,
+            # Current simulator: marker centre 1.93 m, top active book 1.595 m.
+            'marker_min_height': 1.75, 'marker_max_height': 2.55,
+            'column_half_width': 0.43, 'top_book_marker_offset': 0.335,
             'row_spacing': 0.33, 'bin_min_area_fraction': 0.006,
         }
         for key, value in defaults.items():
@@ -57,8 +59,25 @@ class PerceptionNode(Node):
             raise ValueError('shelf_column_number must be 1..5; book_colour red/green/blue/yellow')
         self.images_dir = Path(self.get_parameter('erc_images_dir').value)
         self.images_dir.mkdir(parents=True, exist_ok=True)
-        self.detector = DigitDetector(template_dir=self.get_parameter('template_dir').value,
+        template_dir = Path(self.get_parameter('template_dir').value)
+        source_templates = Path(__file__).resolve().parents[1] / 'templates'
+        complete_templates = lambda path: all((path / f'{digit}.png').is_file()
+                                              for digit in range(1, 6))
+        if not complete_templates(template_dir) and complete_templates(source_templates):
+            self.get_logger().warn(
+                f'Installed shelf templates are incomplete at {template_dir}; '
+                f'using source templates at {source_templates}.')
+            template_dir = source_templates
+        self.detector = DigitDetector(template_dir=str(template_dir),
                                       min_area=25, match_threshold=0.55)
+        if self.detector.using_synthetic:
+            missing = ', '.join(map(str, sorted(set(range(1, 6))-
+                                                 self.detector.real_template_digits)))
+            self.get_logger().error(
+                f'Shelf digit detector is using synthetic templates; missing {missing} '
+                f'in {template_dir}. Correct shelf recognition may fail.')
+        else:
+            self.get_logger().info(f'Loaded all five shelf digit templates from {template_dir}.')
         self.bridge = CvBridge()
         self.tf = Buffer()
         self.listener = TransformListener(self.tf, self)
@@ -88,7 +107,10 @@ class PerceptionNode(Node):
         self.column_pub = self.create_publisher(Int32, '/erc/shelf_column_identification', 10)
         self.row_pub = self.create_publisher(Int32, '/erc/shelf_row_identification', 10)
         self.create_timer(1.0/self.get_parameter('perception_rate').value, self.process)
-        self.get_logger().info(f'RGB-D perception: column {self.target_column}, {self.target_colour}; latest-frame queue')
+        self.get_logger().info(
+            f'Perception BUILD 5.10: column {self.target_column}, {self.target_colour}; '
+            f'marker height {self.get_parameter("marker_min_height").value:.2f}-'
+            f'{self.get_parameter("marker_max_height").value:.2f} m')
 
     def on_rgb(self, msg):
         self.rgb = msg
@@ -163,14 +185,33 @@ class PerceptionNode(Node):
             self.process_book()
 
     def process_shelf(self):
+        detections = self.detector.detect(self.image)
         candidates = []
-        for digit, score, box in self.detector.detect(self.image):
+        rejected = {'depth': 0, 'height': 0}
+        measured_heights = []
+        min_height = self.get_parameter('marker_min_height').value
+        max_height = self.get_parameter('marker_max_height').value
+        for digit, score, box in detections:
             x, y, w, h = box
             p = self.point(x+w/2, y+h/2)
-            # Markers are overhead; rejecting low shapes avoids reading books as digits.
-            if p is not None and 1.95 < p[2] < 2.55:
+            if p is None or not np.isfinite(p).all():
+                rejected['depth'] += 1
+                continue
+            measured_heights.append((digit, round(float(p[2]), 3)))
+            # Reject book spines while allowing the current 1.93 m marker mount
+            # and the older 2.26 m mounting height.
+            if min_height < p[2] < max_height:
                 candidates.append((digit, score, box, p))
+            else:
+                rejected['height'] += 1
         if not candidates:
+            labels = sorted({digit for digit, _, _ in detections})
+            if labels:
+                self.warn(
+                    f'Shelf search recognized labels {labels}; rejected={rejected}; '
+                    f'heights_m={measured_heights}; allowed={min_height:.2f}-{max_height:.2f} m.')
+            else:
+                self.warn('Shelf search cannot recognize any number markers in the current camera view.')
             return
         points = np.array([c[3] for c in candidates])
         centre = points.mean(axis=0)
@@ -186,9 +227,18 @@ class PerceptionNode(Node):
                 if normal @ toward < 0:
                     normal *= -1
         heading = math.atan2(normal[1], normal[0])
-        self.unit_pub.publish(self.make_pose(centre, heading))
+        # A single sign only gives its bearing from the camera, not the shelf
+        # normal. Navigation uses this pose to choose a lateral scan direction,
+        # so publish it only when two separated signs establish the shelf line.
+        if reliable_normal:
+            self.unit_pub.publish(self.make_pose(centre, heading))
         target = next((c for c in candidates if c[0] == self.target_column), None)
         if target is None:
+            labels = sorted({candidate[0] for candidate in candidates})
+            if reliable_normal:
+                self.warn(f'Shelf search sees columns {labels}; waiting for requested column {self.target_column}.')
+            else:
+                self.warn(f'Shelf search sees labels {labels} but needs two separated markers to estimate the shelf direction; continuing the rotational search.')
             return
         _, score, box, p = target
         if self.confirm_column(p, heading, reliable_normal):
@@ -198,6 +248,8 @@ class PerceptionNode(Node):
                 self.save(box, 'shelf_column')
                 self.reported.add('column')
                 self.get_logger().info(f'Confirmed column {self.target_column} from live image (score {score:.2f})')
+        else:
+            self.warn(f'Requested column {self.target_column} is visible; stabilizing its measured pose.')
 
     def confirm_column(self, point, heading, reliable_normal):
         # Keep the confirmed reference when the overhead sign leaves the view.

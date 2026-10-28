@@ -41,7 +41,11 @@ def bare_nav():
                   scan_half_width=2.6, scan_step=.65, scan_observe_time=1.0,
                   shelf_keepout_distance=.62, arm_stow_timeout=10.0,
                   arm_stow_settle_time=2.5, grasp_base_retreat=.25,
-                  grasp_base_return_advance=.28, align_block_timeout=3.0)
+                  grasp_base_return_advance=.28, align_block_timeout=3.0,
+                  bin_turn_backoff=.25, max_bin_turn_recoveries=2,
+                  bin_turn_backoff_timeout=8.0, bin_standoff=.95,
+                  bin_final_advance_max=.65, book_standoff=.68,
+                  book_lateral_offset=-.18)
     n.p = values.__getitem__
     n.now = lambda: 10.0
     n.pose = np.array([0., 0., 0.])
@@ -54,6 +58,9 @@ def bare_nav():
     n.manip_failure = ''
     n.book_diagnostics = 'test diagnostics'
     n.book_recoveries = 0
+    n.bin_turn_recoveries = 0
+    n.bin_turn_retreat_total = 0.0
+    n.holding_stamp = 10.0
     n.cancel_pub = Pub()
     n.prepare_grab_pub, n.finish_grab_pub, n.grab_pub = Pub(), Pub(), Pub()
     n.bin_mode_pub = Pub()
@@ -177,11 +184,69 @@ def test_wrong_column_larger_colour_blob_is_rejected():
 
 def test_real_sim_digit_templates_match_supplied_frame():
     d = DigitDetector(str(ROOT/'templates'), min_area=25, match_threshold=.55)
-    image = cv2.imread(str(ROOT/'erc_images/shelf_column_20260912_120246_121458.png'))
+    image = cv2.imread(str(ROOT/'test/data/shelf_camera_reference.png'))
     results = d.detect(image)
     assert not d.using_synthetic
     assert any(digit == 2 and 420 < box[0] < 470 for digit, _, box in results)
     assert {digit for digit, _, box in results if box[1] > 20} == {2, 3, 4, 5}
+
+
+def shelf_perception(height):
+    n = bare_perception_tracker()
+    n.target_column = 2
+    n.target_colour = 'red'
+    n.image = np.zeros((160, 250, 3), np.uint8)
+    n.detector = NS(detect=lambda image: [(1, .9, (0, 0, 20, 30)),
+                                         (2, .9, (50, 0, 20, 30))])
+    n.camera_to_odom = np.eye(4)
+    n.point = lambda x, y: None if height is None else np.array([3., float(x > 50), height])
+    values = dict(marker_min_height=1.75, marker_max_height=2.55,
+                  column_half_width=.43, top_book_marker_offset=.335, row_spacing=.33)
+    n.get_parameter = lambda key: NS(value=values[key])
+    n.shelf_pub, n.unit_pub, n.column_pub = Pub(), Pub(), Pub()
+    n.book_pub, n.row_pub, n.book_diag_pub = Pub(), Pub(), Pub()
+    n.latest_book, n.book_hits = None, 0
+    n.reported = set()
+    n.log = Logger()
+    n.get_logger = lambda: n.log
+    n.warn = n.log.warn
+    n.save = lambda *args: None
+    return n
+
+
+@pytest.mark.parametrize('height', [1.93, 2.26])
+def test_shelf_detection_accepts_current_and_legacy_marker_mounts(height):
+    n = shelf_perception(height)
+    for _ in range(3):
+        n.process_shelf()
+    assert len(n.shelf_pub.messages) == 1
+    assert n.column_pub.messages[-1].data == 2
+    assert n.shelf_pub.messages[-1].pose.position.z == pytest.approx(height)
+    assert len(n.unit_pub.messages) == 3
+
+
+@pytest.mark.parametrize('height,reason', [(None, 'depth'), (float('nan'), 'depth'),
+                                          (1.595, 'height'), (2.8, 'height')])
+def test_shelf_rejections_distinguish_bad_depth_from_wrong_height(height, reason):
+    n = shelf_perception(height)
+    n.process_shelf()
+    assert not n.unit_pub.messages
+    assert not n.shelf_pub.messages
+    assert f"'{reason}': 2" in n.log.messages[-1]
+    assert 'heights_m=' in n.log.messages[-1]
+
+
+@pytest.mark.parametrize('row,height', [(1, 1.595), (2, 1.265), (3, .935), (4, .605)])
+def test_current_marker_mount_keeps_book_row_identification_correct(row, height):
+    n = shelf_perception(1.93)
+    for _ in range(3):
+        n.process_shelf()
+    n.image[40:100, 50:65] = (0, 0, 255)
+    n.point = lambda x, y: np.array([3., 1., height])
+    for _ in range(3):
+        n.process_book()
+    assert n.row_pub.messages[-1].data == row
+    assert n.book_pub.messages[-1].pose.position.z == pytest.approx(height)
 
 
 @pytest.mark.parametrize('height', [.605, .935, 1.265, 1.595])
@@ -326,6 +391,102 @@ def test_bin_rotation_does_not_use_turn_blocked_reverse_recovery():
     assert n.last_gate == 'turning_envelope_blocked'
 
 
+def bin_approach():
+    n = bare_nav()
+    n.state = State.APPROACH_BIN
+    n.look = lambda *args, **kwargs: None
+    n.goal = np.array([0., 0., .30])
+    n.observations['bin'] = make_heading_pose([1.6, 0., .85], .30)
+    n.scans['front'] = (10., np.array([[.40, .10]]))
+    return n
+
+
+def test_blocked_bin_turn_retreats_then_retries_and_compensates_final_advance():
+    n = bin_approach()
+    n.tick()
+    assert n.state == State.BACK_OUT_FOR_BIN_TURN
+    assert n.bin_mode_pub.messages[-1].data
+    assert n.bin_turn_recoveries == 1
+    assert np.allclose(n.goal, [-.25, 0., 0.])
+    n.tick()
+    command = n.cmd_pub.messages[-1]
+    assert -.08 <= command.linear.x < 0
+    assert command.linear.y == command.angular.z == 0
+    # Complete the measured withdrawal, then clear the front and finish turning.
+    n.pose[0] = -.24
+    n.tick()
+    assert n.state == State.APPROACH_BIN
+    assert n.goal[2] == pytest.approx(.30)
+    assert n.bin_turn_retreat_total == pytest.approx(.24)
+    n.scans['front'] = (10., np.empty((0, 2)))
+    n.pose[2] = .30
+    n.tick()
+    assert n.state == State.APPROACH_BIN_FOR_PLACE
+    advance = np.linalg.norm(n.goal[:2]-n.pose[:2])
+    # The original 0.65 m cap would now stop too far from the bin.
+    assert .65 < advance <= .65+.24
+    direction = np.array([math.cos(.30), math.sin(.30)])
+    assert (n.observations['bin'].pose.position.x-n.goal[0])*direction[0] + (-n.goal[1])*direction[1] == pytest.approx(.95)
+
+
+@pytest.mark.parametrize('rear', [[[-.60, 0.]], [[-.60, .34]]])
+def test_blocked_bin_turn_refuses_retreat_with_insufficient_rear_clearance(rear):
+    n = bin_approach()
+    n.scans['rear'] = (10., np.array(rear))
+    n.tick()
+    assert n.state == State.FAILED
+    assert 'rear clearance' in n.failure_pub.messages[-1].data
+    assert all(m.linear.x == m.linear.y == m.angular.z == 0 for m in n.cmd_pub.messages)
+
+
+def test_bin_turn_retreat_keeps_bin_wall_and_stops_for_new_obstacle():
+    n = bin_approach()
+    n.tick()
+    assert n.state == State.BACK_OUT_FOR_BIN_TURN
+    assert np.allclose(n.wall_reference()[0], [1.6, 0.])
+    n.scans['rear'] = (10., np.array([[-.45, 0.]]))
+    n.tick()
+    assert n.cmd_pub.messages[-1].linear.x == 0
+    assert n.last_gate.startswith('obstacle_clearance')
+
+
+def test_bin_turn_retreat_waits_for_fresh_scans():
+    n = bin_approach()
+    n.tick()
+    n.scans['rear'] = (1., np.empty((0, 2)))
+    n.tick()
+    assert n.state == State.BACK_OUT_FOR_BIN_TURN
+    assert n.cmd_pub.messages[-1].linear.x == 0
+    assert n.last_gate == 'stale_or_missing_lidar'
+
+
+def test_bin_turn_recovery_budget_does_not_repeat_forever():
+    n = bin_approach()
+    n.bin_turn_recoveries = 2
+    n.tick()
+    assert n.state == State.FAILED
+    assert 'bounded clearance retreats' in n.failure_pub.messages[-1].data
+
+
+def test_bin_turn_retreat_monitors_held_book():
+    n = bin_approach()
+    n.tick()
+    n.holding_stamp = 1.
+    n.tick()
+    assert n.state == State.FAILED
+    assert 'Book contact lost' in n.failure_pub.messages[-1].data
+
+
+def test_bin_turn_retreat_times_out_when_reverse_path_stays_blocked():
+    n = bin_approach()
+    n.tick()
+    n.entered = 0.
+    n.scans['rear'] = (10., np.array([[-.45, 0.]]))
+    n.tick()
+    assert n.state == State.FAILED
+    assert 'Bin-turn retreat could not finish' in n.failure_pub.messages[-1].data
+
+
 def test_final_bin_advance_is_forward_only_and_stops_without_reversing():
     n = bare_nav()
     assert not n.drive_forward_to(np.array([.50, 0., 0.]))
@@ -374,6 +535,43 @@ def test_scan_waypoints_remain_bounded_on_both_sides():
         n.advance_scan_waypoint()
     assert min(offsets) == pytest.approx(-2.6)
     assert max(offsets) == pytest.approx(2.6)
+
+
+def test_column_scan_observes_all_pitches_while_stopped_then_advances():
+    n = bare_nav()
+    n.observations['shelf_unit'] = target(3., 0., 1.93)
+    looked = []
+    n.look = lambda *args, **kwargs: looked.append(kwargs['tilt'])
+    n.transition(State.SCAN_COLUMNS)
+    n.pose = n.scan_goal.copy()
+    n.tick()
+    initial_goal = n.scan_goal.copy()
+    for stamp, tilt in [(10.1, .28), (11.9, .12), (13.7, -.08), (15.39, -.08)]:
+        n.now = lambda: stamp
+        n.odom_stamp = stamp
+        n.tick()
+        assert looked[-1] == pytest.approx(tilt)
+        assert np.array_equal(n.scan_goal, initial_goal)
+        assert n.last_command == (0., 0., 0.)
+        assert n.last_gate.startswith('observing_columns')
+    n.now = lambda: 15.41
+    n.odom_stamp = 15.41
+    n.tick()
+    assert n.scan_offset == pytest.approx(-.65)
+    assert not np.array_equal(n.scan_goal, initial_goal)
+    assert n.scan_pause_until is None
+
+
+def test_target_column_acquired_during_observation_skips_remaining_dwell():
+    n = bare_nav()
+    n.observations['shelf_unit'] = target(3., 0., 1.93)
+    n.look = lambda *args, **kwargs: None
+    n.transition(State.SCAN_COLUMNS)
+    n.pose = n.scan_goal.copy()
+    n.tick()
+    n.observations['shelf'] = target(3., 0., 1.93)
+    n.tick()
+    assert n.state == State.APPROACH_COLUMN
 
 
 def test_stale_cached_book_does_not_pin_camera_forever():
@@ -428,6 +626,7 @@ def test_calibrated_arm_stow_settle_does_not_wait_for_exact_gazebo_feedback():
     n.tick()
     n.tick()  # Publish the two-second calibrated trajectories.
     n.now = lambda: 12.6
+    n.odom_stamp = 12.6
     n.arm_joint_stamp = 12.6
     n.tick()
     assert n.state == State.ALIGN_BOOK

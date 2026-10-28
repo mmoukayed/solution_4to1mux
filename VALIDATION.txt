@@ -1,3 +1,34 @@
+Validation performed 2026-10-28 — navigation/perception build 5.10
+
+78 offline regression cases passed with:
+PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider test/test_regressions.py
+
+Twelve additional cases cover marker acceptance at 1.93/2.26 m, separate
+missing/nonfinite-depth and low/high-height rejection diagnostics, all four
+book rows under the current 1.93 m marker mount, a complete stationary pitch
+scan followed by waypoint advancement, and immediate target acquisition
+during observation. The recorded camera fixture was copied from the
+repository's original image into test/data/shelf_camera_reference.png so
+clearing erc_images does not delete a test input. Deleted trial images were
+left as they were.
+Python syntax checks and git diff --check passed.
+No live Gazebo trial was run for this change.
+
+Earlier validation record:
+Validation performed 2026-10-28 — navigation build 5.9
+
+66 offline regression cases passed with:
+PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider test/test_regressions.py
+
+Nine new cases cover blocked bin rotation recovery, measured retreat
+compensation in the final forward approach, insufficient rear clearance
+(centre and footprint edge), an obstacle appearing during retreat, stale
+LiDAR, bounded retries, held-book contact loss, and retreat timeout.
+Existing test setup was supplied with missing docking parameters and a fresh
+odometry stamp when advancing its simulated clock for arm-stow completion.
+git diff --check passed. No live Gazebo trial was run for this change.
+
+Earlier validation record:
 Validation performed 2026-09-14 — revision 3
 
 49 offline regression tests passed (41 existing + 4 new: virtual shelf wall

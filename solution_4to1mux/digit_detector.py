@@ -45,16 +45,14 @@ class DigitDetector:
         if self.save_candidates:
             os.makedirs(self.candidate_dir, exist_ok=True)
 
+        self.real_template_digits = set()
         self.templates = self._load_templates()
         self.using_synthetic = not self._has_real_templates()
 
     # ---------------- templates ----------------
 
     def _has_real_templates(self):
-        if not os.path.isdir(self.template_dir):
-            return False
-        return any(os.path.exists(os.path.join(self.template_dir, f'{d}.png'))
-                   for d in VALID_DIGITS)
+        return len(self.real_template_digits) == len(VALID_DIGITS)
 
     def _load_templates(self):
         templates = {}
@@ -64,6 +62,7 @@ class DigitDetector:
                 img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
                 if img is not None:
                     templates[digit] = self._normalize(img)
+                    self.real_template_digits.add(digit)
         for digit in VALID_DIGITS:
             if digit not in templates:
                 templates[digit] = self._synthetic_template(digit)

@@ -49,7 +49,11 @@ ros2 launch solution_4to1mux solution.launch.py shelf_column_number:=2 book_colo
 
 This package targets the **ERC simulator supplied in the 11 September 2026 ZIP**, ROS 2 Humble and Gazebo Harmonic. It uses the right arm only. Launch the simulator first, then launch this package.
 
-**Current build: 5.8.** Startup must print `Navigation BUILD 5.8` and `Manipulation BUILD 5.8` — if it does not, the rebuild did not take and you are running older code.
+**Current navigation/perception build: 5.10; manipulation build: 5.8.** Startup must print `Navigation BUILD 5.10`, `Perception BUILD 5.10` and `Manipulation BUILD 5.8` — if it does not, the rebuild did not take and you are running older code.
+
+- **Build 5.10:** the local simulator's number markers spawn at 1.93 m, below the old hardcoded 1.95 m minimum. Shelf recognition now allows marker heights from 1.75 to 2.55 m and logs separate depth/height rejection counts with measured heights. The marker-to-top-active-book offset is 0.335 m for this mounting height. Launch arguments `marker_min_height`, `marker_max_height` and `top_book_marker_offset` expose these calibrations; older simulator layouts with 2.26 m markers should use `top_book_marker_offset:=0.665`. At every column scan waypoint, the base now stays stopped through all three head pitches (5.4 simulation seconds by default), with `gate=observing_columns_...` identifying that observation pause. A confirmed target immediately ends the pause.
+
+- **Navigation build 5.9:** `APPROACH_BIN` now recovers from `turning_envelope_blocked` with a separate `BACK_OUT_FOR_BIN_TURN` state. It checks rear clearance for a 0.25 m withdrawal, reverses at up to 0.08 m/s without rotation, then retries alignment. Both LiDAR feeds, held-book contact and the virtual bin wall remain active. Recovery is limited to two retreats, with an 8 s simulation-time limit per retreat. The final forward advance compensates for the measured withdrawal so the extra clearance does not leave the book beyond arm reach. Status output now includes angular command and heading error.
 
 - **Build 5.8:** the bin release point moves an additional 0.10 m back toward the robot: the inward bin offset is now 0.22 m (was 0.12 m).
 

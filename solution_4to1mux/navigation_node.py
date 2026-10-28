@@ -44,6 +44,7 @@ class State(Enum):
     RETURN_TO_START = auto()
     FIND_BIN = auto()
     APPROACH_BIN = auto()
+    BACK_OUT_FOR_BIN_TURN = auto()
     WAIT_FOR_PLACE_PREP = auto()
     APPROACH_BIN_FOR_PLACE = auto()
     WAIT_FOR_PLACE = auto()
@@ -68,6 +69,8 @@ class NavigationNode(Node):
             'startup_settle_time': 1.0, 'reading_max_age': 1.0,
             'book_standoff': 0.68, 'book_lateral_offset': -0.18,
             'bin_standoff': 0.95, 'bin_final_advance_max': 0.65,
+            'bin_turn_backoff': 0.25, 'max_bin_turn_recoveries': 2,
+            'bin_turn_backoff_timeout': 8.0,
             'place_base_advance': 0.35,
             'obstacle_margin': 0.12,
             # Minimum base-centre distance from the shelf-front plane while
@@ -110,6 +113,8 @@ class NavigationNode(Node):
         self.warned = {}
         self.goal = None
         self.book_recoveries = 0
+        self.bin_turn_recoveries = 0
+        self.bin_turn_retreat_total = 0.0
         self.last_command = (0.0, 0.0, 0.0)
         self.actual_speed = 0.0
         self.arm_joints = {}
@@ -155,7 +160,7 @@ class NavigationNode(Node):
         self.wall_sample, self.sim_sample = time.monotonic(), self.now()
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(5.0, self.wall_status, clock=self.wall_clock)
-        self.get_logger().info(f'Navigation BUILD 5.8 (bottom-row carry clearance + rear-centred bin release): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
+        self.get_logger().info(f'Navigation BUILD 5.10 (stationary shelf observation + bin-turn recovery): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -230,9 +235,12 @@ class NavigationNode(Node):
         book = self.observations.get('book')
         book_age = 'none' if book is None else f'{self.now()-Time.from_msg(book.header.stamp).nanoseconds/1e9:.1f}s'
         remaining = 'none' if self.goal is None or self.pose is None else f'{np.linalg.norm(self.goal[:2]-self.pose[:2]):.2f}m'
+        heading_error = ('none' if self.goal is None or self.pose is None else
+                         f'{math.degrees(wrap(self.goal[2]-self.pose[2])):+.1f}deg')
         self.get_logger().info(
             f'State={self.state.name}; sim/wall={rtf:.2f}; command={cmd_speed:.2f}m/s; '
-            f'odom={self.actual_speed:.2f}m/s; remaining={remaining}; book_age={book_age}; gate={self.last_gate}')
+            f'turn={self.last_command[2]:+.2f}rad/s; odom={self.actual_speed:.2f}m/s; '
+            f'remaining={remaining}; heading_error={heading_error}; book_age={book_age}; gate={self.last_gate}')
         if self.state == State.FAILED:
             self.get_logger().error(f'Failure retained on /solution/failure: {self.failure_reason}')
         if rtf < 0.5:
@@ -257,6 +265,7 @@ class NavigationNode(Node):
         # LiDAR. During placement use its observed front plane as the virtual
         # wall; otherwise use the confirmed shelf marker.
         if self.state in (State.FIND_BIN, State.APPROACH_BIN,
+                          State.BACK_OUT_FOR_BIN_TURN,
                           State.WAIT_FOR_PLACE_PREP, State.APPROACH_BIN_FOR_PLACE,
                           State.WAIT_FOR_PLACE):
             msg = self.observations.get('bin')
@@ -407,12 +416,20 @@ class NavigationNode(Node):
             self.search_index = 0
             self.search_pause = self.now()+0.5
         if state == State.SCAN_COLUMNS:
-            self.scan_origin = self.pose[:2].copy()
-            self.scan_heading = yaw(self.observations['shelf_unit'].pose.orientation)
+            shelf_unit = self.observations['shelf_unit']
+            self.scan_heading = yaw(shelf_unit.pose.orientation)
+            shelf_normal = np.array([math.cos(self.scan_heading), math.sin(self.scan_heading)])
+            # Center the sweep on the measured marker cluster, not wherever the
+            # robot happened to be when the first non-target sign was spotted.
+            # The marker normal points into the shelf, so stand 1.8 m in front.
+            self.scan_origin = pose_xyz(shelf_unit)[:2]-1.8*shelf_normal
             self.scan_direction = -1 if self.p('search_direction') == 'right' else 1
             self.scan_offset = 0.0
             self.scan_pause_until = None
-            self.advance_scan_waypoint()
+            self.scan_observe_started = None
+            # First stop in front of the marker cluster and observe; only then
+            # begin the lateral column sweep.
+            self.scan_goal = np.r_[self.scan_origin, self.scan_heading]
 
     def advance_scan_waypoint(self):
         limit = self.p('scan_half_width')
@@ -423,6 +440,7 @@ class NavigationNode(Node):
         # Fixed waypoint. Do not shift it sideways on every timer tick.
         self.scan_goal = np.r_[self.scan_origin+self.scan_offset*left, self.scan_heading]
         self.scan_pause_until = None
+        self.scan_observe_started = None
 
     def scan_for_book(self, elapsed):
         self.stop()
@@ -526,6 +544,14 @@ class NavigationNode(Node):
         msg.points = [point]
         self.head_pub.publish(msg)
 
+    def look_for_shelf(self, elapsed):
+        # The shelf numbers sit above the book rows. Sweep the camera pitch as
+        # the base scans so acquisition still works when the initial head pose
+        # puts the overhead markers outside the camera's vertical field of view.
+        tilts = (0.28, 0.12, -0.08)
+        tilt = tilts[int(max(0.0, elapsed) / self.p('head_scan_dwell')) % len(tilts)]
+        self.look(tilt=tilt)
+
     def search(self):
         if self.now() < self.search_pause:
             self.stop()
@@ -573,9 +599,49 @@ class NavigationNode(Node):
             self.stop()
             return True
         omega = float(np.clip(1.6*error, -self.p('rotate_speed'), self.p('rotate_speed')))
-        # At the bin, reversing during a blocked rotation moves the base away
-        # from its calibrated drop position. Stop and retry rotation instead.
+        # Keep rotation itself translation-free. APPROACH_BIN handles a blocked
+        # turn with a separate, bounded retreat and recomputes the final advance.
         self.move(omega=omega, allow_turn_recovery=False)
+        return False
+
+    def back_out_for_bin_turn(self):
+        """Make room for a blocked bin turn without reversing indefinitely."""
+        if self.bin_turn_recoveries >= self.p('max_bin_turn_recoveries'):
+            self.fail('Bin rotation is still blocked after the bounded clearance retreats; inspect front/rear LiDAR around the base.')
+            return
+        # Check the entire planned reverse path before beginning the recovery.
+        # move() continues checking both sensors and obstacles on every tick.
+        if len(self.scans) < 2 or not all(self.fresh(v[0]) for v in self.scans.values()):
+            self.stop()
+            self.last_gate = 'stale_or_missing_lidar'
+            return
+        points = np.concatenate([v[1] for v in self.scans.values()])
+        wall = self.shelf_wall_points(self.wall_reference())
+        points = np.concatenate([points, wall])
+        behind = points[(points[:, 0] < 0) & (np.abs(points[:, 1]) < 0.35)]
+        clearance = float(-behind[:, 0].max())-0.36 if len(behind) else float('inf')
+        retreat = self.p('bin_turn_backoff')
+        if clearance < retreat+self.p('obstacle_margin'):
+            self.fail(f'Bin rotation blocked and rear clearance {clearance:.2f} m is too small for a {retreat:.2f} m retreat.')
+            return
+        self.bin_turn_recoveries += 1
+        self.bin_approach_heading = self.goal[2]
+        self.bin_retreat_origin = self.pose[:2].copy()
+        heading = self.pose[2]
+        self.goal = np.r_[self.pose[:2]-retreat*np.array([math.cos(heading), math.sin(heading)]), heading]
+        self.get_logger().warn(
+            f'Bin turn blocked; backing straight out {retreat:.2f} m before retrying '
+            f'({self.bin_turn_recoveries}/{self.p("max_bin_turn_recoveries")}).')
+        self.transition(State.BACK_OUT_FOR_BIN_TURN)
+
+    def drive_bin_turn_backoff(self):
+        # Translate along the saved heading without any simultaneous rotation.
+        heading = np.array([math.cos(self.goal[2]), math.sin(self.goal[2])])
+        remaining = float((self.pose[:2]-self.goal[:2]) @ heading)
+        if remaining <= 0.02:
+            self.stop()
+            return True
+        self.move(vx=-min(0.08, 1.8*remaining), allow_turn_recovery=False)
         return False
 
     def drive_forward_to(self, goal, tolerance=0.03):
@@ -606,6 +672,7 @@ class NavigationNode(Node):
         elapsed = self.now()-self.entered
         self.bin_mode_pub.publish(Bool(data=self.state in (
             State.RETURN_TO_START, State.FIND_BIN, State.APPROACH_BIN,
+            State.BACK_OUT_FOR_BIN_TURN,
             State.WAIT_FOR_PLACE_PREP, State.APPROACH_BIN_FOR_PLACE, State.WAIT_FOR_PLACE)))
         if self.state in (State.DONE, State.FAILED):
             self.stop()
@@ -623,7 +690,7 @@ class NavigationNode(Node):
                 self.fail('Startup timed out: inspect perception/manipulation logs for missing inputs/controllers.')
             return
         if self.state in (State.RETREAT_FROM_SHELF, State.WAIT_FOR_CARRY_RAISE, State.RETURN_TO_START,
-                          State.FIND_BIN, State.APPROACH_BIN, State.WAIT_FOR_PLACE_PREP,
+                          State.FIND_BIN, State.APPROACH_BIN, State.BACK_OUT_FOR_BIN_TURN, State.WAIT_FOR_PLACE_PREP,
                           State.APPROACH_BIN_FOR_PLACE) and not self.fresh(self.holding_stamp, 1.5):
             self.fail('Book contact lost while carrying, or manipulation feedback stopped.')
             return
@@ -635,7 +702,8 @@ class NavigationNode(Node):
             self.fail(f'{self.state.name} timed out after {elapsed:.1f} simulation seconds; inspect preceding warnings.')
             return
         if self.state in (State.FIND_SHELF, State.SCAN_COLUMNS):
-            self.look()
+            observing = self.state == State.SCAN_COLUMNS and self.scan_pause_until is not None
+            self.look_for_shelf(self.now()-self.scan_observe_started if observing else elapsed)
             target = self.observation('shelf')
             if target is not None:
                 self.goal = self.target_goal(target, 1.15)
@@ -649,10 +717,16 @@ class NavigationNode(Node):
                 self.goal = self.scan_goal
                 if self.scan_pause_until is not None:
                     self.stop()
+                    self.last_gate = f'observing_columns_{max(0.0, self.scan_pause_until-self.now()):.1f}s'
                     if self.now() >= self.scan_pause_until:
                         self.advance_scan_waypoint()
                 elif self.drive_to(self.scan_goal):
-                    self.scan_pause_until = self.now()+self.p('scan_observe_time')
+                    # One full pitch sweep, including head settling and three
+                    # stable observations at each pitch, with the base stopped.
+                    self.scan_observe_started = self.now()
+                    self.scan_pause_until = self.now()+max(
+                        self.p('scan_observe_time'), 3*self.p('head_scan_dwell'))
+                    self.last_gate = 'observing_columns'
         elif self.state == State.APPROACH_COLUMN:
             if self.drive_to(self.goal):
                 self.transition(State.FIND_BOOK)
@@ -760,14 +834,15 @@ class NavigationNode(Node):
             target = self.observation('bin')
             if target is not None:
                 self.goal = self.target_goal(target, self.p('bin_standoff'), self.p('book_lateral_offset'))
+                self.bin_turn_recoveries = 0
+                self.bin_turn_retreat_total = 0.0
                 self.transition(State.APPROACH_BIN)
             else:
                 self.search()
         elif self.state == State.APPROACH_BIN:
             self.look(self.observations.get('bin'))
-            # The return/start pose is the calibrated table standoff.  Once
-            # the bin is found, only face it: correcting target-goal x/y here
-            # made the base reverse away from the ready-to-drop position.
+            # Face the bin at the return pose, making a bounded retreat only
+            # when LiDAR prevents rotation. Recompute distance after recovery.
             if self.rotate_to(self.goal[2]):
                 # The high carry pose cannot reach a bin 1.53 m away (the
                 # observed failure was a 0.425 m IK position error). Advance
@@ -778,9 +853,19 @@ class NavigationNode(Node):
                 distance = (float((pose_xyz(bin_pose)[:2]-self.pose[:2]) @ heading)
                             if bin_pose is not None else self.p('bin_standoff'))
                 advance = float(np.clip(distance-self.p('bin_standoff'), 0.0,
-                                         self.p('bin_final_advance_max')))
+                                         self.p('bin_final_advance_max')+self.bin_turn_retreat_total))
                 self.goal = np.r_[self.pose[:2]+advance*heading, self.pose[2]]
                 self.transition(State.APPROACH_BIN_FOR_PLACE)
+            elif self.last_gate == 'turning_envelope_blocked':
+                self.back_out_for_bin_turn()
+        elif self.state == State.BACK_OUT_FOR_BIN_TURN:
+            self.look(self.observations.get('bin'))
+            if self.drive_bin_turn_backoff():
+                self.bin_turn_retreat_total += float(np.linalg.norm(self.pose[:2]-self.bin_retreat_origin))
+                self.goal = np.r_[self.pose[:2], self.bin_approach_heading]
+                self.transition(State.APPROACH_BIN)
+            elif elapsed > self.p('bin_turn_backoff_timeout'):
+                self.fail(f'Bin-turn retreat could not finish within {self.p("bin_turn_backoff_timeout"):.0f} s; gate={self.last_gate}.')
         elif self.state == State.APPROACH_BIN_FOR_PLACE:
             if self.drive_forward_to(self.goal):
                 self.result = None
