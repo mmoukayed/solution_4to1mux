@@ -1,6 +1,12 @@
 """Live RGB-D target detection; no Gazebo model poses or fixed column ordering."""
+import csv
+import io
 import math
+import shutil
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import cv2
@@ -28,6 +34,90 @@ COLOR_RANGES = {
 SENSOR_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
 
 
+def normalized_label(text):
+    return ''.join(character for character in text.casefold() if character.isalnum())
+
+
+def label_matches(candidate, target):
+    candidate, target = normalized_label(candidate), normalized_label(target)
+    if candidate == target:
+        return True
+    return (len(target) >= 5 and abs(len(candidate)-len(target)) <= 1
+            and SequenceMatcher(None, candidate, target).ratio() >= 0.90)
+
+
+def read_text_label_boxes(crop, target):
+    """Read exact target labels printed vertically along book spines.
+
+    Tesseract runs in a worker thread so book search continues while OCR is
+    processing. The returned boxes use coordinates in the unrotated crop.
+    """
+    if crop.size == 0:
+        return []
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    gray = cv2.equalizeHist(gray)
+    scale = 3
+    matches = []
+    rotations = (
+        ('ccw', cv2.rotate(gray, cv2.ROTATE_90_COUNTERCLOCKWISE)),
+        ('cw', cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE)),
+    )
+    for direction, rotated in rotations:
+        enlarged = cv2.resize(rotated, None, fx=scale, fy=scale,
+                              interpolation=cv2.INTER_CUBIC)
+        success, encoded = cv2.imencode('.png', enlarged)
+        if not success:
+            continue
+        result = subprocess.run(
+            ['tesseract', 'stdin', 'stdout', '--psm', '11', '-l', 'eng', 'tsv'],
+            input=encoded.tobytes(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False, timeout=1.5)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.decode(errors='replace').strip()
+                               or 'Tesseract returned a non-zero status.')
+        lines = {}
+        reader = csv.DictReader(io.StringIO(result.stdout.decode(errors='replace')),
+                                delimiter='\t')
+        for word in reader:
+            if word.get('level') != '5' or not word.get('text', '').strip():
+                continue
+            try:
+                confidence = float(word['conf'])
+                x, y = int(word['left']), int(word['top'])
+                width, height = int(word['width']), int(word['height'])
+                key = tuple(int(word[name]) for name in
+                            ('page_num', 'block_num', 'par_num', 'line_num'))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if confidence < 18:
+                continue
+            group = lines.setdefault(key, {'words': [], 'confidence': [],
+                                           'left': x, 'top': y,
+                                           'right': x+width, 'bottom': y+height})
+            group['words'].append((int(word['word_num']), word['text']))
+            group['confidence'].append(confidence)
+            group['left'] = min(group['left'], x)
+            group['top'] = min(group['top'], y)
+            group['right'] = max(group['right'], x+width)
+            group['bottom'] = max(group['bottom'], y+height)
+        for group in lines.values():
+            text = ''.join(word for _, word in sorted(group['words']))
+            if not label_matches(text, target):
+                continue
+            left = group['left']/scale
+            top = group['top']/scale
+            width = (group['right']-group['left'])/scale
+            height = (group['bottom']-group['top'])/scale
+            crop_height, crop_width = gray.shape
+            if direction == 'ccw':
+                box = (crop_width-top-height, left, height, width)
+            else:
+                box = (top, crop_height-left-width, height, width)
+            confidence = float(np.mean(group['confidence']))
+            matches.append((tuple(int(round(value)) for value in box), confidence, text))
+    return matches
+
+
 def colour_boxes(image, colour, minimum_area=12):
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     mask = np.zeros(image.shape[:2], np.uint8)
@@ -41,7 +131,8 @@ class PerceptionNode(Node):
     def __init__(self):
         super().__init__('perception_node')
         defaults = {
-            'shelf_column_number': 1, 'book_colour': 'red', 'perception_rate': 8.0,
+            'shelf_column_number': 1, 'book_colour': 'red', 'book_text': '',
+            'perception_rate': 8.0, 'book_text_ocr_period': 0.45,
             'erc_images_dir': str(Path(__file__).resolve().parents[1] / 'erc_images'),
             'template_dir': str(Path(get_package_share_directory('solution_4to1mux')) / 'templates'),
             'depth_frame': 'head_front_camera_depth_optical_frame',
@@ -55,8 +146,11 @@ class PerceptionNode(Node):
             self.declare_parameter(key, value)
         self.target_column = self.get_parameter('shelf_column_number').value
         self.target_colour = self.get_parameter('book_colour').value.lower()
-        if self.target_column not in range(1, 6) or self.target_colour not in COLOR_RANGES:
-            raise ValueError('shelf_column_number must be 1..5; book_colour red/green/blue/yellow')
+        self.target_text = str(self.get_parameter('book_text').value).strip()
+        if self.target_column not in range(1, 6) or (not self.target_text and self.target_colour not in COLOR_RANGES):
+            raise ValueError('shelf_column_number must be 1..5; set book_colour to red/green/blue/yellow or provide book_text')
+        if self.target_text and shutil.which('tesseract') is None:
+            raise RuntimeError('book_text requires Tesseract OCR. Install it in the simulator container with: apt install tesseract-ocr')
         self.images_dir = Path(self.get_parameter('erc_images_dir').value)
         self.images_dir.mkdir(parents=True, exist_ok=True)
         template_dir = Path(self.get_parameter('template_dir').value)
@@ -93,6 +187,14 @@ class PerceptionNode(Node):
         self.warned_at = -100.0
         self.latest_book = None
         self.book_hits = 0
+        self.ocr_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='book-text-ocr')
+        self.ocr_future = None
+        self.ocr_pending_context = None
+        self.ocr_result_context = None
+        self.ocr_boxes = []
+        self.ocr_sequence = 0
+        self.ocr_handled = 0
+        self.ocr_submit_at = -100.0
         prefix = '/head_front_camera/head_front_camera'
         self.create_subscription(Image, prefix+'/color/image_raw', self.on_rgb, SENSOR_QOS)
         self.create_subscription(Image, prefix+'/depth/image_rect_raw', self.on_depth, SENSOR_QOS)
@@ -108,7 +210,8 @@ class PerceptionNode(Node):
         self.row_pub = self.create_publisher(Int32, '/erc/shelf_row_identification', 10)
         self.create_timer(1.0/self.get_parameter('perception_rate').value, self.process)
         self.get_logger().info(
-            f'Perception BUILD 5.10: column {self.target_column}, {self.target_colour}; '
+            f'Perception BUILD 5.11: column {self.target_column}, '
+            f'{"text="+self.target_text if self.target_text else self.target_colour}; '
             f'marker height {self.get_parameter("marker_min_height").value:.2f}-'
             f'{self.get_parameter("marker_max_height").value:.2f} m')
 
@@ -131,17 +234,82 @@ class PerceptionNode(Node):
             self.warned_at = now
 
     def point(self, px, py):
-        dh, dw = self.depth_image.shape
-        h, w = self.image.shape[:2]
+        return self.point_in_frame(px, py, self.image.shape[:2], self.depth_image,
+                                   self.camera_to_odom, self.info)
+
+    @staticmethod
+    def point_in_frame(px, py, image_shape, depth_image, camera_to_odom, info):
+        dh, dw = depth_image.shape
+        h, w = image_shape
         u, v = px*dw/w, py*dh/h
-        z = depth_median(self.depth_image, u, v)
+        z = depth_median(depth_image, u, v)
         if z is None:
             return None
-        fx, fy, cx, cy = self.info.k[0], self.info.k[4], self.info.k[2], self.info.k[5]
+        fx, fy, cx, cy = info.k[0], info.k[4], info.k[2], info.k[5]
         if fx <= 0 or fy <= 0:
             return None
         # Gazebo colour/depth streams share the virtual sensor projection.
-        return (self.camera_to_odom @ np.array([(u-cx)*z/fx, (v-cy)*z/fy, z, 1.]))[:3]
+        return (camera_to_odom @ np.array([(u-cx)*z/fx, (v-cy)*z/fy, z, 1.]))[:3]
+
+    def text_search_crop(self):
+        """Project the confirmed column and four book rows into the RGB image."""
+        marker = pose_xyz(self.column_pose)
+        heading = yaw(self.column_pose.pose.orientation)
+        tangent = np.array([-math.sin(heading), math.cos(heading)])
+        top = marker[2]-self.get_parameter('top_book_marker_offset').value
+        spacing = self.get_parameter('row_spacing').value
+        bottom = top-3*spacing
+        inverse = np.linalg.inv(self.camera_to_odom)
+        fx, fy, cx, cy = self.info.k[0], self.info.k[4], self.info.k[2], self.info.k[5]
+        pixels = []
+        for lateral in (-0.43, 0.43):
+            for height in (top+0.18, bottom-0.18):
+                world = np.r_[marker[:2]+lateral*tangent, height, 1.0]
+                camera = inverse @ world
+                if camera[2] <= 0.1:
+                    continue
+                pixels.append((fx*camera[0]/camera[2]+cx,
+                               fy*camera[1]/camera[2]+cy))
+        if len(pixels) < 2:
+            return None
+        image_height, image_width = self.image.shape[:2]
+        margin = 12
+        x0 = max(0, int(math.floor(min(point[0] for point in pixels)))-margin)
+        y0 = max(0, int(math.floor(min(point[1] for point in pixels)))-margin)
+        x1 = min(image_width, int(math.ceil(max(point[0] for point in pixels)))+margin)
+        y1 = min(image_height, int(math.ceil(max(point[1] for point in pixels)))+margin)
+        if x1-x0 < 12 or y1-y0 < 12:
+            return None
+        return self.image[y0:y1, x0:x1].copy(), (x0, y0)
+
+    def update_text_search(self):
+        if self.ocr_future is not None and self.ocr_future.done():
+            try:
+                self.ocr_boxes = self.ocr_future.result()
+            except Exception as error:
+                self.ocr_boxes = []
+                self.warn('book_text_ocr', f'Text OCR failed: {error}')
+            self.ocr_result_context = self.ocr_pending_context
+            self.ocr_sequence += 1
+            self.ocr_future = None
+        if (self.ocr_future is not None or
+                self.get_clock().now().nanoseconds/1e9-self.ocr_submit_at <
+                self.get_parameter('book_text_ocr_period').value):
+            return
+        search = self.text_search_crop()
+        if search is None:
+            return
+        crop, origin = search
+        self.ocr_pending_context = {
+            'origin': origin,
+            'image_shape': self.image.shape[:2],
+            'depth_image': self.depth_image.copy(),
+            'camera_to_odom': self.camera_to_odom.copy(),
+            'info': self.info,
+        }
+        self.ocr_future = self.ocr_pool.submit(read_text_label_boxes, crop,
+                                               self.target_text)
+        self.ocr_submit_at = self.get_clock().now().nanoseconds/1e9
 
     def make_pose(self, xyz, heading=0.0):
         msg = PoseStamped()
@@ -285,21 +453,47 @@ class PerceptionNode(Node):
         candidates = []
         rejected = {'shape': 0, 'depth': 0, 'column': 0, 'plane': 0, 'row': 0}
         plane_offsets = []
-        boxes = colour_boxes(self.image, self.target_colour)
-        for box in boxes:
-            x, y, w, h = box
-            if h < 1.3*w:
-                rejected['shape'] += 1
-                continue
-            p = self.point(x+w/2, y+h/2)
-            if p is None:
-                rejected['depth'] += 1
-                continue
+        if self.target_text:
+            self.update_text_search()
+            if self.ocr_sequence == self.ocr_handled:
+                return
+            self.ocr_handled = self.ocr_sequence
+            boxes = self.ocr_boxes
+            context = self.ocr_result_context
+            if context is None:
+                self.book_hits = 0
+                return
+            x0, y0 = context['origin']
+            for local_box, confidence, recognized in boxes:
+                x, y, w, h = local_box
+                box = (x+x0, y+y0, w, h)
+                p = self.point_in_frame(
+                    box[0]+w/2, box[1]+h/2, context['image_shape'],
+                    context['depth_image'], context['camera_to_odom'], context['info'])
+                if p is None:
+                    rejected['depth'] += 1
+                    continue
+                candidates.append((box, p, None, confidence, recognized))
+        else:
+            boxes = colour_boxes(self.image, self.target_colour)
+            for box in boxes:
+                x, y, w, h = box
+                if h < 1.3*w:
+                    rejected['shape'] += 1
+                    continue
+                p = self.point(x+w/2, y+h/2)
+                if p is None:
+                    rejected['depth'] += 1
+                    continue
+                candidates.append((box, p, None, 100.0, self.target_colour))
+
+        valid = []
+        for box, p, _, confidence, recognized in candidates:
             delta = p[:2]-marker[:2]
             if abs(delta @ tangent) > self.get_parameter('column_half_width').value:
                 rejected['column'] += 1
                 continue
-            # Book spines sit on the marker plane (the shelf front). A colour blob
+            # Book spines sit on the marker plane (the shelf front). A candidate
             # measured much deeper is a reflection/gap hit inside the shelf, and
             # accepting it would aim the dock at the shelf front. Deep rejection is
             # strict; the robot side is generous because the confirmed column pose
@@ -313,31 +507,42 @@ class PerceptionNode(Node):
             row = row_for_height(marker[2], p[2], self.get_parameter('top_book_marker_offset').value,
                                  self.get_parameter('row_spacing').value)
             if row is not None:
-                candidates.append((box, p, row))
+                valid.append((box, p, row, confidence, recognized))
             else:
                 rejected['row'] += 1
-        # Exactly one target-colour book per column; ambiguity must not select a neighbour.
+        # The two 90-degree OCR passes can report the same spine. Merge those
+        # boxes by measured 3D position, while preserving genuine ambiguity.
+        valid.sort(key=lambda candidate: candidate[3], reverse=True)
+        candidates = []
+        for candidate in valid:
+            if not any(np.linalg.norm(candidate[1]-kept[1]) < 0.12 for kept in candidates):
+                candidates.append(candidate)
         if len(candidates) != 1:
             self.book_hits = 0
             detail = f'; plane_offsets_m={plane_offsets}' if plane_offsets else ''
-            self.book_status(f'colour={self.target_colour}; blobs={len(boxes)}; valid_in_column={len(candidates)}; rejected={rejected}{detail}')
+            target = f'text={self.target_text!r}' if self.target_text else f'colour={self.target_colour}'
+            self.book_status(f'{target}; candidates={len(boxes)}; valid_in_column={len(candidates)}; rejected={rejected}{detail}')
             return
-        box, p, row = candidates[0]
+        box, p, row, confidence, recognized = candidates[0]
         if self.latest_book is not None and np.linalg.norm(p-self.latest_book) < 0.08:
             self.book_hits += 1
         else:
             self.book_hits = 1
         self.latest_book = p
-        if self.book_hits < 3:
-            self.book_status(f'confirming_book: {self.book_hits}/3 observations')
+        required_hits = 2 if self.target_text else 3
+        if self.book_hits < required_hits:
+            self.book_status(f'confirming_book: {self.book_hits}/{required_hits} observations')
             return
-        self.book_status(f'book_confirmed: row={row}, xyz={p.round(3).tolist()}')
+        target = f'text={self.target_text!r}' if self.target_text else f'colour={self.target_colour}'
+        self.book_status(f'book_confirmed: {target}, row={row}, xyz={p.round(3).tolist()}')
         self.book_pub.publish(self.make_pose(p, heading))
         if 'row' not in self.reported:
             self.row_pub.publish(Int32(data=row))
             self.save(box, 'book_row')
             self.reported.add('row')
-            self.get_logger().info(f'Confirmed {self.target_colour} book in target column, row {row}, xyz={p.round(3)}')
+            self.get_logger().info(
+                f'Confirmed {target} book in target column, row {row}, '
+                f'confidence={confidence:.0f}, recognized={recognized!r}, xyz={p.round(3)}')
 
     def process_bin(self):
         frame_area = self.image.shape[0]*self.image.shape[1]

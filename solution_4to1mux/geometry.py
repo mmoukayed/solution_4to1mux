@@ -162,27 +162,45 @@ class ArmKinematics:
                 result = result @ motion
         return result
 
-    def solve(self, xyz, orientation, seed, attempts=12, iterations=200):
+    def solve(self, xyz, orientation, seed, attempts=12, iterations=200, fixed=None):
         target = np.asarray(xyz, dtype=float)
         seed = np.clip(np.asarray(seed, dtype=float), self.lower, self.upper)
+        fixed = {int(index): float(value) for index, value in (fixed or {}).items()}
+        if any(index < 0 or index >= len(seed) for index in fixed):
+            raise ValueError('Fixed joint index is outside the kinematic chain.')
+        if any(not self.lower[index] <= value <= self.upper[index]
+               for index, value in fixed.items()):
+            raise ValueError('A fixed joint value is outside its URDF limits.')
+        anchor = seed.copy()
+        for index, value in fixed.items():
+            anchor[index] = value
+        free = np.array([index for index in range(len(seed)) if index not in fixed], dtype=int)
         rng = np.random.default_rng(6)
         best = float('inf')
 
-        def residual(q):
+        def expand(values):
+            q = anchor.copy()
+            q[free] = values
+            return q
+
+        def residual(values):
+            q = expand(values)
             actual = self.fk(q)
             # Full matrix residual avoids a false zero at a 180-degree rotation.
             return np.r_[actual[:3, 3]-target,
                          0.3*(actual[:3, :3]-orientation).ravel()]
 
         for attempt in range(attempts):
-            initial = seed if attempt == 0 else rng.uniform(self.lower, self.upper)
-            result = least_squares(residual, initial, bounds=(self.lower, self.upper),
+            initial = anchor[free] if attempt == 0 else rng.uniform(self.lower[free], self.upper[free])
+            result = least_squares(residual, initial,
+                                   bounds=(self.lower[free], self.upper[free]),
                                    max_nfev=iterations, ftol=1e-7, xtol=1e-7, gtol=1e-7)
-            actual = self.fk(result.x)
+            solution = expand(result.x)
+            actual = self.fk(solution)
             pos_error = float(np.linalg.norm(actual[:3, 3]-target))
             best = min(best, pos_error)
             if pos_error < 0.008 and np.linalg.norm(actual[:3, :3]-orientation) < 0.06:
-                return result.x
+                return solution
         raise ValueError(f'IK failed for {target.round(3).tolist()} (best position error {best:.3f} m)')
 
     def duration(self, start, end, minimum=1.0):

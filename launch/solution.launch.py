@@ -10,6 +10,7 @@ def generate_launch_description():
     arguments = {
         'shelf_column_number': ('1', int),
         'book_colour': ('red', str),
+        'book_text': ('', str),
         'use_sim_time': ('true', bool),
         'linear_speed': ('0.85', float),
         'strafe_speed': ('0.25', float),
@@ -25,9 +26,14 @@ def generate_launch_description():
         'marker_min_height': ('1.75', float),
         'marker_max_height': ('2.55', float),
         'top_book_marker_offset': ('0.335', float),
+        'row_spacing': ('0.33', float),
+        'column_half_width': ('0.43', float),
+        'lower_book_standoff': ('0.92', float),
+        'lower_book_keepout_distance': ('0.84', float),
         'docking_speed': ('0.25', float),
-        'book_search_timeout': ('24.0', float),
+        'book_search_timeout': ('8.0', float),
         'max_book_recoveries': ('2', int),
+        'book_view_backoff': ('0.35', float),
     }
     params = {name: ParameterValue(LaunchConfiguration(name), value_type=kind)
               for name, (_, kind) in arguments.items()}
@@ -38,12 +44,16 @@ def generate_launch_description():
                     parameters=[{name: params[name] for name in ['use_sim_time']+names}],
                     output='screen', emulate_tty=True)
     return LaunchDescription(declarations+[
-        node('perception_node', ['shelf_column_number', 'book_colour', 'perception_rate',
-                                 'marker_min_height', 'marker_max_height', 'top_book_marker_offset']),
+        node('perception_node', ['shelf_column_number', 'book_colour', 'book_text', 'perception_rate',
+                                 'marker_min_height', 'marker_max_height', 'top_book_marker_offset',
+                                 'row_spacing', 'column_half_width']),
         node('navigation_node', ['shelf_column_number', 'linear_speed', 'strafe_speed',
                                 'rotate_speed', 'search_rotate_speed', 'search_direction',
                                 'book_standoff', 'book_lateral_offset', 'grab_timeout',
                                 'place_timeout', 'phase_timeout', 'docking_speed',
-                                'book_search_timeout', 'max_book_recoveries']),
+                                'book_search_timeout', 'max_book_recoveries',
+                                'book_view_backoff', 'top_book_marker_offset', 'row_spacing',
+                                'column_half_width', 'lower_book_standoff',
+                                'lower_book_keepout_distance']),
         node('manipulation_node', []),
     ])

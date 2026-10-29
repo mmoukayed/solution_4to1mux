@@ -40,9 +40,9 @@ class ManipulationNode(Node):
         for name, value in {
             'gripper_open': 0.066, 'gripper_closed': 0.0,
             # Insert past the measured spine rather than asking the base to
-            # violate its shelf keepout.  Offset right 1.5 cm to centre the
-            # fingers when the right finger was contacting first.
-            'grasp_insert_depth': 0.085, 'grasp_right_offset': 0.015,
+            # violate its shelf keepout. Keep the lateral target centred on
+            # perception; the former 1.5 cm right bias led to left-only contact.
+            'grasp_insert_depth': 0.085, 'grasp_right_offset': 0.0,
             'pregrasp_distance': 0.10,
             'lift_distance': 0.025, 'extract_distance': 0.10,
             # Must match navigation.grasp_base_return_advance.  This offsets
@@ -51,9 +51,10 @@ class ManipulationNode(Node):
             # Must match navigation.place_base_advance.  The high pre-place
             # target is compensated while the base is still before the table.
             'place_base_advance': 0.35, 'place_clearance_height': 0.20,
+            'place_torso_hover': 0.35,
             'target_max_age': 2.0, 'gripper_timeout': 8.0,
             'placement_target_max_age': 30.0,
-            'grip_contact_hold': 1.0, 'grip_recommand_period': 0.4,
+            'grip_contact_hold': 1.0,
             'motion_timeout_margin': 8.0, 'planning_timeout': 60.0,
             # The measured bin point is near the far half of its opening;
             # release 22 cm back toward the robot for a centred drop.
@@ -102,6 +103,7 @@ class ManipulationNode(Node):
         self.plan_future = None
         self.arm_in_shelf = False
         self.retreat_target = None
+        self.placement_hover_target = None
         self.active = None
         self.phase = None
         self.phases = []
@@ -111,7 +113,7 @@ class ManipulationNode(Node):
         self.deadline = 0.0
         self.warned_at = -100.0
         self.create_timer(0.1, self.tick)
-        self.get_logger().info('Manipulation BUILD 5.8: calibrated high right-arm carry + rear-centred bin release.')
+        self.get_logger().info('Manipulation BUILD 5.12: centred grasp + compensated pregrasp reach.')
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -186,6 +188,8 @@ class ManipulationNode(Node):
             self.plan_future = self.pool.submit(self.plan_carry_raise, current)
             self.get_logger().info('raise_carry: moving the held book to the predefined high right-arm carry pose.')
             return
+        if sequence == 'prepare_place':
+            self.placement_hover_target = None
         target = self.targets.get('book' if sequence in ('grab', 'prepare_grab', 'finish_grab') else 'bin')
         target_age = (self.p('placement_target_max_age') if sequence in ('place', 'prepare_place', 'finish_place')
                       else self.p('target_max_age'))
@@ -210,7 +214,7 @@ class ManipulationNode(Node):
         self.phase = 'planning'
         self.deadline = self.now()+self.p('planning_timeout')
         current = np.array([self.joints[n] for n in self.model.names])
-        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'place_base_advance', 'place_clearance_height', 'bin_inset', 'bin_release_height')}
+        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'bin_inset', 'bin_release_height')}
         self.plan_future = self.pool.submit(self.plan, sequence, point, normal, current, params)
         self.get_logger().info(f'{sequence}: planning for camera target in base frame {point.round(3)}')
 
@@ -218,13 +222,33 @@ class ManipulationNode(Node):
         """Compute all waypoints before any actuator moves; never guess joint angles."""
         if not np.isfinite(point).all() or point[0] < 0.2:
             raise ValueError(f'Target is not in front of the arm at reachable distance: {point}')
-        if sequence in ('grab', 'prepare_grab', 'finish_grab') and not 0.45 <= point[0] <= 1.05:
-            # A book closer than ~0.45 m means the base ended up jammed against
-            # the shelf; swinging the arm from there hits the shelf boards.
-            raise ValueError(f'Dock distance wrong for a safe grasp: book at {point[0]:.2f} m in base frame, need 0.45-1.05 m; redock.')
-        # +y is robot-left in base_footprint; the requested correction is to
-        # robot-right, away from the finger that was striking the book first.
+        reach_distance = point[0]
+        if sequence == 'prepare_grab':
+            # This phase runs after the base has backed out. Validate the
+            # compensated arm target that will be reached after the planned
+            # base advance, rather than rejecting the intentionally larger
+            # book-to-base distance at the staging pose.
+            reach_distance += normal[0]*(params['grasp_insert_depth']-
+                                         params['grasp_base_advance'])
+        if sequence in ('grab', 'prepare_grab', 'finish_grab') and not 0.45 <= reach_distance <= 1.05:
+            # A grasp target closer than ~0.45 m means the base ended up jammed
+            # against the shelf; swinging the arm from there hits shelf boards.
+            raise ValueError(f'{sequence} reach target is {reach_distance:.2f} m in base frame, need 0.45-1.05 m; redock.')
+        # +y is robot-left in base_footprint. Keep the default target neutral;
+        # a nonzero grasp_right_offset remains available for measured tuning.
         point = point+np.array([0.0, -params.get('grasp_right_offset', 0.0), 0.0]) if sequence in ('grab', 'prepare_grab', 'finish_grab') else point
+        if sequence == 'finish_place':
+            if self.placement_hover_target is None:
+                raise ValueError('No staged crane pose is available; run prepare_place before finish_place.')
+            lowered = self.placement_hover_target.copy()
+            lowered[0] = max(self.model.lower[0],
+                             lowered[0]-params['place_clearance_height'])
+            if self.placement_hover_target[0]-lowered[0] < 0.05:
+                raise ValueError('Torso has less than 5 cm of safe downward travel from the bin hover pose.')
+            duration = self.model.duration(current, lowered, 1.0)
+            motions = [('lower_to_bin', 'motion', lowered, duration)]
+            return motions+[('release_book', 'open', None, 1.0),
+                            ('verify_delivery', 'delivery', None, 3.0)]
         facing = rotation([0, 0, 1], math.atan2(normal[1], normal[0]))
         if sequence == 'grab':
             grasp = point+normal*params['grasp_insert_depth']
@@ -244,11 +268,12 @@ class ManipulationNode(Node):
             targets = [('lift', lifted), ('extract', extracted)]
         elif sequence == 'prepare_place':
             # Perception's bin normal points from the camera/robot toward the
-            # bin. Move against it to put the held book inside the opening;
-            # adding it overshot the far rim by the 12 cm inset.
+            # bin. Move against it to centre the book in the opening. The base
+            # has already reached its calibrated standoff; the torso supplies
+            # the final straight down motion after this hover pose is reached.
             release = point-normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
-            preplace = release-normal*params['place_base_advance']+np.array([0, 0, params['place_clearance_height']])
-            targets = [('raise_over_bin', preplace)]
+            hover = release+np.array([0, 0, params['place_clearance_height']])
+            targets = [('crane_hover', hover)]
         elif sequence == 'finish_place':
             release = point-normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
             targets = [('lower_to_bin', release)]
@@ -266,10 +291,13 @@ class ManipulationNode(Node):
         for roll in rolls:
             orientation = facing @ rotation([1, 0, 0], roll)
             q = current.copy()
+            if sequence == 'prepare_place':
+                q[0] = min(self.model.upper[0], params['place_torso_hover'])
             candidate = []
             try:
                 for name, xyz in targets:
-                    solved = self.model.solve(xyz, orientation, q)
+                    fixed = {0: q[0]} if sequence == 'prepare_place' else None
+                    solved = self.model.solve(xyz, orientation, q, fixed=fixed)
                     if candidate and np.max(np.abs(solved[1:]-q[1:])) > 1.4:
                         raise ValueError(f'{name}: IK branch jump; adjust docking pose before retrying.')
                     candidate.append((name, 'motion', solved, self.model.duration(q, solved, 1.0)))
@@ -360,10 +388,13 @@ class ManipulationNode(Node):
                 future.add_done_callback(lambda f, t=token: self.goal_response(f, t))
         elif self.phase in ('open', 'close'):
             value = self.p('gripper_open' if self.phase == 'open' else 'gripper_closed')
+            if self.phase == 'close':
+                # Do not let contact from a previous approach/attempt count as
+                # proof of a grasp. The close phase needs fresh bilateral data.
+                self.contacts.clear()
             self.gripper_pub.publish(self.trajectory([GRIPPER_JOINT], [value], duration))
             self.deadline = self.now()+self.p('gripper_timeout')
             self.contact_since = None
-            self.last_close_command = self.now() if self.phase == 'close' else None
         else:
             self.deadline = self.now()+duration+3.0
 
@@ -410,16 +441,26 @@ class ManipulationNode(Node):
             if self.phase == 'close':
                 seen = {f'{book.split("::")[0]}:{side}': f'{self.now()-stamp:.1f}s ago'
                         for (book, side), stamp in self.contacts.items()}
-                detail = (f' Finger/book contacts seen: {seen}.' if seen else
-                          ' NO finger/book contact was ever reported: the fingers closed beside or in'
-                          ' front of the book (alignment/insert depth), or /contacts is not being bridged'
-                          ' (verify with: ros2 topic echo /contacts --once while pushing the gripper into a book).')
+                finger_position = self.joints.get(GRIPPER_JOINT)
+                position_text = ('unknown' if finger_position is None else
+                                 f'{finger_position:.4f} m')
+                detail = (f' Gripper joint at timeout: {position_text}; last fresh-phase '
+                          f'finger/book contacts: {seen or "none"}. If the joint reached 0.0 m '
+                          'without bilateral contact, the fingers closed beside/in front of the '
+                          'book; if it stayed open, inspect the gripper trajectory controller '
+                          'and /joint_states.')
             self.abort(f'{self.phase}: timed out.{detail} Check controller feedback, contacts, target pose and Gazebo.')
             return
         if self.phase == 'planning':
             if self.plan_future.done():
                 try:
                     self.phases = self.plan_future.result()
+                    if self.active == 'prepare_place':
+                        hover = next((phase[2] for phase in self.phases
+                                      if phase[1] == 'motion'), None)
+                        if hover is None:
+                            raise ValueError('The bin hover plan did not contain a joint waypoint.')
+                        self.placement_hover_target = hover.copy()
                     self.next_phase()
                 except Exception as error:
                     self.abort(f'No valid grasp/placement plan: {error}')
@@ -427,12 +468,9 @@ class ManipulationNode(Node):
             if self.fresh(self.joint_stamp) and abs(self.joints.get(GRIPPER_JOINT, -1)-self.p('gripper_open')) < 0.006 and self.now()-self.phase_started > 0.8:
                 self.next_phase()
         elif self.phase == 'close':
-            # The public gripper interface is position-only and 0.0 is its
-            # physical hard-close limit. Reassert it while seating the book so
-            # a controller update cannot relax the clamp before the lift.
-            if self.now()-self.last_close_command >= self.p('grip_recommand_period'):
-                self.gripper_pub.publish(self.trajectory([GRIPPER_JOINT], [self.p('gripper_closed')], 0.5))
-                self.last_close_command = self.now()
+            # This is a position trajectory. Once the one close trajectory
+            # finishes, the controller holds its target; republishing a shorter
+            # trajectory here can repeatedly restart/preempt the close motion.
             book = self.held_book()
             if book:
                 if self.contact_since is None:

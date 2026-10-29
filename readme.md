@@ -47,9 +47,27 @@ The start command for our program should be as mentioned in the guidelines:
 ros2 launch solution_4to1mux solution.launch.py shelf_column_number:=2 book_colour:=red
 ```
 
+For Phase 2 Round 2, launch `erc_bringup simulation_round_2.launch.py` in the simulator. Shelf 2 uses printed labels: install Tesseract in the simulator container once (`apt install -y tesseract-ocr`), then pass the exact requested label with `book_text`. For example:
+
+```bash
+ros2 launch solution_4to1mux solution.launch.py shelf_column_number:=2 book_text:="TARGET LABEL"
+```
+
+Leave `book_text` empty and use `book_colour:=red|green|blue|yellow` for the colored-book shelves, including the tight shelf 4 challenge.
+
 This package targets the **ERC simulator supplied in the 11 September 2026 ZIP**, ROS 2 Humble and Gazebo Harmonic. It uses the right arm only. Launch the simulator first, then launch this package.
 
-**Current navigation/perception build: 5.10; manipulation build: 5.8.** Startup must print `Navigation BUILD 5.10`, `Perception BUILD 5.10` and `Manipulation BUILD 5.8` — if it does not, the rebuild did not take and you are running older code.
+**Current navigation build: 5.12; perception build: 5.11; manipulation build: 5.12.** Startup must print `Navigation BUILD 5.12`, `Perception BUILD 5.11` and `Manipulation BUILD 5.12` — if it does not, the rebuild did not take and you are running older code.
+
+- **Manipulation Build 5.12:** removed the 1.5 cm robot-right grasp bias after repeated left-finger-only book contacts. The grasp now targets the measured book centre laterally.
+
+- **Manipulation Build 5.11:** `prepare_grab` validates its compensated arm reach target after the planned base advance, so a safe backed-out staging pose is not rejected merely because the book is temporarily farther away.
+
+- **Manipulation Build 5.10:** gripper close sends one position trajectory and then waits for fresh bilateral finger/book contact. It no longer republishes shorter trajectories while closing, which could restart the controller's motion. A close timeout now includes gripper joint position and current-attempt contact ages.
+
+- **Build 5.12:** lower-row docking uses a 0.92 m book standoff and a 0.84 m hard shelf keepout to leave the folded arm more room during `ALIGN_BOOK`. The base goal is also constrained to the target column's safe lateral footprint, leaving the arm to reach sideways to books near a divider. These limits apply before and during `ALIGN_BOOK`.
+
+- **Build 5.11:** Shelf 2 can target the exact printed book label with `book_text:=...`; OCR searches only the confirmed column, checks both vertical text directions, and runs off the perception callback so camera processing stays live. Colored-book targeting remains available with `book_colour`. Book search now completes a 1.4 s head dwell at each angle and backs out 0.35 m after an 8 s failed view, rather than waiting 24 s. Return-to-start drives directly while preserving heading and chooses a short LiDAR-clear detour when the direct path is obstructed. Bin delivery now reaches the calibrated base standoff, raises the arm to a crane-like hover, then lowers the torso by 20 cm with the arm pose fixed before releasing.
 
 - **Build 5.10:** the local simulator's number markers spawn at 1.93 m, below the old hardcoded 1.95 m minimum. Shelf recognition now allows marker heights from 1.75 to 2.55 m and logs separate depth/height rejection counts with measured heights. The marker-to-top-active-book offset is 0.335 m for this mounting height. Launch arguments `marker_min_height`, `marker_max_height` and `top_book_marker_offset` expose these calibrations; older simulator layouts with 2.26 m markers should use `top_book_marker_offset:=0.665`. At every column scan waypoint, the base now stays stopped through all three head pitches (5.4 simulation seconds by default), with `gate=observing_columns_...` identifying that observation pause. A confirmed target immediately ends the pause.
 
@@ -212,7 +230,7 @@ All three solution nodes use `use_sim_time:=true` by default. Leave that enabled
 | Fixed/slow movement and repeated fine alignment. | Configurable 0.85 m/s forward cap and 0.25 m/s close-range docking cap, proportional approach and vector-limited diagonal motion. These are limits, not guaranteed average speeds. |
 | Front laser's zero ray treated as base-forward, although its mount is yawed -45 degrees and rolled 180 degrees. | Transform both LiDAR scans into `base_footprint` using TF before directional obstacle checks. |
 | Missing distance triggered blind creep; an obstacle stop was reported as successful docking; a warning could format `None` as a float. | Missing scans stop motion with a diagnostic. Obstacle stop is not arrival. Docking uses the camera-derived odometry-frame goal. |
-| Largest colour blob anywhere in the image chosen as the book; row guessed from image quarters. | Require a confirmed target column, restrict the colour blob to that column in 3D, and infer row from relative marker/book heights and fixed shelf spacing. No randomized book/column world positions are read from Gazebo. |
+| Largest colour blob anywhere in the image chosen as the book; row guessed from image quarters. | Require a confirmed target column, restrict colour or OCR label matches to that column in 3D, and infer row from relative marker/book heights and fixed shelf spacing. No randomized book/column world positions are read from Gazebo. |
 | Empty digit-template directory led to synthetic-font matching. | Include copies of the supplied simulator's public number-marker textures 1–5 as recognition templates. |
 | Code called `/gripper_right_controller/follow_joint_trajectory`, which does not exist in this simulator. | Send bounded commands to the public `/gripper_right_controller/joint_trajectory` clamp topic, using joint feedback for opening and bilateral book contact for closing. Arm/torso continue using their real actions. |
 | Hardcoded placeholder arm poses did not use the book's measured position. | Read `/robot_description`, solve right-arm/torso IK for live RGB-D targets, check all waypoints before motion, and respect joint/velocity limits. Try the two symmetric wrist-roll orientations. |
@@ -225,7 +243,7 @@ All three solution nodes use `use_sim_time:=true` by default. Leave that enabled
 
 Normal state progression:
 
-`WAIT_INPUTS -> FIND_SHELF -> [SCAN_COLUMNS if needed] -> APPROACH_COLUMN -> FIND_BOOK -> STOW_ARMS_FOR_DOCK -> ALIGN_BOOK -> [REACQUIRE_BOOK / BACK_OUT_FOR_VIEW if needed] -> WAIT_FOR_GRAB -> RETREAT_FROM_SHELF -> RETURN_TO_START -> FIND_BIN -> APPROACH_BIN -> WAIT_FOR_PLACE -> DONE`
+`WAIT_INPUTS -> FIND_SHELF -> [SCAN_COLUMNS if needed] -> APPROACH_COLUMN -> FIND_BOOK -> STOW_ARMS_FOR_DOCK -> ALIGN_BOOK -> [REACQUIRE_BOOK / BACK_OUT_FOR_VIEW if needed] -> WAIT_FOR_GRAB -> RETREAT_FROM_SHELF -> RETURN_TO_START -> FIND_BIN -> APPROACH_BIN -> APPROACH_BIN_FOR_PLACE -> WAIT_FOR_PLACE_PREP -> WAIT_FOR_PLACE -> DONE`
 
 Each transition is printed. Failures print a cause and publish `FAILED` on `/solution/state`; the robot stops. `FAILED` is not a successful trial. Restart the solution after fixing the reported cause; restart the simulator for a clean randomized trial.
 
@@ -278,10 +296,11 @@ The callback tests use small ROS import/message stand-ins. They do **not** emula
 A full Gazebo trial was **not run** in the editing environment because ROS/Gazebo are unavailable there. This is a repaired implementation to test in your simulator, not a verified competition submission. Remaining concrete limits:
 
 - Local IK and joint waypoints are **not whole-body or mesh collision planning**. The base obstacle check covers its footprint, not extended arms. Validate arm clearance, especially the initial arm posture, with the simulator before repeated autonomous trials; a configured MoveIt planning scene is the next step if paths collide.
+- Printed-label targeting needs the `tesseract-ocr` executable in the simulator container. OCR uses the confirmed column crop and matches the requested label; small, occluded, or unfamiliar print may still need a closer view or more contrast.
 - RGB/depth projection assumes the supplied simulator's matching virtual-camera geometry. Real-camera deployment needs calibrated depth registration.
 - Grasp insertion/lift and wrist orientation need live contact validation. The simulator README itself notes gripper/contact issues. Missing or one-sided book contact produces an explicit failed grasp rather than invented success.
 - The bin placement uses a measured visual target with fixed inset/height offsets, and requires book/bin contact to report completion. It has not been tuned or validated for the rubric's gentle-placement points.
-- Perception relies on the public shelf geometry (0.33 m row spacing and marker-to-top-book offset), the supplied number textures and colour segmentation. Partial occlusion, odometry drift and changed simulator geometry still require testing.
+- Perception relies on the public shelf geometry (0.33 m row spacing and marker-to-top-book offset), the supplied number textures, colour segmentation, and OCR of the selected text label. Partial occlusion, odometry drift and changed simulator geometry still require testing.
 - Startup/travel speeds depend on the host's actual Gazebo real-time factor. Increasing the commanded speed cannot compensate for a slow physics/rendering loop.
 
 The fixture `test/data/erc_right_arm_chain.urdf` contains only joints/limits extracted from the supplied ERC robot description for numerical testing. Runtime kinematics always come from the live `/robot_description` topic.

@@ -16,7 +16,8 @@ from std_msgs.msg import Bool, String
 from tf2_ros import Buffer, TransformListener, TransformException
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from .geometry import body_velocity, forward_command, pose_xyz, scan_points, transform_matrix, wrap, yaw
+from .geometry import (body_velocity, forward_command, pose_xyz, row_for_height,
+                       scan_points, transform_matrix, wrap, yaw)
 
 
 DOCK_STOW_POSES = {
@@ -78,9 +79,14 @@ class NavigationNode(Node):
             # margin: a depth-biased book point must not put the bumper (or
             # the parked arm) against the shelf before the grasp starts.
             'shelf_keepout_distance': 0.62,
+            # Low-row arm links sweep close to the shelf even in the dock
+            # stow pose. Keep the base farther back while ALIGN_BOOK runs.
+            'lower_book_standoff': 0.92, 'lower_book_keepout_distance': 0.84,
+            'top_book_marker_offset': 0.335, 'row_spacing': 0.33,
+            'column_half_width': 0.43,
             'arm_stow_timeout': 10.0, 'arm_stow_settle_time': 2.5,
             'scan_half_width': 2.6, 'scan_step': 0.65, 'scan_observe_time': 1.0,
-            'docking_speed': 0.25, 'book_search_timeout': 24.0,
+            'docking_speed': 0.25, 'book_search_timeout': 8.0,
             'align_block_timeout': 3.0,
             'grasp_base_retreat': 0.25,
             # Keep a 3 cm buffer above the shelf keepout while returning to
@@ -90,7 +96,8 @@ class NavigationNode(Node):
             # bottom-row grasp needs this full straight withdrawal before that
             # pose is commanded, otherwise its elbow can still hit the shelf.
             'carry_raise_retreat': 0.80,
-            'max_book_recoveries': 2, 'head_scan_dwell': 1.8,
+            'max_book_recoveries': 2, 'head_scan_dwell': 1.4,
+            'book_view_backoff': 0.35,
         }
         for key, value in defaults.items():
             self.declare_parameter(key, value)
@@ -113,6 +120,7 @@ class NavigationNode(Node):
         self.warned = {}
         self.goal = None
         self.book_recoveries = 0
+        self.return_detour_side = 0
         self.bin_turn_recoveries = 0
         self.bin_turn_retreat_total = 0.0
         self.last_command = (0.0, 0.0, 0.0)
@@ -122,6 +130,9 @@ class NavigationNode(Node):
         self.arm_stow_last = None
         self.last_gate = 'startup'
         self.blocked_since = None
+        self.active_shelf_keepout_distance = self.p('shelf_keepout_distance')
+        self.book_dock_minimum = self.p('shelf_keepout_distance')
+        self.current_book_row = None
         self.failure_reason = ''
         self.manip_failure = ''
         self.book_diagnostics = 'No book diagnostics received yet.'
@@ -160,7 +171,7 @@ class NavigationNode(Node):
         self.wall_sample, self.sim_sample = time.monotonic(), self.now()
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(5.0, self.wall_status, clock=self.wall_clock)
-        self.get_logger().info(f'Navigation BUILD 5.10 (stationary shelf observation + bin-turn recovery): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
+        self.get_logger().info(f'Navigation BUILD 5.12 (lower-row shelf clearance): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -312,12 +323,54 @@ class NavigationNode(Node):
             return goal
         p, normal = reference
         minimum = max(self.p('book_standoff')-0.10,
-                      self.p('shelf_keepout_distance'))
+                      self.p('shelf_keepout_distance'),
+                      getattr(self, 'active_shelf_keepout_distance',
+                              self.p('shelf_keepout_distance')),
+                      getattr(self, 'book_dock_minimum',
+                              self.p('shelf_keepout_distance')))
         depth = (goal[:2]-p) @ normal   # negative = robot side of the plane
         if depth > -minimum:
             goal = goal.copy()
             goal[:2] -= (depth+minimum)*normal
             self.warn('deep_goal', f'Dock goal was {depth:+.2f} m of the shelf plane; clamped to {minimum:.2f} m in front. Book depth estimate is suspect.')
+        return goal
+
+    def dock_constraints_for_book(self, book):
+        """Increase low-row clearance and estimate a safe base centre in-column."""
+        shelf = self.observations.get('shelf')
+        row = None
+        if shelf is not None:
+            row = row_for_height(
+                shelf.pose.position.z, book.pose.position.z,
+                self.p('top_book_marker_offset'), self.p('row_spacing'))
+        standoff = self.p('book_standoff')
+        keepout = self.p('shelf_keepout_distance')
+        if row is not None and row >= 3:
+            standoff = max(standoff, self.p('lower_book_standoff'))
+            keepout = max(keepout, self.p('lower_book_keepout_distance'))
+        self.current_book_row = row
+        self.active_shelf_keepout_distance = keepout
+        self.book_dock_minimum = max(standoff-0.10, keepout)
+        return standoff
+
+    def constrain_goal_to_column(self, goal):
+        """Keep the robot footprint within the target aisle while the arm reaches sideways."""
+        shelf = self.observations.get('shelf')
+        if shelf is None:
+            return goal
+        heading = yaw(shelf.pose.orientation)
+        tangent = np.array([-math.sin(heading), math.cos(heading)])
+        relative = goal[:2]-pose_xyz(shelf)[:2]
+        lateral = float(relative @ tangent)
+        robot_half_width = (0.36*abs(math.sin(goal[2]-heading))
+                            + 0.32*abs(math.cos(goal[2]-heading)))
+        safe_lateral = max(0.02, self.p('column_half_width')-robot_half_width-0.03)
+        bounded = float(np.clip(lateral, -safe_lateral, safe_lateral))
+        if abs(bounded-lateral) > 1e-3:
+            goal = goal.copy()
+            goal[:2] += (bounded-lateral)*tangent
+            self.warn('column_lateral_clamp',
+                      f'Base alignment shifted {abs(bounded-lateral):.2f} m toward the column centre to clear its divider.')
         return goal
 
     def move(self, vx=0.0, vy=0.0, omega=0.0, allow_turn_recovery=True):
@@ -341,14 +394,16 @@ class NavigationNode(Node):
             c, s = math.cos(self.pose[2]), math.sin(self.pose[2])
             world_velocity = np.array([c*vx-s*vy, s*vx+c*vy])
             distance = float(-(self.pose[:2]-wall_point) @ normal)
-            if world_velocity @ normal > 1e-6 and distance <= self.p('shelf_keepout_distance'):
+            keepout = getattr(self, 'active_shelf_keepout_distance',
+                              self.p('shelf_keepout_distance'))
+            if world_velocity @ normal > 1e-6 and distance <= keepout:
                 vx = vy = 0.0
                 hard_shelf_blocked = True
                 self.last_gate = f'shelf_keepout_hard_{distance:.2f}m'
                 if self.blocked_since is None:
                     self.blocked_since = self.now()
                 self.warn('hard_shelf_gate',
-                          f'Shelf keepout reached at {distance:.2f} m; suppressing inward docking motion.')
+                          f'Shelf keepout reached at {distance:.2f} m (minimum {keepout:.2f} m); suppressing inward docking motion.')
         wall = self.shelf_wall_points(reference)
         if len(wall):
             points = np.concatenate([points, wall]) if scan_count else wall
@@ -404,8 +459,14 @@ class NavigationNode(Node):
         self.stop()
         self.blocked_since = None
         self.state, self.entered = state, self.now()
+        if state == State.FIND_SHELF:
+            self.active_shelf_keepout_distance = self.p('shelf_keepout_distance')
+            self.book_dock_minimum = self.p('shelf_keepout_distance')
+            self.current_book_row = None
         if state == State.STOW_ARMS_FOR_DOCK:
             self.arm_stow_last = None
+        if state == State.RETURN_TO_START:
+            self.return_detour_side = 0
         self.state_pub.publish(String(data=state.name))
         self.get_logger().info(f'-> {state.name}')
         if state in (State.FIND_SHELF, State.FIND_BIN):
@@ -506,7 +567,11 @@ class NavigationNode(Node):
             return
         self.book_recoveries += 1
         heading = self.pose[2]
-        self.goal = np.r_[self.pose[:2]-0.20*np.array([math.cos(heading), math.sin(heading)]), heading]
+        retreat = self.p('book_view_backoff')
+        self.goal = np.r_[self.pose[:2]-retreat*np.array([math.cos(heading), math.sin(heading)]), heading]
+        self.get_logger().warn(
+            f'Book scan found no stable target; backing straight out {retreat:.2f} m '
+            f'for a wider view ({self.book_recoveries}/{self.p("max_book_recoveries")}).')
         self.transition(State.BACK_OUT_FOR_VIEW)
 
     def fail(self, reason):
@@ -590,6 +655,91 @@ class NavigationNode(Node):
         else:
             vy = float(np.clip(vy, -self.p('strafe_speed'), self.p('strafe_speed')))
         self.move(vx, vy, omega)
+        return False
+
+    def return_path_clearance(self, direction, horizon):
+        """Estimate LiDAR clearance along a short base-frame translation."""
+        points = np.concatenate([scan[1] for scan in self.scans.values()])
+        wall = self.shelf_wall_points(self.wall_reference())
+        if len(wall):
+            points = np.concatenate([points, wall])
+        direction = np.asarray(direction, dtype=float)
+        direction /= max(np.linalg.norm(direction), 1e-9)
+        side = np.array([-direction[1], direction[0]])
+        extent = abs(direction[0])*0.36+abs(direction[1])*0.32
+        width = abs(direction[1])*0.36+abs(direction[0])*0.32+0.03
+        along, across = points @ direction, points @ side
+        in_path = (along > 0) & (along < horizon+extent) & (np.abs(across) < width)
+        if not in_path.any():
+            return float('inf')
+        return float(along[in_path].min()-extent)
+
+    def drive_return_to_start(self):
+        """Take a direct reverse/strafe route, detouring around LiDAR obstacles."""
+        delta = self.start[:2]-self.pose[:2]
+        distance = float(np.linalg.norm(delta))
+        if distance <= 0.10:
+            self.stop()
+            return self.rotate_to(self.start[2])
+        if len(self.scans) < 2 or not all(self.fresh(scan[0]) for scan in self.scans.values()):
+            self.stop()
+            self.last_gate = 'stale_or_missing_lidar'
+            self.warn('return_lidar', 'Waiting for fresh front/rear LiDAR before returning to the start.')
+            return False
+
+        desired_world = delta/distance
+        c, s = math.cos(self.pose[2]), math.sin(self.pose[2])
+        horizon = min(1.0, distance)
+        offsets = (0.0, math.radians(20), -math.radians(20), math.radians(35),
+                   -math.radians(35), math.radians(50), -math.radians(50),
+                   math.radians(65), -math.radians(65), math.radians(80),
+                   -math.radians(80))
+        options = []
+        for offset in offsets:
+            angle = math.atan2(desired_world[1], desired_world[0])+offset
+            world_direction = np.array([math.cos(angle), math.sin(angle)])
+            body_direction = np.array([c*world_direction[0]+s*world_direction[1],
+                                       -s*world_direction[0]+c*world_direction[1]])
+            progress = float(world_direction @ desired_world)
+            if progress < 0.15:
+                continue
+            clearance = self.return_path_clearance(body_direction, horizon)
+            if clearance < self.p('obstacle_margin'):
+                continue
+            score = abs(offset)+0.025/max(clearance, 0.05)
+            options.append((score, offset, body_direction))
+
+        direct_clear = any(offset == 0.0 for _, offset, _ in options)
+        if direct_clear:
+            self.return_detour_side = 0
+            options = [option for option in options if option[1] == 0.0]
+        else:
+            left = [option for option in options if option[1] > 0]
+            right = [option for option in options if option[1] < 0]
+            if self.return_detour_side > 0 and left:
+                options = left
+            elif self.return_detour_side < 0 and right:
+                options = right
+            elif left or right:
+                best_left = min((option[0] for option in left), default=float('inf'))
+                best_right = min((option[0] for option in right), default=float('inf'))
+                self.return_detour_side = 1 if best_left < best_right else -1
+                options = left if self.return_detour_side > 0 else right
+
+        if not options:
+            self.stop()
+            self.last_gate = 'return_path_blocked'
+            self.warn('return_blocked', 'No short obstacle-free return direction is available; holding position.')
+            return False
+
+        _, offset, direction = min(options, key=lambda option: option[0])
+        speed_cap = self.p('linear_speed')
+        if abs(direction[1]) > 1e-6:
+            speed_cap = min(speed_cap, self.p('strafe_speed')/abs(direction[1]))
+        speed = min(speed_cap, 1.5*distance)
+        self.move(float(direction[0]*speed), float(direction[1]*speed), 0.0)
+        if offset and self.last_gate == 'clear':
+            self.last_gate = f'return_detour_{"left" if offset > 0 else "right"}'
         return False
 
     def rotate_to(self, heading):
@@ -733,8 +883,13 @@ class NavigationNode(Node):
         elif self.state in (State.FIND_BOOK, State.REACQUIRE_BOOK):
             book = self.observation('book')
             if book is not None:
-                self.goal = self.clamped_dock_goal(
-                    self.target_goal(book, self.p('book_standoff'), self.p('book_lateral_offset')))
+                standoff = self.dock_constraints_for_book(book)
+                self.goal = self.constrain_goal_to_column(
+                    self.target_goal(book, standoff, self.p('book_lateral_offset')))
+                self.goal = self.clamped_dock_goal(self.goal)
+                self.get_logger().info(
+                    f'Book dock: row={self.current_book_row}, standoff={standoff:.2f} m, '
+                    f'shelf_keepout={self.active_shelf_keepout_distance:.2f} m.')
                 self.transition(State.STOW_ARMS_FOR_DOCK)
             else:
                 self.scan_for_book(elapsed)
@@ -753,6 +908,7 @@ class NavigationNode(Node):
             # Keep the goal consistent with the current wall plane, and never
             # sit out the 90 s phase timeout against a blocked docking path —
             # back out and reacquire instead.
+            self.goal = self.constrain_goal_to_column(self.goal)
             self.goal = self.clamped_dock_goal(self.goal)
             arrived = self.drive_to(self.goal, tolerance=0.025, docking=True)
             if arrived or self.shelf_limited_return_arrived(self.goal):
@@ -827,7 +983,7 @@ class NavigationNode(Node):
                 self.transition(State.RETURN_TO_START)
         elif self.state == State.RETURN_TO_START:
             self.look(tilt=-0.1)
-            if self.drive_to(self.start, tolerance=0.10):
+            if self.drive_return_to_start():
                 self.transition(State.FIND_BIN)
         elif self.state == State.FIND_BIN:
             self.look(tilt=-0.1)
@@ -868,6 +1024,14 @@ class NavigationNode(Node):
                 self.fail(f'Bin-turn retreat could not finish within {self.p("bin_turn_backoff_timeout"):.0f} s; gate={self.last_gate}.')
         elif self.state == State.APPROACH_BIN_FOR_PLACE:
             if self.drive_forward_to(self.goal):
+                self.result = None
+                self.transition(State.WAIT_FOR_PLACE_PREP)
+                self.prepare_place_pub.publish(Bool(data=True))
+        elif self.state == State.WAIT_FOR_PLACE_PREP:
+            self.stop()
+            if self.result is False:
+                self.fail(f'Bin hover failed: {self.manip_failure or "read /manipulation/failure for the arm error"}')
+            elif self.result is True:
                 self.result = None
                 self.transition(State.WAIT_FOR_PLACE)
                 self.finish_place_pub.publish(Bool(data=True))
