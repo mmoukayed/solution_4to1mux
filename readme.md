@@ -18,7 +18,14 @@ Next once you are in the docker shell, these commands will setup the environment
 ```
 colcon build --symlink-install
 source install/setup.bash
-ros2 launch erc_bringup simulation.launch.py
+```
+Then use this command to start up the round 1 simulation:
+```
+ros2 launch erc_bringup simulation_round_1.launch.py   # Round 1 environment
+```
+And this for round 2:
+```
+ros2 launch erc_bringup simulation_round_2.launch.py   # Round 2 environment
 ```
 
 > [!NOTE]
