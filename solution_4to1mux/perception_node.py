@@ -195,10 +195,10 @@ class PerceptionNode(Node):
         self.ocr_sequence = 0
         self.ocr_handled = 0
         self.ocr_submit_at = -100.0
-        prefix = '/head_front_camera/head_front_camera'
+        prefix = '/head_front_camera'
         self.create_subscription(Image, prefix+'/color/image_raw', self.on_rgb, SENSOR_QOS)
-        self.create_subscription(Image, prefix+'/depth/image_rect_raw', self.on_depth, SENSOR_QOS)
-        self.create_subscription(CameraInfo, prefix+'/depth/camera_info', self.on_info, SENSOR_QOS)
+self.create_subscription(Image, prefix+'/depth/image_rect_raw', self.on_depth, SENSOR_QOS)
+self.create_subscription(CameraInfo, prefix+'/color/camera_info', self.on_info, SENSOR_QOS)
         self.create_subscription(Bool, '/perception/looking_for_bin', self.on_mode, 10)
         self.ready_pub = self.create_publisher(Bool, '/perception/ready', 10)
         self.shelf_pub = self.create_publisher(PoseStamped, '/perception/shelf_pose', 10)
