@@ -1,3 +1,4 @@
+Python
 """One-arm RGB-D grasp waypoints, controller results and contact verification.
 
 The public gripper endpoint is a TOPIC-only clamp in ERC, not an action.
@@ -38,7 +39,7 @@ class ManipulationNode(Node):
     def __init__(self):
         super().__init__('manipulation_node')
         for name, value in {
-            'gripper_open': 0.066, 'gripper_closed': 0.0,
+            'gripper_open': 0.0, 'gripper_closed': 0.79,
             # Insert past the measured spine rather than asking the base to
             # violate its shelf keepout. Keep the lateral target centred on
             # perception; the former 1.5 cm right bias led to left-only contact.
@@ -62,8 +63,8 @@ class ManipulationNode(Node):
         }.items():
             self.declare_parameter(name, value)
         for key in ('gripper_open', 'gripper_closed'):
-            if not 0 <= self.p(key) <= 0.069:
-                raise ValueError(f'{key} must lie in the ERC clamp interval [0, 0.069]')
+            if not 0 <= self.p(key) <= 0.803:
+                raise ValueError(f'{key} must lie in the ERC clamp interval [0, 0.803]')
         self.tf = Buffer()
         self.listener = TransformListener(self.tf, self)
         self.model = None
@@ -73,9 +74,9 @@ class ManipulationNode(Node):
         self.contacts = {}
         self.holding_book = None
         self.bin_contact_stamp = None
-        self.arm = ActionClient(self, FollowJointTrajectory, '/arm_right_controller/follow_joint_trajectory')
-        self.torso = ActionClient(self, FollowJointTrajectory, '/torso_controller/follow_joint_trajectory')
-        self.gripper_pub = self.create_publisher(JointTrajectory, '/gripper_right_controller/joint_trajectory', 10)
+        self.arm = ActionClient(self, FollowJointTrajectory, '/erc/arm_right_controller/follow_joint_trajectory')
+        self.torso = ActionClient(self, FollowJointTrajectory, '/erc/torso_controller/follow_joint_trajectory')
+        self.gripper_pub = self.create_publisher(JointTrajectory, '/erc/gripper_right_controller/joint_trajectory', 10)
         self.ready_pub = self.create_publisher(Bool, '/manipulation/ready', 10)
         self.holding_pub = self.create_publisher(Bool, '/manipulation/holding_book', 10)
         self.failure_pub = self.create_publisher(String, '/manipulation/failure', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -85,7 +86,7 @@ class ManipulationNode(Node):
         self.place_prepared_pub = self.create_publisher(Bool, '/manipulation/place_prepared', 10)
         self.carry_raised_pub = self.create_publisher(Bool, '/manipulation/carry_raised', 10)
         self.create_subscription(String, '/robot_description', self.on_description,
-                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+                                   QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_subscription(JointState, '/joint_states', self.on_joints, qos_profile_sensor_data)
         for name in ('book', 'bin'):
             self.create_subscription(PoseStamped, f'/perception/{name}_pose', lambda m, n=name: self.targets.update({n: m}), 10)
@@ -562,3 +563,5 @@ def main():
         node.pool.shutdown(wait=False, cancel_futures=True)
         node.destroy_node()
         rclpy.shutdown()
+
+
