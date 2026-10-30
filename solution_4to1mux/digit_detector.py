@@ -205,3 +205,5 @@ class DigitDetector:
             if digit == target_digit:
                 return confidence, bbox
         return None, None
+
+
