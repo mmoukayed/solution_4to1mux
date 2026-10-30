@@ -166,7 +166,7 @@ class PerceptionNode(Node):
                                       min_area=25, match_threshold=0.55)
         if self.detector.using_synthetic:
             missing = ', '.join(map(str, sorted(set(range(1, 6))-
-                                                 self.detector.real_template_digits)))
+                                                self.detector.real_template_digits)))
             self.get_logger().error(
                 f'Shelf digit detector is using synthetic templates; missing {missing} '
                 f'in {template_dir}. Correct shelf recognition may fail.')
@@ -195,10 +195,11 @@ class PerceptionNode(Node):
         self.ocr_sequence = 0
         self.ocr_handled = 0
         self.ocr_submit_at = -100.0
-        prefix = '/head_front_camera'
-        self.create_subscription(Image, prefix+'/color/image_raw', self.on_rgb, SENSOR_QOS)
-self.create_subscription(Image, prefix+'/depth/image_rect_raw', self.on_depth, SENSOR_QOS)
-self.create_subscription(CameraInfo, prefix+'/color/camera_info', self.on_info, SENSOR_QOS)
+        
+        self.create_subscription(Image, '/head_front_camera/color/image_raw', self.on_rgb, SENSOR_QOS)
+        self.create_subscription(Image, '/head_front_camera/depth/image_rect_raw', self.on_depth, SENSOR_QOS)
+        self.create_subscription(CameraInfo, '/head_front_camera/color/camera_info', self.on_info, SENSOR_QOS)
+        
         self.create_subscription(Bool, '/perception/looking_for_bin', self.on_mode, 10)
         self.ready_pub = self.create_publisher(Bool, '/perception/ready', 10)
         self.shelf_pub = self.create_publisher(PoseStamped, '/perception/shelf_pose', 10)
