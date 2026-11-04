@@ -1,4 +1,3 @@
-Python
 """One-arm RGB-D grasp waypoints, controller results and contact verification.
 
 The public gripper endpoint is a TOPIC-only clamp in ERC, not an action.
