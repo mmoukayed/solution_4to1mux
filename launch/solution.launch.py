@@ -1,9 +1,11 @@
-"""ERC entry point; all nodes share simulation time and typed arguments."""
+"""ERC entry point; all nodes share one ROS interface profile and clock."""
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+
+from solution_4to1mux.ros_topics import DEFAULT_PROFILE, get_ros_config
 
 
 def generate_launch_description():
@@ -11,7 +13,6 @@ def generate_launch_description():
         'shelf_column_number': ('1', int),
         'book_colour': ('red', str),
         'book_text': ('', str),
-        'use_sim_time': ('true', bool),
         'linear_speed': ('0.85', float),
         'strafe_speed': ('0.25', float),
         'rotate_speed': ('0.85', float),
@@ -37,23 +38,43 @@ def generate_launch_description():
     }
     params = {name: ParameterValue(LaunchConfiguration(name), value_type=kind)
               for name, (_, kind) in arguments.items()}
-    declarations = [DeclareLaunchArgument(name, default_value=value)
-                    for name, (value, _) in arguments.items()]
-    def node(executable, names):
-        return Node(package='solution_4to1mux', executable=executable,
-                    parameters=[{name: params[name] for name in ['use_sim_time']+names}],
-                    output='screen', emulate_tty=True)
-    return LaunchDescription(declarations+[
-        node('perception_node', ['shelf_column_number', 'book_colour', 'book_text', 'perception_rate',
-                                 'marker_min_height', 'marker_max_height', 'top_book_marker_offset',
-                                 'row_spacing', 'column_half_width']),
-        node('navigation_node', ['shelf_column_number', 'linear_speed', 'strafe_speed',
-                                'rotate_speed', 'search_rotate_speed', 'search_direction',
-                                'book_standoff', 'book_lateral_offset', 'grab_timeout',
-                                'place_timeout', 'phase_timeout', 'docking_speed',
-                                'book_search_timeout', 'max_book_recoveries',
-                                'book_view_backoff', 'top_book_marker_offset', 'row_spacing',
-                                'column_half_width', 'lower_book_standoff',
-                                'lower_book_keepout_distance']),
-        node('manipulation_node', []),
-    ])
+    declarations = [
+        DeclareLaunchArgument('robot_profile', default_value=DEFAULT_PROFILE,
+                              description='Profile name from solution_4to1mux/ros_topics.py'),
+        DeclareLaunchArgument('use_sim_time', default_value='auto',
+                              choices=['auto', 'true', 'false'],
+                              description='auto uses the clock setting in the selected robot profile'),
+    ]+[DeclareLaunchArgument(name, default_value=value)
+       for name, (value, _) in arguments.items()]
+
+    def launch_nodes(context):
+        profile = LaunchConfiguration('robot_profile').perform(context)
+        config = get_ros_config(profile)
+        clock = LaunchConfiguration('use_sim_time').perform(context)
+        if clock not in ('auto', 'true', 'false'):
+            raise ValueError('use_sim_time must be auto, true, or false')
+        shared = {'robot_profile': profile,
+                  'use_sim_time': config.use_sim_time if clock == 'auto' else clock == 'true'}
+
+        def node(executable, names):
+            return Node(package='solution_4to1mux', executable=executable,
+                        parameters=[{**shared, **{name: params[name] for name in names}}],
+                        remappings=config.builtin_remappings(),
+                        output='screen', emulate_tty=True)
+
+        return [
+            node('perception_node', ['shelf_column_number', 'book_colour', 'book_text', 'perception_rate',
+                                     'marker_min_height', 'marker_max_height', 'top_book_marker_offset',
+                                     'row_spacing', 'column_half_width']),
+            node('navigation_node', ['shelf_column_number', 'linear_speed', 'strafe_speed',
+                                    'rotate_speed', 'search_rotate_speed', 'search_direction',
+                                    'book_standoff', 'book_lateral_offset', 'grab_timeout',
+                                    'place_timeout', 'phase_timeout', 'docking_speed',
+                                    'book_search_timeout', 'max_book_recoveries',
+                                    'book_view_backoff', 'top_book_marker_offset', 'row_spacing',
+                                    'column_half_width', 'lower_book_standoff',
+                                    'lower_book_keepout_distance']),
+            node('manipulation_node', []),
+        ]
+
+    return LaunchDescription(declarations+[OpaqueFunction(function=launch_nodes)])

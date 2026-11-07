@@ -51,20 +51,68 @@ ros2 launch erc_bringup solution.launch.py
 ```
 The start command for our program should be as mentioned in the guidelines:
 ```
-ros2 launch solution_4to1mux solution.launch.py shelf_column_number:=2 book_colour:=red
+ros2 launch solution_4to1mux solution.launch.py robot_profile:=simulation shelf_column_number:=2 book_colour:=red
 ```
 
 For Phase 2 Round 2, launch `erc_bringup simulation_round_2.launch.py` in the simulator. Shelf 2 uses printed labels: install Tesseract in the simulator container once (`apt install -y tesseract-ocr`), then pass the exact requested label with `book_text`. For example:
 
 ```bash
-ros2 launch solution_4to1mux solution.launch.py shelf_column_number:=2 book_text:="TARGET LABEL"
+ros2 launch solution_4to1mux solution.launch.py robot_profile:=simulation shelf_column_number:=2 book_text:="TARGET LABEL"
 ```
 
 Leave `book_text` empty and use `book_colour:=red|green|blue|yellow` for the colored-book shelves, including the tight shelf 4 challenge.
 
+## ROS topics: simulation and real robot
+
+Edit **[solution_4to1mux/ros_topics.py](solution_4to1mux/ros_topics.py)** to change ROS names for the entire program. All three nodes import this file. It includes camera and LiDAR topics, base/arm/gripper commands, controller actions, robot description, contact feedback, internal node messages, and TF frame IDs. The launch file also remaps the library-owned TF and clock topics from this configuration.
+
+`TOPICS`, `ACTIONS`, and `FRAMES` retain the existing simulator names. `PROFILES['simulation']` and `PROFILES['real']` override only the entries that differ. For example, edit `camera_rgb` under the real profile's `topics` to change that subscription. Changing an internal topic such as `book_pose` updates both its publisher and subscribers. Frame names belong under `frames`; they are not topic names. Optional interfaces absent from a profile use `None`; required interfaces must have a valid name.
+
+The real profile now uses the **ERC 2026 Live Phase TIAGo Pro Interface Guide**, sections 2–3:
+
+| Interface | Real robot mapping |
+| --- | --- |
+| Base velocity / odometry | `/cmd_vel` / `/mobile_base_controller/odom` |
+| LiDAR | `/scan`, `/scan_front_raw`, `/scan_rear_raw` |
+| Colour image / intrinsics | `/head_front_camera/color/image_raw` / `/head_front_camera/color/camera_info` |
+| Depth used by perception | `/head_front_camera/aligned_depth_to_color/image_raw` |
+| Raw depth / point cloud | `/head_front_camera/depth/image_rect_raw` / `/head_front_camera/depth/color/points` |
+| Both arms, torso, head, both grippers | `/erc/<controller>/joint_trajectory` and `/erc/<controller>/follow_joint_trajectory` |
+| Controller rejection reasons | `/erc/rejections` (logged by navigation) |
+| Joint feedback / URDF | `/joint_states` / `/robot_description` |
+| TF | `/tf`, `/tf_static` |
+
+Perception uses colour-aligned depth with colour intrinsics and the colour optical frame; its existing `16UC1` conversion handles millimetres. Raw depth, point clouds, merged scans, and compressed image transport endpoints are also catalogued for reuse. Compressed names expand the guide's abbreviated transport suffixes. Navigation continues using both raw LiDAR streams and transforms them through TF.
+
+```bash
+# Gazebo: select simulation explicitly.
+ros2 launch solution_4to1mux solution.launch.py robot_profile:=simulation shelf_column_number:=3 book_colour:=green
+
+# Live robot: this is also the current DEFAULT_PROFILE in ros_topics.py.
+ros2 launch solution_4to1mux solution.launch.py robot_profile:=real shelf_column_number:=3 book_colour:=green
+```
+
+The launch argument `use_sim_time:=auto` is the default: simulation uses simulated time and real uses system time. An explicit `use_sim_time:=true` or `false` overrides it for all nodes. The profile selection does not add a startup waiting state.
+
+The real profile disables simulation-only `/contacts`, `/bin_contacts`, and `/base_imu`. Manipulation skips unavailable contact subscriptions and reports the missing feedback. **Hardware grasp/delivery verification still needs an adapter or a separate implementation**; the current contact-based checks cannot confirm success on the live robot. These interface mappings have been checked against the guide, not a connected robot. They do not calibrate motion or implement hardware effort-based grasp detection.
+
+After adding this module, build the package and source the workspace as usual. With `colcon build --symlink-install`, later edits to `ros_topics.py` take effect when you restart the nodes; a normal copied installation needs another build. Every node logs `ROS interface profile: simulation` or `real` at startup. Direct `ros2 run` also accepts `--ros-args -p robot_profile:=real`; set `use_sim_time` explicitly for direct runs and supply any custom TF/clock remappings yourself, since those are normally applied by `solution.launch.py`.
+
+The profile and launch checks run without ROS using:
+
+```bash
+python3 -m unittest discover -s test -p test_ros_topics.py -v
+```
+
 This package targets the **ERC simulator supplied in the 11 September 2026 ZIP**, ROS 2 Humble and Gazebo Harmonic. It uses the right arm only. Launch the simulator first, then launch this package.
 
-**Current navigation build: 5.12; perception build: 5.11; manipulation build: 5.12.** Startup must print `Navigation BUILD 5.12`, `Perception BUILD 5.11` and `Manipulation BUILD 5.12` — if it does not, the rebuild did not take and you are running older code.
+**Current navigation build: 5.16; perception build: 5.12; manipulation build: 5.14.** Startup must print `Navigation BUILD 5.16`, `Perception BUILD 5.12` and `Manipulation BUILD 5.14` — if it does not, the rebuild did not take and you are running older code.
+
+- **Navigation 5.16 / Perception 5.12 / Manipulation 5.14:** ROS topics, actions, and frames now come from `ros_topics.py`, with one `robot_profile` selection passed to every node. Simulation preserves the previous endpoint names; the real profile is editable separately.
+
+- **Navigation Build 5.15:** navigation enters and publishes `FIND_SHELF` during construction and immediately requests the first head scan pose. The startup waiting state, readiness subscription, settle delay, and startup timeout are removed. The first odometry message supplies the sweep heading and starts the search timeout, avoiding an instant timeout when the simulation clock first arrives. Base motion still requires fresh odometry and LiDAR.
+
+- **Build 5.13:** top-row grabs keep both arms folded during the base return, then move the right arm from a front clearance point to above the book before descending to pregrasp. The grasp inserts only after the base has stopped. The IK endpoint uses `gripper_right_base_link`, which is present in the current simulator frame dump, and manipulation readiness continues publishing while simulation time is paused.
 
 - **Manipulation Build 5.12:** removed the 1.5 cm robot-right grasp bias after repeated left-finger-only book contacts. The grasp now targets the measured book centre laterally.
 
@@ -250,7 +298,7 @@ All three solution nodes use `use_sim_time:=true` by default. Leave that enabled
 
 Normal state progression:
 
-`WAIT_INPUTS -> FIND_SHELF -> [SCAN_COLUMNS if needed] -> APPROACH_COLUMN -> FIND_BOOK -> STOW_ARMS_FOR_DOCK -> ALIGN_BOOK -> [REACQUIRE_BOOK / BACK_OUT_FOR_VIEW if needed] -> WAIT_FOR_GRAB -> RETREAT_FROM_SHELF -> RETURN_TO_START -> FIND_BIN -> APPROACH_BIN -> APPROACH_BIN_FOR_PLACE -> WAIT_FOR_PLACE_PREP -> WAIT_FOR_PLACE -> DONE`
+`FIND_SHELF -> [SCAN_COLUMNS if needed] -> APPROACH_COLUMN -> FIND_BOOK -> STOW_ARMS_FOR_DOCK -> ALIGN_BOOK -> [REACQUIRE_BOOK / BACK_OUT_FOR_VIEW if needed] -> WAIT_FOR_GRAB -> RETREAT_FROM_SHELF -> RETURN_TO_START -> FIND_BIN -> APPROACH_BIN -> APPROACH_BIN_FOR_PLACE -> WAIT_FOR_PLACE_PREP -> WAIT_FOR_PLACE -> DONE`
 
 Each transition is printed. Failures print a cause and publish `FAILED` on `/solution/state`; the robot stops. `FAILED` is not a successful trial. Restart the solution after fixing the reported cause; restart the simulator for a clean randomized trial.
 

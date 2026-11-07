@@ -1,7 +1,8 @@
-Python
+
 """One-arm RGB-D grasp waypoints, controller results and contact verification.
 
-The public gripper endpoint is a TOPIC-only clamp in ERC, not an action.
+Gripper commands use the trajectory topic; the simulation clamp is topic-only.
+The live profile also lists the hardware's gripper action endpoints.
 This local IK/waypoint controller does not provide whole-body collision planning.
 """
 import math
@@ -13,15 +14,16 @@ from action_msgs.msg import GoalStatus
 from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import PoseStamped
 from rclpy.action import ActionClient
+from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
-from ros_gz_interfaces.msg import Contacts
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Int32, String
 from tf2_ros import Buffer, TransformListener, TransformException
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+from .ros_topics import configure_ros
 from .geometry import ArmKinematics, pose_xyz, rotation, transform_matrix, yaw
 
 GRIPPER_JOINT = 'gripper_right_finger_joint'
@@ -38,6 +40,8 @@ def entity_name(value):
 class ManipulationNode(Node):
     def __init__(self):
         super().__init__('manipulation_node')
+        self.ros = configure_ros(self)
+        topics = self.ros.topics
         for name, value in {
             'gripper_open': 0.0, 'gripper_closed': 0.79,
             # Insert past the measured spine rather than asking the base to
@@ -49,6 +53,10 @@ class ManipulationNode(Node):
             # Must match navigation.grasp_base_return_advance.  This offsets
             # the prealignment target while the base is backed out.
             'grasp_base_advance': 0.28,
+            # Top-row pickup stays folded during base return, then approaches
+            # above the target so the wrist does not sweep across the middle row.
+            'top_book_clearance_height': 0.16,
+            'top_book_front_standoff': 0.10,
             # Must match navigation.place_base_advance.  The high pre-place
             # target is compensated while the base is still before the table.
             'place_base_advance': 0.35, 'place_clearance_height': 0.20,
@@ -71,35 +79,46 @@ class ManipulationNode(Node):
         self.joints = {}
         self.joint_stamp = None
         self.targets = {}
+        self.book_row = None
         self.contacts = {}
         self.holding_book = None
         self.bin_contact_stamp = None
-        self.arm = ActionClient(self, FollowJointTrajectory, '/erc/arm_right_controller/follow_joint_trajectory')
-        self.torso = ActionClient(self, FollowJointTrajectory, '/erc/torso_controller/follow_joint_trajectory')
-        self.gripper_pub = self.create_publisher(JointTrajectory, '/erc/gripper_right_controller/joint_trajectory', 10)
-        self.ready_pub = self.create_publisher(Bool, '/manipulation/ready', 10)
-        self.holding_pub = self.create_publisher(Bool, '/manipulation/holding_book', 10)
-        self.failure_pub = self.create_publisher(String, '/manipulation/failure', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.grab_pub = self.create_publisher(Bool, '/manipulation/grab_complete', 10)
-        self.prepared_pub = self.create_publisher(Bool, '/manipulation/grab_prepared', 10)
-        self.place_pub = self.create_publisher(Bool, '/manipulation/place_complete', 10)
-        self.place_prepared_pub = self.create_publisher(Bool, '/manipulation/place_prepared', 10)
-        self.carry_raised_pub = self.create_publisher(Bool, '/manipulation/carry_raised', 10)
-        self.create_subscription(String, '/robot_description', self.on_description,
+        self.arm = ActionClient(self, FollowJointTrajectory, self.ros.actions['right_arm_trajectory'])
+        self.torso = ActionClient(self, FollowJointTrajectory, self.ros.actions['torso_trajectory'])
+        self.gripper_pub = self.create_publisher(JointTrajectory, topics['right_gripper_command'], 10)
+        self.ready_pub = self.create_publisher(Bool, topics['manipulation_ready'], 10)
+        self.holding_pub = self.create_publisher(Bool, topics['holding_book'], 10)
+        self.failure_pub = self.create_publisher(String, topics['manipulation_failure'], QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.grab_pub = self.create_publisher(Bool, topics['grab_complete'], 10)
+        self.prepared_pub = self.create_publisher(Bool, topics['grab_prepared'], 10)
+        self.place_pub = self.create_publisher(Bool, topics['place_complete'], 10)
+        self.place_prepared_pub = self.create_publisher(Bool, topics['place_prepared'], 10)
+        self.carry_raised_pub = self.create_publisher(Bool, topics['carry_raised'], 10)
+        self.create_subscription(String, topics['robot_description'], self.on_description,
                                    QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.create_subscription(JointState, '/joint_states', self.on_joints, qos_profile_sensor_data)
+        self.create_subscription(Int32, topics['book_row'], self.on_book_row,
+                                   QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(JointState, topics['joint_states'], self.on_joints, qos_profile_sensor_data)
         for name in ('book', 'bin'):
-            self.create_subscription(PoseStamped, f'/perception/{name}_pose', lambda m, n=name: self.targets.update({n: m}), 10)
-        self.create_subscription(Bool, '/manipulation/request_grab', lambda m: self.request('grab') if m.data else None, 10)
-        self.create_subscription(Bool, '/manipulation/request_prepare_grab', lambda m: self.request('prepare_grab') if m.data else None, 10)
-        self.create_subscription(Bool, '/manipulation/request_finish_grab', lambda m: self.request('finish_grab') if m.data else None, 10)
-        self.create_subscription(Bool, '/manipulation/request_place', lambda m: self.request('place') if m.data else None, 10)
-        self.create_subscription(Bool, '/manipulation/request_prepare_place', lambda m: self.request('prepare_place') if m.data else None, 10)
-        self.create_subscription(Bool, '/manipulation/request_finish_place', lambda m: self.request('finish_place') if m.data else None, 10)
-        self.create_subscription(Bool, '/manipulation/request_raise_carry', lambda m: self.request('raise_carry') if m.data else None, 10)
-        self.create_subscription(Bool, '/manipulation/cancel', lambda m: self.abort('Cancelled by navigation') if m.data and self.active else None, 10)
-        self.create_subscription(Contacts, '/contacts', self.on_contacts, qos_profile_sensor_data)
-        self.create_subscription(Contacts, '/bin_contacts', self.on_bin_contacts, qos_profile_sensor_data)
+            self.create_subscription(PoseStamped, topics[f'{name}_pose'], lambda m, n=name: self.targets.update({n: m}), 10)
+        self.create_subscription(Bool, topics['request_grab'], lambda m: self.request('grab') if m.data else None, 10)
+        self.create_subscription(Bool, topics['request_prepare_grab'], lambda m: self.request('prepare_grab') if m.data else None, 10)
+        self.create_subscription(Bool, topics['request_finish_grab'], lambda m: self.request('finish_grab') if m.data else None, 10)
+        self.create_subscription(Bool, topics['request_place'], lambda m: self.request('place') if m.data else None, 10)
+        self.create_subscription(Bool, topics['request_prepare_place'], lambda m: self.request('prepare_place') if m.data else None, 10)
+        self.create_subscription(Bool, topics['request_finish_place'], lambda m: self.request('finish_place') if m.data else None, 10)
+        self.create_subscription(Bool, topics['request_raise_carry'], lambda m: self.request('raise_carry') if m.data else None, 10)
+        self.create_subscription(Bool, topics['cancel_manipulation'], lambda m: self.abort('Cancelled by navigation') if m.data and self.active else None, 10)
+        if topics['contacts'] is not None or topics['bin_contacts'] is not None:
+            from ros_gz_interfaces.msg import Contacts
+            if topics['contacts'] is not None:
+                self.create_subscription(Contacts, topics['contacts'], self.on_contacts, qos_profile_sensor_data)
+            if topics['bin_contacts'] is not None:
+                self.create_subscription(Contacts, topics['bin_contacts'], self.on_bin_contacts, qos_profile_sensor_data)
+        if topics['contacts'] is None or topics['bin_contacts'] is None:
+            self.get_logger().warn(
+                'This profile has no simulated grasp/bin contact feedback. '
+                'Hardware grasp and delivery verification still need an adapter or implementation.')
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.plan_future = None
         self.arm_in_shelf = False
@@ -113,8 +132,11 @@ class ManipulationNode(Node):
         self.token = 0
         self.deadline = 0.0
         self.warned_at = -100.0
-        self.create_timer(0.1, self.tick)
-        self.get_logger().info('Manipulation BUILD 5.12: centred grasp + compensated pregrasp reach.')
+        # Publish readiness on wall time, even while Gazebo sim time is paused.
+        # Motion deadlines still use the simulator clock in tick().
+        self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
+        self.create_timer(0.1, self.tick, clock=self.wall_clock)
+        self.get_logger().info('Manipulation BUILD 5.14: shared ROS topics + row-aware top-shelf grasp.')
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -128,14 +150,18 @@ class ManipulationNode(Node):
     def on_description(self, msg):
         if self.model is None:
             try:
-                self.model = ArmKinematics(msg.data)
-                self.get_logger().info('Loaded right-arm/torso kinematics and limits from /robot_description.')
+                self.model = ArmKinematics(msg.data, base=self.ros.frames['base'],
+                                           tip=self.ros.frames['arm_tip'])
+                self.get_logger().info(f'Loaded right-arm/torso kinematics and limits from {self.ros.topics["robot_description"]}.')
             except (ValueError, AttributeError) as error:
                 self.get_logger().error(f'Cannot load arm model: {error}')
 
     def on_joints(self, msg):
         self.joints.update(zip(msg.name, msg.position))
         self.joint_stamp = Time.from_msg(msg.header.stamp).nanoseconds/1e9
+
+    def on_book_row(self, msg):
+        self.book_row = int(msg.data) if 1 <= msg.data <= 4 else None
 
     def on_contacts(self, msg):
         for contact in msg.contacts:
@@ -194,11 +220,11 @@ class ManipulationNode(Node):
         target = self.targets.get('book' if sequence in ('grab', 'prepare_grab', 'finish_grab') else 'bin')
         target_age = (self.p('placement_target_max_age') if sequence in ('place', 'prepare_place', 'finish_place')
                       else self.p('target_max_age'))
-        if target is None or target.header.frame_id != 'odom' or not self.fresh(Time.from_msg(target.header.stamp).nanoseconds/1e9, target_age):
-            self.report(sequence, False, 'No fresh target pose in odom; inspect RGB-D perception.')
+        if target is None or target.header.frame_id != self.ros.frames['odom'] or not self.fresh(Time.from_msg(target.header.stamp).nanoseconds/1e9, target_age):
+            self.report(sequence, False, f'No fresh target pose in {self.ros.frames["odom"]}; inspect RGB-D perception.')
             return
         try:
-            tf = self.tf.lookup_transform('base_footprint', 'odom', Time())
+            tf = self.tf.lookup_transform(self.ros.frames['base'], self.ros.frames['odom'], Time())
         except TransformException as error:
             self.report(sequence, False, f'Cannot transform target to robot base: {error}')
             return
@@ -211,11 +237,12 @@ class ManipulationNode(Node):
         self.active = sequence
         self.token += 1
         self.arm_in_shelf = False
-        self.retreat_target = None
+        if sequence != 'finish_grab':
+            self.retreat_target = None
         self.phase = 'planning'
         self.deadline = self.now()+self.p('planning_timeout')
         current = np.array([self.joints[n] for n in self.model.names])
-        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'bin_inset', 'bin_release_height')}
+        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'top_book_clearance_height', 'top_book_front_standoff', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'bin_inset', 'bin_release_height')}
         self.plan_future = self.pool.submit(self.plan, sequence, point, normal, current, params)
         self.get_logger().info(f'{sequence}: planning for camera target in base frame {point.round(3)}')
 
@@ -224,7 +251,7 @@ class ManipulationNode(Node):
         if not np.isfinite(point).all() or point[0] < 0.2:
             raise ValueError(f'Target is not in front of the arm at reachable distance: {point}')
         reach_distance = point[0]
-        if sequence == 'prepare_grab':
+        if sequence == 'prepare_grab' and self.book_row != 1:
             # This phase runs after the base has backed out. Validate the
             # compensated arm target that will be reached after the planned
             # base advance, rather than rejecting the intentionally larger
@@ -258,15 +285,24 @@ class ManipulationNode(Node):
             extracted = lifted-normal*params['extract_distance']
             targets = [('pregrasp', pre), ('insert', grasp), ('lift', lifted), ('extract', extracted)]
         elif sequence == 'prepare_grab':
-            # At the backed-out base pose, solve an arm configuration that
-            # reaches the grasp point only after navigation advances the base.
-            # This keeps the arm below/clear of the shelf during its swing.
-            targets = [('prealign', point+normal*(params['grasp_insert_depth']-params['grasp_base_advance']))]
+            if self.book_row == 1:
+                # The base has already returned to the dock for a top-row grab.
+                # Reach from outside and above, then descend to pregrasp.
+                grasp = point+normal*params['grasp_insert_depth']
+                pre = grasp-normal*params['pregrasp_distance']
+                above = pre+np.array([0.0, 0.0, params['top_book_clearance_height']])
+                front = above-normal*params['top_book_front_standoff']
+                targets = [('top_front_clearance', front), ('top_clearance', above),
+                           ('pregrasp', pre)]
+            else:
+                # At the backed-out base pose, solve for the eventual dock pose.
+                targets = [('prealign', point+normal*(params['grasp_insert_depth']-params['grasp_base_advance']))]
         elif sequence == 'finish_grab':
             grasp = point+normal*params['grasp_insert_depth']
             lifted = grasp+np.array([0, 0, params['lift_distance']])
             extracted = lifted-normal*params['extract_distance']
-            targets = [('lift', lifted), ('extract', extracted)]
+            targets = ([('insert', grasp), ('lift', lifted), ('extract', extracted)]
+                       if self.book_row == 1 else [('lift', lifted), ('extract', extracted)])
         elif sequence == 'prepare_place':
             # Perception's bin normal points from the camera/robot toward the
             # bin. Move against it to centre the book in the opening. The base
@@ -317,8 +353,17 @@ class ManipulationNode(Node):
                     ('close_gripper', 'close', None, 1.0), motions[2], motions[3],
                     ('verify_book_held', 'verify', None, 0.8)]
         if sequence == 'prepare_grab':
+            if self.book_row == 1:
+                # Keep the solved pregrasp as the safe retreat if insertion fails.
+                self.retreat_target = motions[-1][2]
+                return [('open_gripper', 'open', None, 1.0)]+motions
             return [('open_gripper', 'open', None, 1.0), motions[0]]
         if sequence == 'finish_grab':
+            if self.book_row == 1:
+                if self.retreat_target is None:
+                    raise ValueError('Top-row pregrasp joints were not retained; prepare_grab must complete before finish_grab.')
+                return [motions[0], ('close_gripper', 'close', None, 1.0),
+                        motions[1], motions[2], ('verify_book_held', 'verify', None, 0.8)]
             self.retreat_target = motions[-1][2]
             return [('close_gripper', 'close', None, 1.0), motions[0], motions[1],
                     ('verify_book_held', 'verify', None, 0.8)]
@@ -359,6 +404,8 @@ class ManipulationNode(Node):
             sequence = self.active
             self.active = self.phase = None
             self.report(sequence, True, 'Confirmed sequence complete.')
+            if sequence in ('grab', 'finish_grab'):
+                self.retreat_target = None
             return
         self.phase_name, self.phase, self.phase_target, duration = self.phases.pop(0)
         # Fingers cross the shelf front at 'insert' and are clear again once
@@ -449,7 +496,7 @@ class ManipulationNode(Node):
                           f'finger/book contacts: {seen or "none"}. If the joint reached 0.0 m '
                           'without bilateral contact, the fingers closed beside/in front of the '
                           'book; if it stayed open, inspect the gripper trajectory controller '
-                          'and /joint_states.')
+                          f'and {self.ros.topics["joint_states"]}.')
             self.abort(f'{self.phase}: timed out.{detail} Check controller feedback, contacts, target pose and Gazebo.')
             return
         if self.phase == 'planning':

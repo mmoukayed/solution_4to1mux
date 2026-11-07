@@ -12,10 +12,11 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import JointState, LaserScan
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Int32, String
 from tf2_ros import Buffer, TransformListener, TransformException
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+from .ros_topics import configure_ros
 from .geometry import (body_velocity, forward_command, pose_xyz, row_for_height,
                        scan_points, transform_matrix, wrap, yaw)
 
@@ -27,7 +28,6 @@ DOCK_STOW_POSES = {
 
 
 class State(Enum):
-    WAIT_INPUTS = auto()
     FIND_SHELF = auto()
     SCAN_COLUMNS = auto()
     APPROACH_COLUMN = auto()
@@ -59,6 +59,8 @@ class NavigationNode(Node):
 
     def __init__(self):
         super().__init__('navigation_node')
+        self.ros = configure_ros(self)
+        topics = self.ros.topics
         defaults = {
             'shelf_column_number': 1, 'linear_speed': 0.85, 'strafe_speed': 0.25,
             'rotate_speed': 0.85, 'search_rotate_speed': 0.45,
@@ -67,7 +69,7 @@ class NavigationNode(Node):
             # begin its complete sweep counterclockwise.
             'bin_search_direction': 'left',
             'phase_timeout': 90.0, 'grab_timeout': 120.0, 'place_timeout': 90.0,
-            'startup_settle_time': 1.0, 'reading_max_age': 1.0,
+            'reading_max_age': 1.0,
             'book_standoff': 0.68, 'book_lateral_offset': -0.18,
             'bin_standoff': 0.95, 'bin_final_advance_max': 0.65,
             'bin_turn_backoff': 0.25, 'max_bin_turn_recoveries': 2,
@@ -110,11 +112,9 @@ class NavigationNode(Node):
         self.odom_stamp = None
         self.observations = {}
         self.scans = {}
-        self.ready_stamp = None
-        self.manip_ready = False
         self.result = None
         self.holding_stamp = None
-        self.state = State.WAIT_INPUTS
+        self.state = State.FIND_SHELF
         self.entered = self.now()
         self.last_head = None
         self.warned = {}
@@ -128,7 +128,7 @@ class NavigationNode(Node):
         self.arm_joints = {}
         self.arm_joint_stamp = None
         self.arm_stow_last = None
-        self.last_gate = 'startup'
+        self.last_gate = 'clear'
         self.blocked_since = None
         self.active_shelf_keepout_distance = self.p('shelf_keepout_distance')
         self.book_dock_minimum = self.p('shelf_keepout_distance')
@@ -136,42 +136,47 @@ class NavigationNode(Node):
         self.failure_reason = ''
         self.manip_failure = ''
         self.book_diagnostics = 'No book diagnostics received yet.'
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.head_pub = self.create_publisher(JointTrajectory, '/head_controller/joint_trajectory', 10)
-        self.left_arm_pub = self.create_publisher(JointTrajectory, '/arm_left_controller/joint_trajectory', 10)
-        self.right_arm_pub = self.create_publisher(JointTrajectory, '/arm_right_controller/joint_trajectory', 10)
-        self.bin_mode_pub = self.create_publisher(Bool, '/perception/looking_for_bin', 10)
-        self.grab_pub = self.create_publisher(Bool, '/manipulation/request_grab', 10)
-        self.prepare_grab_pub = self.create_publisher(Bool, '/manipulation/request_prepare_grab', 10)
-        self.finish_grab_pub = self.create_publisher(Bool, '/manipulation/request_finish_grab', 10)
-        self.raise_carry_pub = self.create_publisher(Bool, '/manipulation/request_raise_carry', 10)
-        self.place_pub = self.create_publisher(Bool, '/manipulation/request_place', 10)
-        self.prepare_place_pub = self.create_publisher(Bool, '/manipulation/request_prepare_place', 10)
-        self.finish_place_pub = self.create_publisher(Bool, '/manipulation/request_finish_place', 10)
-        self.cancel_pub = self.create_publisher(Bool, '/manipulation/cancel', 10)
-        self.failure_pub = self.create_publisher(String, '/solution/failure', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.state_pub = self.create_publisher(String, '/solution/state', QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.create_subscription(Odometry, '/odom', self.on_odom, qos_profile_sensor_data)
-        self.create_subscription(JointState, '/joint_states', self.on_arm_joints, qos_profile_sensor_data)
+        self.cmd_pub = self.create_publisher(Twist, topics['cmd_vel'], 10)
+        self.head_pub = self.create_publisher(JointTrajectory, topics['head_command'], 10)
+        self.left_arm_pub = self.create_publisher(JointTrajectory, topics['left_arm_command'], 10)
+        self.right_arm_pub = self.create_publisher(JointTrajectory, topics['right_arm_command'], 10)
+        self.bin_mode_pub = self.create_publisher(Bool, topics['looking_for_bin'], 10)
+        self.grab_pub = self.create_publisher(Bool, topics['request_grab'], 10)
+        self.prepare_grab_pub = self.create_publisher(Bool, topics['request_prepare_grab'], 10)
+        self.finish_grab_pub = self.create_publisher(Bool, topics['request_finish_grab'], 10)
+        self.raise_carry_pub = self.create_publisher(Bool, topics['request_raise_carry'], 10)
+        self.place_pub = self.create_publisher(Bool, topics['request_place'], 10)
+        self.prepare_place_pub = self.create_publisher(Bool, topics['request_prepare_place'], 10)
+        self.finish_place_pub = self.create_publisher(Bool, topics['request_finish_place'], 10)
+        self.cancel_pub = self.create_publisher(Bool, topics['cancel_manipulation'], 10)
+        self.failure_pub = self.create_publisher(String, topics['solution_failure'], QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.state_pub = self.create_publisher(String, topics['solution_state'], QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.book_row_pub = self.create_publisher(
+            Int32, topics['book_row'],
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(Odometry, topics['odom'], self.on_odom, qos_profile_sensor_data)
+        self.create_subscription(JointState, topics['joint_states'], self.on_arm_joints, qos_profile_sensor_data)
         for name in ('shelf', 'shelf_unit', 'book', 'bin'):
-            self.create_subscription(PoseStamped, f'/perception/{name}_pose', lambda m, n=name: self.on_pose(n, m), 10)
+            self.create_subscription(PoseStamped, topics[f'{name}_pose'], lambda m, n=name: self.on_pose(n, m), 10)
         for name in ('front', 'rear'):
-            self.create_subscription(LaserScan, f'/scan_{name}_raw', lambda m, n=name: self.on_scan(n, m), qos_profile_sensor_data)
-        self.create_subscription(Bool, '/perception/ready', self.on_ready, 10)
-        self.create_subscription(Bool, '/manipulation/ready', self.on_manip_ready, 10)
-        self.create_subscription(Bool, '/manipulation/holding_book', self.on_holding, 10)
-        self.create_subscription(String, '/manipulation/failure', self.on_manip_failure, QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.create_subscription(String, '/perception/book_diagnostics', self.on_book_diagnostics, 10)
-        self.create_subscription(Bool, '/manipulation/grab_complete', lambda m: self.on_result(m, State.WAIT_FOR_GRAB), 10)
-        self.create_subscription(Bool, '/manipulation/grab_prepared', lambda m: self.on_result(m, State.WAIT_FOR_PREGRASP), 10)
-        self.create_subscription(Bool, '/manipulation/carry_raised', lambda m: self.on_result(m, State.WAIT_FOR_CARRY_RAISE), 10)
-        self.create_subscription(Bool, '/manipulation/place_complete', lambda m: self.on_result(m, State.WAIT_FOR_PLACE), 10)
-        self.create_subscription(Bool, '/manipulation/place_prepared', lambda m: self.on_result(m, State.WAIT_FOR_PLACE_PREP), 10)
-        self.create_timer(0.05, self.tick)
+            self.create_subscription(LaserScan, topics[f'scan_{name}'], lambda m, n=name: self.on_scan(n, m), qos_profile_sensor_data)
+        self.create_subscription(Bool, topics['holding_book'], self.on_holding, 10)
+        self.create_subscription(String, topics['manipulation_failure'], self.on_manip_failure, QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(String, topics['book_diagnostics'], self.on_book_diagnostics, 10)
+        if topics['controller_rejections'] is not None:
+            self.create_subscription(String, topics['controller_rejections'], self.on_controller_rejection, 10)
+        self.create_subscription(Bool, topics['grab_complete'], lambda m: self.on_result(m, State.WAIT_FOR_GRAB), 10)
+        self.create_subscription(Bool, topics['grab_prepared'], lambda m: self.on_result(m, State.WAIT_FOR_PREGRASP), 10)
+        self.create_subscription(Bool, topics['carry_raised'], lambda m: self.on_result(m, State.WAIT_FOR_CARRY_RAISE), 10)
+        self.create_subscription(Bool, topics['place_complete'], lambda m: self.on_result(m, State.WAIT_FOR_PLACE), 10)
+        self.create_subscription(Bool, topics['place_prepared'], lambda m: self.on_result(m, State.WAIT_FOR_PLACE_PREP), 10)
         self.wall_sample, self.sim_sample = time.monotonic(), self.now()
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
+        self.create_timer(0.05, self.tick)
         self.create_timer(5.0, self.wall_status, clock=self.wall_clock)
-        self.get_logger().info(f'Navigation BUILD 5.12 (lower-row shelf clearance): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
+        self.get_logger().info(f'Navigation BUILD 5.16 (shared ROS topics + immediate shelf search): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
+        self.transition(State.FIND_SHELF)
+        self.look_for_shelf(0.0)
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -189,21 +194,20 @@ class NavigationNode(Node):
         self.odom_stamp = Time.from_msg(msg.header.stamp).nanoseconds/1e9
         if self.start is None:
             self.start = self.pose.copy()
+            if self.state == State.FIND_SHELF and self.search_origin is None:
+                # Startup already entered FIND_SHELF. Anchor its sweep to the
+                # first measured heading, and its timeout to the running clock
+                # so a first /clock jump from zero cannot expire the search.
+                self.search_origin = self.pose[2]
+                self.entered = self.search_pause = self.now()
 
     def on_arm_joints(self, msg):
         self.arm_joints.update(zip(msg.name, msg.position))
         self.arm_joint_stamp = Time.from_msg(msg.header.stamp).nanoseconds/1e9
 
     def on_pose(self, name, msg):
-        if msg.header.frame_id == 'odom' and np.isfinite(pose_xyz(msg)).all():
+        if msg.header.frame_id == self.ros.frames['odom'] and np.isfinite(pose_xyz(msg)).all():
             self.observations[name] = msg
-
-    def on_ready(self, msg):
-        if msg.data:
-            self.ready_stamp = self.now()
-
-    def on_manip_ready(self, msg):
-        self.manip_ready = msg.data
 
     def on_holding(self, msg):
         if msg.data:
@@ -215,13 +219,20 @@ class NavigationNode(Node):
     def on_book_diagnostics(self, msg):
         self.book_diagnostics = msg.data
 
+    def on_controller_rejection(self, msg):
+        # Topic trajectory rejections have no action result. Surface the
+        # organiser's reason without attributing another client's rejection
+        # to our current action or triggering an unrelated state transition.
+        self.get_logger().error(
+            f'Controller rejection on {self.ros.topics["controller_rejections"]}: {msg.data}')
+
     def on_result(self, msg, expected):
         if self.state == expected:
             self.result = msg.data
 
     def on_scan(self, name, msg):
         try:
-            tf = self.tf.lookup_transform('base_footprint', msg.header.frame_id, Time.from_msg(msg.header.stamp))
+            tf = self.tf.lookup_transform(self.ros.frames['base'], msg.header.frame_id, Time.from_msg(msg.header.stamp))
         except TransformException:
             return
         values = np.asarray(msg.ranges, dtype=float)
@@ -253,7 +264,7 @@ class NavigationNode(Node):
             f'turn={self.last_command[2]:+.2f}rad/s; odom={self.actual_speed:.2f}m/s; '
             f'remaining={remaining}; heading_error={heading_error}; book_age={book_age}; gate={self.last_gate}')
         if self.state == State.FAILED:
-            self.get_logger().error(f'Failure retained on /solution/failure: {self.failure_reason}')
+            self.get_logger().error(f'Failure retained on {self.ros.topics["solution_failure"]}: {self.failure_reason}')
         if rtf < 0.5:
             self.get_logger().warn('Gazebo is paused or slower than real time. Increasing /cmd_vel cannot speed up physics; check GPU/rendering.')
 
@@ -351,6 +362,8 @@ class NavigationNode(Node):
         self.current_book_row = row
         self.active_shelf_keepout_distance = keepout
         self.book_dock_minimum = max(standoff-0.10, keepout)
+        if row is not None:
+            self.book_row_pub.publish(Int32(data=row))
         return standoff
 
     def constrain_goal_to_column(self, goal):
@@ -378,7 +391,7 @@ class NavigationNode(Node):
         if len(self.scans) < 2 or not all(self.fresh(v[0]) for v in self.scans.values()):
             self.stop()
             self.last_gate = 'stale_or_missing_lidar'
-            self.warn('scan', 'Waiting for fresh front/rear LiDAR in base_footprint; no blind creep.')
+            self.warn('scan', f'Waiting for fresh front/rear LiDAR in {self.ros.frames["base"]}; no blind creep.')
             return
         points = np.concatenate([v[1] for v in self.scans.values()])
         scan_count = len(points)
@@ -463,6 +476,7 @@ class NavigationNode(Node):
             self.active_shelf_keepout_distance = self.p('shelf_keepout_distance')
             self.book_dock_minimum = self.p('shelf_keepout_distance')
             self.current_book_row = None
+            self.book_row_pub.publish(Int32(data=-1))
         if state == State.STOW_ARMS_FOR_DOCK:
             self.arm_stow_last = None
         if state == State.RETURN_TO_START:
@@ -470,12 +484,12 @@ class NavigationNode(Node):
         self.state_pub.publish(String(data=state.name))
         self.get_logger().info(f'-> {state.name}')
         if state in (State.FIND_SHELF, State.FIND_BIN):
-            self.search_origin = self.pose[2]
+            self.search_origin = self.pose[2] if self.pose is not None else None
             search_direction = self.p('bin_search_direction') if state == State.FIND_BIN else self.p('search_direction')
             direction = -1 if search_direction == 'right' else 1
             self.search_angles = [direction*math.radians(a) for a in (70, -70, 155, -155)]
             self.search_index = 0
-            self.search_pause = self.now()+0.5
+            self.search_pause = self.now()+(0.5 if state == State.FIND_BIN else 0.0)
         if state == State.SCAN_COLUMNS:
             shelf_unit = self.observations['shelf_unit']
             self.scan_heading = yaw(shelf_unit.pose.orientation)
@@ -590,7 +604,7 @@ class NavigationNode(Node):
     def look(self, target=None, tilt=0.15):
         if target is not None:
             try:
-                tf = self.tf.lookup_transform('head_1_link', 'odom', Time())
+                tf = self.tf.lookup_transform(self.ros.frames['head'], self.ros.frames['odom'], Time())
                 p = (transform_matrix(tf.transform) @ np.r_[pose_xyz(target), 1])[:3]
                 tilt = math.atan2(p[2]-0.25, max(math.hypot(p[0], p[1]), 0.1))
             except TransformException:
@@ -827,17 +841,12 @@ class NavigationNode(Node):
         if self.state in (State.DONE, State.FAILED):
             self.stop()
             return
+        if self.state == State.FIND_SHELF:
+            self.look_for_shelf(elapsed)
         if not self.fresh(self.odom_stamp):
             self.stop()
+            self.last_gate = 'stale_or_missing_odometry'
             self.warn('odom', 'Waiting for fresh odometry.')
-            return
-        if self.state == State.WAIT_INPUTS:
-            self.look()
-            self.stop()
-            if self.fresh(self.ready_stamp) and self.manip_ready and elapsed >= self.p('startup_settle_time'):
-                self.transition(State.FIND_SHELF)
-            elif elapsed > self.p('phase_timeout'):
-                self.fail('Startup timed out: inspect perception/manipulation logs for missing inputs/controllers.')
             return
         if self.state in (State.RETREAT_FROM_SHELF, State.WAIT_FOR_CARRY_RAISE, State.RETURN_TO_START,
                           State.FIND_BIN, State.APPROACH_BIN, State.BACK_OUT_FOR_BIN_TURN, State.WAIT_FOR_PLACE_PREP,
@@ -853,7 +862,8 @@ class NavigationNode(Node):
             return
         if self.state in (State.FIND_SHELF, State.SCAN_COLUMNS):
             observing = self.state == State.SCAN_COLUMNS and self.scan_pause_until is not None
-            self.look_for_shelf(self.now()-self.scan_observe_started if observing else elapsed)
+            if self.state == State.SCAN_COLUMNS:
+                self.look_for_shelf(self.now()-self.scan_observe_started if observing else elapsed)
             target = self.observation('shelf')
             if target is not None:
                 self.goal = self.target_goal(target, 1.15)
@@ -898,7 +908,7 @@ class NavigationNode(Node):
             if self.stow_arms_for_dock():
                 self.transition(State.ALIGN_BOOK)
             elif elapsed > self.p('arm_stow_timeout'):
-                self.fail('Arm stow timed out before shelf docking; inspect /joint_states and both arm trajectory controllers.')
+                self.fail(f'Arm stow timed out before shelf docking; inspect {self.ros.topics["joint_states"]} and both arm trajectory controllers.')
         elif self.state == State.BACK_OUT_FOR_VIEW:
             if self.drive_to(self.goal, keep_heading=True):
                 self.transition(State.FIND_BOOK)
@@ -926,27 +936,43 @@ class NavigationNode(Node):
                 self.recover_book_view()
         elif self.state == State.BACK_OUT_FOR_GRASP:
             if self.drive_to(self.goal, keep_heading=True):
-                self.result = None
-                self.transition(State.WAIT_FOR_PREGRASP)
-                self.prepare_grab_pub.publish(Bool(data=True))
+                if self.current_book_row == 1:
+                    # Keep the arms folded for the base return. The top-row
+                    # reach is planned from above only after the base is still.
+                    heading = self.pose[2]
+                    advance = self.p('grasp_base_return_advance')
+                    self.goal = np.r_[self.pose[:2]+advance*np.array([math.cos(heading), math.sin(heading)]), heading]
+                    self.transition(State.RETURN_FOR_GRAB)
+                else:
+                    self.result = None
+                    self.transition(State.WAIT_FOR_PREGRASP)
+                    self.prepare_grab_pub.publish(Bool(data=True))
         elif self.state == State.WAIT_FOR_PREGRASP:
             self.stop()
             if self.result is False:
-                self.fail(f'Pregrasp failed: {self.manip_failure or "read /manipulation/failure for the controller error"}')
+                self.fail(f'Pregrasp failed: {self.manip_failure or self.ros.topics["manipulation_failure"]}')
             elif self.result is True:
-                heading = self.pose[2]
-                advance = self.p('grasp_base_return_advance')
-                self.goal = np.r_[self.pose[:2]+advance*np.array([math.cos(heading), math.sin(heading)]), heading]
                 self.result = None
-                self.transition(State.RETURN_FOR_GRAB)
+                if self.current_book_row == 1:
+                    self.transition(State.WAIT_FOR_GRAB)
+                    self.finish_grab_pub.publish(Bool(data=True))
+                else:
+                    heading = self.pose[2]
+                    advance = self.p('grasp_base_return_advance')
+                    self.goal = np.r_[self.pose[:2]+advance*np.array([math.cos(heading), math.sin(heading)]), heading]
+                    self.transition(State.RETURN_FOR_GRAB)
         elif self.state == State.RETURN_FOR_GRAB:
             arrived = self.drive_to(self.goal, keep_heading=True)
             if arrived or self.shelf_limited_return_arrived(self.goal):
                 if not arrived:
                     self.get_logger().warn('Return-to-grab stopped by the shelf keepout at the safe boundary; starting the compensated arm close.')
                 self.result = None
-                self.transition(State.WAIT_FOR_GRAB)
-                self.finish_grab_pub.publish(Bool(data=True))
+                if self.current_book_row == 1:
+                    self.transition(State.WAIT_FOR_PREGRASP)
+                    self.prepare_grab_pub.publish(Bool(data=True))
+                else:
+                    self.transition(State.WAIT_FOR_GRAB)
+                    self.finish_grab_pub.publish(Bool(data=True))
         elif self.state == State.WAIT_FOR_GRAB:
             self.stop()
             if self.result is False:
@@ -960,7 +986,7 @@ class NavigationNode(Node):
                     self.result = None
                     self.transition(State.BACK_OUT_FOR_VIEW)
                     return
-                self.fail(f'Grasp failed: {self.manip_failure or "read /manipulation/failure for the controller or contact error"}')
+                self.fail(f'Grasp failed: {self.manip_failure or self.ros.topics["manipulation_failure"]}')
             elif self.result is True:
                 # The upright carry configuration moves its elbow through a
                 # broad arc. Back straight out first, especially for a book
@@ -1030,7 +1056,7 @@ class NavigationNode(Node):
         elif self.state == State.WAIT_FOR_PLACE_PREP:
             self.stop()
             if self.result is False:
-                self.fail(f'Bin hover failed: {self.manip_failure or "read /manipulation/failure for the arm error"}')
+                self.fail(f'Bin hover failed: {self.manip_failure or self.ros.topics["manipulation_failure"]}')
             elif self.result is True:
                 self.result = None
                 self.transition(State.WAIT_FOR_PLACE)
