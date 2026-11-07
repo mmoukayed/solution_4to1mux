@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from ros_stubs import install, Logger, Message, PoseStamped, Pub, Time
+from solution_4to1mux.ros_topics import get_ros_config
 restore_ros = install()
 from solution_4to1mux.geometry import (ArmKinematics, body_velocity, depth_median, forward_command,
                                       rotation, row_for_height, scan_points, wrap)
@@ -34,6 +35,7 @@ def model():
 
 def bare_nav():
     n = NavigationNode.__new__(NavigationNode)
+    n.ros = get_ros_config('simulation')
     values = dict(reading_max_age=1.0, obstacle_margin=0.12, linear_speed=0.85,
                   strafe_speed=0.25, rotate_speed=0.85, search_rotate_speed=0.45,
                   phase_timeout=90, search_direction='right', docking_speed=.25,
@@ -158,6 +160,7 @@ def test_failed_grasp_never_returns_empty():
 
 def test_wrong_column_larger_colour_blob_is_rejected():
     n = PerceptionNode.__new__(PerceptionNode)
+    n.ros = get_ros_config('simulation')
     n.target_colour = 'red'
     n.image = np.zeros((160, 250, 3), np.uint8)
     n.image[40:100, 50:65] = (0, 0, 255)       # correct column
@@ -252,6 +255,7 @@ def test_current_marker_mount_keeps_book_row_identification_correct(row, height)
 @pytest.mark.parametrize('height', [.605, .935, 1.265, 1.595])
 def test_grasp_waypoints_reach_all_four_rows_within_limits(model, height):
     n = ManipulationNode.__new__(ManipulationNode)
+    n.ros = get_ros_config('simulation')
     n.model = model
     params = dict(grasp_insert_depth=.025, pregrasp_distance=.06, lift_distance=.025,
                   extract_distance=.10, bin_inset=.12, bin_release_height=.21)
@@ -273,6 +277,7 @@ def test_torso_duration_respects_actual_urdf_limit(model):
 
 def test_high_carry_pose_moves_only_arm_and_preserves_torso(model):
     n = ManipulationNode.__new__(ManipulationNode)
+    n.ros = get_ros_config('simulation')
     n.model = model
     current = np.zeros(8)
     current[0] = .12
@@ -289,6 +294,7 @@ def test_unreachable_target_rejected_before_motion(model):
 
 def test_grasp_needs_both_fingers_on_same_book():
     n = ManipulationNode.__new__(ManipulationNode)
+    n.ros = get_ros_config('simulation')
     n.now = lambda: 10.
     n.contacts = {('book_A', 'left'): 10., ('book_B', 'right'): 10.}
     assert n.held_book() is None
@@ -300,6 +306,7 @@ def test_grasp_needs_both_fingers_on_same_book():
 
 def test_rejected_action_fails_instead_of_waiting_for_nav_timeout():
     n = ManipulationNode.__new__(ManipulationNode)
+    n.ros = get_ros_config('simulation')
     n.token = 1
     n.active = 'grab'
     n.phase_name = 'pregrasp'
@@ -311,6 +318,7 @@ def test_rejected_action_fails_instead_of_waiting_for_nav_timeout():
 
 def test_late_action_acceptance_after_cancel_is_cancelled():
     n = ManipulationNode.__new__(ManipulationNode)
+    n.ros = get_ros_config('simulation')
     n.token, n.active = 2, None
     cancelled = []
     handle = NS(accepted=True, cancel_goal_async=lambda: cancelled.append(True))
@@ -320,6 +328,7 @@ def test_late_action_acceptance_after_cancel_is_cancelled():
 
 def test_cancelled_result_with_zero_error_is_not_success():
     n = ManipulationNode.__new__(ManipulationNode)
+    n.ros = get_ros_config('simulation')
     n.token, n.active, n.phase_name = 1, 'grab', 'insert'
     failures = []
     n.abort = failures.append
@@ -671,6 +680,7 @@ def test_book_view_recovery_is_bounded_and_does_not_retry_a_grasp():
 
 def bare_perception_tracker():
     n = PerceptionNode.__new__(PerceptionNode)
+    n.ros = get_ros_config('simulation')
     n.column_pose = None
     n.candidate_column_pose = None
     n.candidate_column_hits = 0
@@ -706,6 +716,7 @@ def test_single_visible_sign_does_not_replace_measured_shelf_normal_with_bearing
 
 def test_manipulation_failure_reason_published_with_false_result():
     n = ManipulationNode.__new__(ManipulationNode)
+    n.ros = get_ros_config('simulation')
     n.failure_pub, n.grab_pub, n.place_pub = Pub(), Pub(), Pub()
     n.get_logger = lambda: Logger()
     n.report('grab', False, 'close: no bilateral book contact')
@@ -745,6 +756,7 @@ def test_dock_goal_clamped_when_book_reads_too_deep():
 
 def test_deep_colour_blob_inside_shelf_is_rejected():
     n = PerceptionNode.__new__(PerceptionNode)
+    n.ros = get_ros_config('simulation')
     n.target_colour = 'red'
     n.image = np.zeros((160, 250, 3), np.uint8)
     n.image[40:100, 50:65] = (0, 0, 255)
@@ -814,6 +826,7 @@ def test_blocked_docking_is_tracked_for_recovery_not_waited_out():
 
 def test_grab_refused_when_base_jammed_against_shelf(model):
     n = ManipulationNode.__new__(ManipulationNode)
+    n.ros = get_ros_config('simulation')
     n.model = model
     params = dict(grasp_insert_depth=.04, pregrasp_distance=.10, lift_distance=.025,
                   extract_distance=.10, bin_inset=.12, bin_release_height=.21)

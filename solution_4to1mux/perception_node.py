@@ -23,6 +23,7 @@ from std_msgs.msg import Bool, Int32, String
 from tf2_ros import Buffer, TransformListener, TransformException
 
 from .digit_detector import DigitDetector
+from .ros_topics import configure_ros
 from .geometry import depth_median, pose_xyz, row_for_height, transform_matrix, yaw
 
 COLOR_RANGES = {
@@ -130,12 +131,14 @@ def colour_boxes(image, colour, minimum_area=12):
 class PerceptionNode(Node):
     def __init__(self):
         super().__init__('perception_node')
+        self.ros = configure_ros(self)
+        topics = self.ros.topics
         defaults = {
             'shelf_column_number': 1, 'book_colour': 'red', 'book_text': '',
             'perception_rate': 8.0, 'book_text_ocr_period': 0.45,
             'erc_images_dir': str(Path(__file__).resolve().parents[1] / 'erc_images'),
             'template_dir': str(Path(get_package_share_directory('solution_4to1mux')) / 'templates'),
-            'depth_frame': 'head_front_camera_depth_optical_frame',
+            'depth_frame': self.ros.frames['depth_camera'],
             'depth_max_skew': 0.20, 'observation_max_age': 0.8,
             # Current simulator: marker centre 1.93 m, top active book 1.595 m.
             'marker_min_height': 1.75, 'marker_max_height': 2.55,
@@ -166,7 +169,7 @@ class PerceptionNode(Node):
                                       min_area=25, match_threshold=0.55)
         if self.detector.using_synthetic:
             missing = ', '.join(map(str, sorted(set(range(1, 6))-
-                                                 self.detector.real_template_digits)))
+                                                self.detector.real_template_digits)))
             self.get_logger().error(
                 f'Shelf digit detector is using synthetic templates; missing {missing} '
                 f'in {template_dir}. Correct shelf recognition may fail.')
@@ -195,22 +198,23 @@ class PerceptionNode(Node):
         self.ocr_sequence = 0
         self.ocr_handled = 0
         self.ocr_submit_at = -100.0
-        prefix = '/head_front_camera/head_front_camera'
-        self.create_subscription(Image, prefix+'/color/image_raw', self.on_rgb, SENSOR_QOS)
-        self.create_subscription(Image, prefix+'/depth/image_rect_raw', self.on_depth, SENSOR_QOS)
-        self.create_subscription(CameraInfo, prefix+'/depth/camera_info', self.on_info, SENSOR_QOS)
-        self.create_subscription(Bool, '/perception/looking_for_bin', self.on_mode, 10)
-        self.ready_pub = self.create_publisher(Bool, '/perception/ready', 10)
-        self.shelf_pub = self.create_publisher(PoseStamped, '/perception/shelf_pose', 10)
-        self.unit_pub = self.create_publisher(PoseStamped, '/perception/shelf_unit_pose', 10)
-        self.book_diag_pub = self.create_publisher(String, '/perception/book_diagnostics', 10)
-        self.book_pub = self.create_publisher(PoseStamped, '/perception/book_pose', 10)
-        self.bin_pub = self.create_publisher(PoseStamped, '/perception/bin_pose', 10)
-        self.column_pub = self.create_publisher(Int32, '/erc/shelf_column_identification', 10)
-        self.row_pub = self.create_publisher(Int32, '/erc/shelf_row_identification', 10)
+        
+        self.create_subscription(Image, topics['camera_rgb'], self.on_rgb, SENSOR_QOS)
+        self.create_subscription(Image, topics['camera_depth'], self.on_depth, SENSOR_QOS)
+        self.create_subscription(CameraInfo, topics['camera_info'], self.on_info, SENSOR_QOS)
+        
+        self.create_subscription(Bool, topics['looking_for_bin'], self.on_mode, 10)
+        self.ready_pub = self.create_publisher(Bool, topics['perception_ready'], 10)
+        self.shelf_pub = self.create_publisher(PoseStamped, topics['shelf_pose'], 10)
+        self.unit_pub = self.create_publisher(PoseStamped, topics['shelf_unit_pose'], 10)
+        self.book_diag_pub = self.create_publisher(String, topics['book_diagnostics'], 10)
+        self.book_pub = self.create_publisher(PoseStamped, topics['book_pose'], 10)
+        self.bin_pub = self.create_publisher(PoseStamped, topics['bin_pose'], 10)
+        self.column_pub = self.create_publisher(Int32, topics['shelf_column_identification'], 10)
+        self.row_pub = self.create_publisher(Int32, topics['shelf_row_identification'], 10)
         self.create_timer(1.0/self.get_parameter('perception_rate').value, self.process)
         self.get_logger().info(
-            f'Perception BUILD 5.11: column {self.target_column}, '
+            f'Perception BUILD 5.12: column {self.target_column}, '
             f'{"text="+self.target_text if self.target_text else self.target_colour}; '
             f'marker height {self.get_parameter("marker_min_height").value:.2f}-'
             f'{self.get_parameter("marker_max_height").value:.2f} m')
@@ -313,7 +317,7 @@ class PerceptionNode(Node):
 
     def make_pose(self, xyz, heading=0.0):
         msg = PoseStamped()
-        msg.header.frame_id = 'odom'
+        msg.header.frame_id = self.ros.frames['odom']
         msg.header.stamp = self.depth.header.stamp
         msg.pose.position.x, msg.pose.position.y, msg.pose.position.z = map(float, xyz)
         msg.pose.orientation.z = math.sin(heading/2)
@@ -336,10 +340,10 @@ class PerceptionNode(Node):
             self.warn('Camera frames are stale; check Gazebo real-time factor and use_sim_time.')
             return
         try:
-            tf = self.tf.lookup_transform('odom', self.get_parameter('depth_frame').value, depth_stamp)
+            tf = self.tf.lookup_transform(self.ros.frames['odom'], self.get_parameter('depth_frame').value, depth_stamp)
             self.camera_to_odom = transform_matrix(tf.transform)
         except TransformException as error:
-            self.warn(f'Waiting for camera -> odom TF: {error}')
+            self.warn(f'Waiting for camera -> {self.ros.frames["odom"]} TF: {error}')
             return
         self.image = self.bridge.imgmsg_to_cv2(self.rgb, 'bgr8')
         raw = self.bridge.imgmsg_to_cv2(self.depth, 'passthrough')

@@ -6,6 +6,8 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from scipy.optimize import least_squares
 
+from .ros_topics import FRAMES
+
 
 def wrap(angle):
     return math.atan2(math.sin(angle), math.cos(angle))
@@ -113,7 +115,7 @@ class ArmKinematics:
     The caller must approach the shelf square-on and keep waypoints clear.
     """
 
-    def __init__(self, urdf, base='base_footprint', tip='gripper_right_grasping_link'):
+    def __init__(self, urdf, base=FRAMES['base'], tip=FRAMES['arm_tip']):
         root = ET.fromstring(urdf)
         by_child = {j.find('child').get('link'): j for j in root.findall('joint')}
         chain, current = [], tip
