@@ -32,6 +32,7 @@ class State(Enum):
     SCAN_COLUMNS = auto()
     APPROACH_COLUMN = auto()
     FIND_BOOK = auto()
+    ALIGN_SHELF_FOR_DOCK = auto()
     STOW_ARMS_FOR_DOCK = auto()
     ALIGN_BOOK = auto()
     BACK_OUT_FOR_GRASP = auto()
@@ -81,6 +82,11 @@ class NavigationNode(Node):
             # margin: a depth-biased book point must not put the bumper (or
             # the parked arm) against the shelf before the grasp starts.
             'shelf_keepout_distance': 0.62,
+            # Before folding the arms, square the mobile base to the shelf and
+            # correct its lateral position at low speed while still staged.
+            'shelf_alignment_standoff': 1.35,
+            'shelf_alignment_strafe_speed': 0.12,
+            'shelf_alignment_timeout': 15.0,
             # Low-row arm links sweep close to the shelf even in the dock
             # stow pose. Keep the base farther back while ALIGN_BOOK runs.
             'lower_book_standoff': 0.92, 'lower_book_keepout_distance': 0.84,
@@ -103,7 +109,8 @@ class NavigationNode(Node):
         }
         for key, value in defaults.items():
             self.declare_parameter(key, value)
-        for key in ('linear_speed', 'strafe_speed', 'rotate_speed', 'search_rotate_speed', 'docking_speed'):
+        for key in ('linear_speed', 'strafe_speed', 'rotate_speed', 'search_rotate_speed', 'docking_speed',
+                    'shelf_alignment_strafe_speed'):
             if not 0 < self.p(key) <= 1.0:
                 raise ValueError(f'{key} must be >0 and <=1')
         self.tf = Buffer()
@@ -174,7 +181,7 @@ class NavigationNode(Node):
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(0.05, self.tick)
         self.create_timer(5.0, self.wall_status, clock=self.wall_clock)
-        self.get_logger().info(f'Navigation BUILD 5.16 (shared ROS topics + immediate shelf search): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
+        self.get_logger().info(f'Navigation BUILD 5.17 (pre-stow shelf-parallel alignment): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
         self.transition(State.FIND_SHELF)
         self.look_for_shelf(0.0)
 
@@ -856,7 +863,10 @@ class NavigationNode(Node):
         if self.state in (State.FIND_BOOK, State.REACQUIRE_BOOK) and elapsed > self.p('book_search_timeout'):
             self.recover_book_view()
             return
-        limit = self.p('grab_timeout') if self.state == State.WAIT_FOR_GRAB else self.p('place_timeout') if self.state == State.WAIT_FOR_PLACE else self.p('phase_timeout')
+        limit = (self.p('grab_timeout') if self.state == State.WAIT_FOR_GRAB else
+                 self.p('place_timeout') if self.state == State.WAIT_FOR_PLACE else
+                 self.p('shelf_alignment_timeout') if self.state == State.ALIGN_SHELF_FOR_DOCK else
+                 self.p('phase_timeout'))
         if elapsed > limit:
             self.fail(f'{self.state.name} timed out after {elapsed:.1f} simulation seconds; inspect preceding warnings.')
             return
@@ -894,15 +904,53 @@ class NavigationNode(Node):
             book = self.observation('book')
             if book is not None:
                 standoff = self.dock_constraints_for_book(book)
-                self.goal = self.constrain_goal_to_column(
-                    self.target_goal(book, standoff, self.p('book_lateral_offset')))
+                self.goal = self.target_goal(
+                    book, standoff, self.p('book_lateral_offset'))
+                shelf = self.observation('shelf')
+                if shelf is not None:
+                    self.goal[2] = yaw(shelf.pose.orientation)
+                self.goal = self.constrain_goal_to_column(self.goal)
                 self.goal = self.clamped_dock_goal(self.goal)
                 self.get_logger().info(
                     f'Book dock: row={self.current_book_row}, standoff={standoff:.2f} m, '
                     f'shelf_keepout={self.active_shelf_keepout_distance:.2f} m.')
-                self.transition(State.STOW_ARMS_FOR_DOCK)
+                self.get_logger().info('Aligning the base parallel to the shelf before moving the arms.')
+                self.transition(State.ALIGN_SHELF_FOR_DOCK)
             else:
                 self.scan_for_book(elapsed)
+        elif self.state == State.ALIGN_SHELF_FOR_DOCK:
+            if (self.blocked_since is not None and
+                    self.now()-self.blocked_since > self.p('align_block_timeout')):
+                self.fail(f'Shelf-parallel alignment blocked ({self.last_gate}); refusing to stow arms against the shelf.')
+                return
+            reference = self.wall_reference()
+            if reference is not None:
+                wall_point, normal = reference
+                shelf_distance = float(-(self.pose[:2]-wall_point) @ normal)
+                safe_distance = max(self.p('shelf_alignment_standoff'),
+                                    self.active_shelf_keepout_distance+0.25)
+                if shelf_distance < safe_distance-0.025:
+                    speed = min(self.p('shelf_alignment_strafe_speed'),
+                                1.5*(safe_distance-shelf_distance))
+                    world_velocity = -normal*speed
+                    c, s = math.cos(self.pose[2]), math.sin(self.pose[2])
+                    vx = c*world_velocity[0]+s*world_velocity[1]
+                    vy = -s*world_velocity[0]+c*world_velocity[1]
+                    self.move(vx=vx, vy=vy, allow_turn_recovery=False)
+                    return
+            heading_error = wrap(self.goal[2]-self.pose[2])
+            if abs(heading_error) > 0.025:
+                omega = float(np.clip(1.6*heading_error,
+                                      -self.p('rotate_speed'), self.p('rotate_speed')))
+                self.move(omega=omega, allow_turn_recovery=False)
+                return
+            tangent = np.array([-math.sin(self.goal[2]), math.cos(self.goal[2])])
+            lateral_error = float((self.goal[:2]-self.pose[:2]) @ tangent)
+            if abs(lateral_error) <= 0.025:
+                self.transition(State.STOW_ARMS_FOR_DOCK)
+                return
+            speed = min(self.p('shelf_alignment_strafe_speed'), 1.5*abs(lateral_error))
+            self.move(vy=math.copysign(speed, lateral_error), allow_turn_recovery=False)
         elif self.state == State.STOW_ARMS_FOR_DOCK:
             self.stop()
             if self.stow_arms_for_dock():

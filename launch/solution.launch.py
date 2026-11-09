@@ -31,6 +31,9 @@ def generate_launch_description():
         'column_half_width': ('0.43', float),
         'lower_book_standoff': ('0.92', float),
         'lower_book_keepout_distance': ('0.84', float),
+        'shelf_alignment_standoff': ('1.35', float),
+        'shelf_alignment_strafe_speed': ('0.12', float),
+        'shelf_alignment_timeout': ('15.0', float),
         'docking_speed': ('0.25', float),
         'book_search_timeout': ('8.0', float),
         'max_book_recoveries': ('2', int),
@@ -73,7 +76,10 @@ def generate_launch_description():
                                     'book_search_timeout', 'max_book_recoveries',
                                     'book_view_backoff', 'top_book_marker_offset', 'row_spacing',
                                     'column_half_width', 'lower_book_standoff',
-                                    'lower_book_keepout_distance']),
+                                    'lower_book_keepout_distance',
+                                    'shelf_alignment_standoff',
+                                    'shelf_alignment_strafe_speed',
+                                    'shelf_alignment_timeout']),
             node('manipulation_node', []),
         ]
 

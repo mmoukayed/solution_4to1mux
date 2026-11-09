@@ -106,9 +106,9 @@ python3 -m unittest discover -s test -p test_ros_topics.py -v
 
 This package targets the **ERC simulator supplied in the 11 September 2026 ZIP**, ROS 2 Humble and Gazebo Harmonic. It uses the right arm only. Launch the simulator first, then launch this package.
 
-**Current navigation build: 5.16; perception build: 5.12; manipulation build: 5.14.** Startup must print `Navigation BUILD 5.16`, `Perception BUILD 5.12` and `Manipulation BUILD 5.14` — if it does not, the rebuild did not take and you are running older code.
+**Current navigation build: 5.17; perception build: 5.13; manipulation build: 5.19.** Startup must print `Navigation BUILD 5.17`, `Perception BUILD 5.13` and `Manipulation BUILD 5.19` — if it does not, the rebuild did not take and you are running older code.
 
-- **Navigation 5.16 / Perception 5.12 / Manipulation 5.14:** ROS topics, actions, and frames now come from `ros_topics.py`, with one `robot_profile` selection passed to every node. Simulation preserves the previous endpoint names; the real profile is editable separately.
+- **Navigation 5.17 / Perception 5.13 / Manipulation 5.19:** before either arm moves into its shelf dock pose, navigation backs out to at least 1.35 m from the shelf if needed, rotates the base to the measured shelf heading, then strafes at up to 0.12 m/s along the shelf face to line up with the selected book's dock position. LiDAR and the virtual shelf clearance gate remain active during base alignment; if it cannot complete safely, navigation stops and reports the blocking gate instead of moving the arms. Top-row grasp preparation raises the torso to its URDF upper limit before running IK, confirms the measured torso height, then solves and executes the pregrasp with that lift fixed; the gripper opens before arm motion. This avoids relying on the IK optimizer to request torso motion incidentally. ROS topics, actions, and frames come from `ros_topics.py`, with one `robot_profile` selection passed to every node. Simulation action and gripper names match the controllers and clamp started by `erc_bringup`; the real profile keeps its `/erc/` endpoints. Perception tolerates image stamps up to 100 ms ahead of the latest TF and reports missing camera inputs by name. Manipulation reports the specific missing description, joint feedback, action server, or gripper subscriber when a grasp request is not ready. Grasp IK uses the URDF grasp frame, and gripper open/closed positions follow each profile's joint convention (simulation: 0.066/0.0; real: 0.0/0.79).
 
 - **Navigation Build 5.15:** navigation enters and publishes `FIND_SHELF` during construction and immediately requests the first head scan pose. The startup waiting state, readiness subscription, settle delay, and startup timeout are removed. The first odometry message supplies the sweep heading and starts the search timeout, avoiding an instant timeout when the simulation clock first arrives. Base motion still requires fresh odometry and LiDAR.
 
@@ -298,7 +298,7 @@ All three solution nodes use `use_sim_time:=true` by default. Leave that enabled
 
 Normal state progression:
 
-`FIND_SHELF -> [SCAN_COLUMNS if needed] -> APPROACH_COLUMN -> FIND_BOOK -> STOW_ARMS_FOR_DOCK -> ALIGN_BOOK -> [REACQUIRE_BOOK / BACK_OUT_FOR_VIEW if needed] -> WAIT_FOR_GRAB -> RETREAT_FROM_SHELF -> RETURN_TO_START -> FIND_BIN -> APPROACH_BIN -> APPROACH_BIN_FOR_PLACE -> WAIT_FOR_PLACE_PREP -> WAIT_FOR_PLACE -> DONE`
+`FIND_SHELF -> [SCAN_COLUMNS if needed] -> APPROACH_COLUMN -> FIND_BOOK -> ALIGN_SHELF_FOR_DOCK -> STOW_ARMS_FOR_DOCK -> ALIGN_BOOK -> [REACQUIRE_BOOK / BACK_OUT_FOR_VIEW if needed] -> WAIT_FOR_GRAB -> RETREAT_FROM_SHELF -> RETURN_TO_START -> FIND_BIN -> APPROACH_BIN -> APPROACH_BIN_FOR_PLACE -> WAIT_FOR_PLACE_PREP -> WAIT_FOR_PLACE -> DONE`
 
 Each transition is printed. Failures print a cause and publish `FAILED` on `/solution/state`; the robot stops. `FAILED` is not a successful trial. Restart the solution after fixing the reported cause; restart the simulator for a clean randomized trial.
 
