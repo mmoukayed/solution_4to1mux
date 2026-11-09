@@ -140,6 +140,7 @@ class PerceptionNode(Node):
             'template_dir': str(Path(get_package_share_directory('solution_4to1mux')) / 'templates'),
             'depth_frame': self.ros.frames['depth_camera'],
             'depth_max_skew': 0.20, 'observation_max_age': 0.8,
+            'tf_latest_fallback_tolerance': 0.10,
             # Current simulator: marker centre 1.93 m, top active book 1.595 m.
             'marker_min_height': 1.75, 'marker_max_height': 2.55,
             'column_half_width': 0.43, 'top_book_marker_offset': 0.335,
@@ -214,7 +215,7 @@ class PerceptionNode(Node):
         self.row_pub = self.create_publisher(Int32, topics['shelf_row_identification'], 10)
         self.create_timer(1.0/self.get_parameter('perception_rate').value, self.process)
         self.get_logger().info(
-            f'Perception BUILD 5.12: column {self.target_column}, '
+            f'Perception BUILD 5.13: column {self.target_column}, '
             f'{"text="+self.target_text if self.target_text else self.target_colour}; '
             f'marker height {self.get_parameter("marker_min_height").value:.2f}-'
             f'{self.get_parameter("marker_max_height").value:.2f} m')
@@ -326,7 +327,14 @@ class PerceptionNode(Node):
 
     def process(self):
         if self.rgb is None or self.depth is None or self.info is None:
-            self.warn('Waiting for RGB, depth and depth CameraInfo; check camera topics/QoS.')
+            missing = [label for label, message in (
+                ('RGB', self.rgb), ('depth', self.depth), ('CameraInfo', self.info))
+                if message is None]
+            self.warn(
+                f'Waiting for {", ".join(missing)}; verify the subscribed topic names '
+                f'and QoS (RGB={self.ros.topics["camera_rgb"]}, '
+                f'depth={self.ros.topics["camera_depth"]}, '
+                f'CameraInfo={self.ros.topics["camera_info"]}).')
             return
         stamp = Time.from_msg(self.rgb.header.stamp)
         key = stamp.nanoseconds
@@ -339,12 +347,28 @@ class PerceptionNode(Node):
         if (self.get_clock().now()-stamp).nanoseconds/1e9 > self.get_parameter('observation_max_age').value:
             self.warn('Camera frames are stale; check Gazebo real-time factor and use_sim_time.')
             return
+        target_frame = self.ros.frames['odom']
+        camera_frame = self.get_parameter('depth_frame').value
         try:
-            tf = self.tf.lookup_transform(self.ros.frames['odom'], self.get_parameter('depth_frame').value, depth_stamp)
-            self.camera_to_odom = transform_matrix(tf.transform)
+            tf = self.tf.lookup_transform(target_frame, camera_frame, depth_stamp)
         except TransformException as error:
-            self.warn(f'Waiting for camera -> {self.ros.frames["odom"]} TF: {error}')
-            return
+            # Sensor images can be stamped a few milliseconds after the most
+            # recent /tf sample. Use the latest transform only when it is very
+            # close in time; otherwise keep waiting for correctly aligned TF.
+            try:
+                latest = self.tf.lookup_transform(target_frame, camera_frame, Time())
+            except TransformException:
+                self.warn(f'Waiting for {camera_frame} -> {target_frame} TF: {error}')
+                return
+            lag = (depth_stamp-Time.from_msg(latest.header.stamp)).nanoseconds/1e9
+            tolerance = self.get_parameter('tf_latest_fallback_tolerance').value
+            if not 0.0 <= lag <= tolerance:
+                self.warn(f'Waiting for {camera_frame} -> {target_frame} TF at image time; '
+                          f'latest transform differs by {lag*1000:.1f} ms: {error}')
+                return
+            tf = latest
+            self.warn(f'Image is {lag*1000:.1f} ms ahead of TF; using the latest transform.')
+        self.camera_to_odom = transform_matrix(tf.transform)
         self.image = self.bridge.imgmsg_to_cv2(self.rgb, 'bgr8')
         raw = self.bridge.imgmsg_to_cv2(self.depth, 'passthrough')
         self.depth_image = raw.astype(np.float32) / (1000.0 if self.depth.encoding == '16UC1' else 1.0)

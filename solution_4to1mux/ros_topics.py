@@ -9,7 +9,7 @@ sections 2-3. Optional interfaces unavailable in a profile are set to None.
 from dataclasses import dataclass
 
 
-DEFAULT_PROFILE = 'real'
+DEFAULT_PROFILE = 'simulation'
 
 TOPICS = {
     # Robot input and control (message types stay defined in the nodes).
@@ -21,11 +21,13 @@ TOPICS = {
     'scan_rear': '/scan_rear_raw',
     'scan_merged': None,  # Live robot: filtered 360-degree sensor_msgs/LaserScan.
     'base_imu': '/base_imu',  # Not available on the live robot.
-    'camera_rgb': '/head_front_camera/color/image_raw',
+    'camera_rgb': '/head_front_camera/head_front_camera/color/image_raw',
     # camera_depth is the image consumed by perception. On the live robot it
     # must be aligned to colour to use camera_info's colour intrinsics.
-    'camera_depth': '/head_front_camera/depth/image_rect_raw',
-    'camera_info': '/head_front_camera/color/camera_info',
+    'camera_depth': '/head_front_camera/head_front_camera/depth/image_rect_raw',
+    # The simulator bridge publishes CameraInfo under the same doubled
+    # namespace as its colour image topic.
+    'camera_info': '/head_front_camera/head_front_camera/color/camera_info',
     'camera_depth_raw': '/head_front_camera/depth/image_rect_raw',
     'camera_depth_aligned': None,
     'camera_points': '/head_front_camera/depth/color/points',
@@ -37,7 +39,7 @@ TOPICS = {
     'right_arm_command': '/arm_right_controller/joint_trajectory',
     'torso_command': '/torso_controller/joint_trajectory',
     'left_gripper_command': '/gripper_left_controller/joint_trajectory',
-    'right_gripper_command': '/erc/gripper_right_controller/joint_trajectory',
+    'right_gripper_command': '/gripper_right_controller/joint_trajectory',
     'controller_rejections': None,  # Live checking-layer diagnostics: std_msgs/String.
     # These currently require ros_gz_interfaces/msg/Contacts messages.
     'contacts': '/contacts',
@@ -83,8 +85,8 @@ TOPICS = {
 
 ACTIONS = {
     'left_arm_trajectory': '/arm_left_controller/follow_joint_trajectory',
-    'right_arm_trajectory': '/erc/arm_right_controller/follow_joint_trajectory',
-    'torso_trajectory': '/erc/torso_controller/follow_joint_trajectory',
+    'right_arm_trajectory': '/arm_right_controller/follow_joint_trajectory',
+    'torso_trajectory': '/torso_controller/follow_joint_trajectory',
     'head_trajectory': '/head_controller/follow_joint_trajectory',
     # The existing simulation uses topic-only gripper clamps.
     'left_gripper_trajectory': None,

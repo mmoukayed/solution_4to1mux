@@ -108,6 +108,19 @@ def scan_points(ranges, angle_min, angle_increment, range_min, range_max, transf
     return (transform @ points)[:2].T
 
 
+def _joint_origin(joint):
+    """Return a URDF joint's parent-to-child origin transform."""
+    result = np.eye(4)
+    origin = joint.find('origin')
+    if origin is not None:
+        result[:3, 3] = np.fromstring(origin.get('xyz', '0 0 0'), sep=' ')
+        roll, pitch, yaw_angle = np.fromstring(origin.get('rpy', '0 0 0'), sep=' ')
+        result[:3, :3] = (rotation([0, 0, 1], yaw_angle)
+                          @ rotation([0, 1, 0], pitch)
+                          @ rotation([1, 0, 0], roll))
+    return result
+
+
 class ArmKinematics:
     """Position/orientation IK from the actual URDF, with hard joint limits.
 
@@ -118,6 +131,9 @@ class ArmKinematics:
     def __init__(self, urdf, base=FRAMES['base'], tip=FRAMES['arm_tip']):
         root = ET.fromstring(urdf)
         by_child = {j.find('child').get('link'): j for j in root.findall('joint')}
+        self.by_child = by_child
+        self.base_link = base
+        self.tip_link = tip
         chain, current = [], tip
         while current != base:
             if current not in by_child:
@@ -127,12 +143,7 @@ class ArmKinematics:
             current = joint.find('parent').get('link')
         self.chain, self.names, self.lower, self.upper, self.velocity = [], [], [], [], []
         for j in reversed(chain):
-            origin = np.eye(4)
-            o = j.find('origin')
-            if o is not None:
-                origin[:3, 3] = np.fromstring(o.get('xyz', '0 0 0'), sep=' ')
-                r, p, y = np.fromstring(o.get('rpy', '0 0 0'), sep=' ')
-                origin[:3, :3] = rotation([0, 0, 1], y) @ rotation([0, 1, 0], p) @ rotation([1, 0, 0], r)
+            origin = _joint_origin(j)
             kind = j.get('type')
             axis = np.fromstring(j.find('axis').get('xyz'), sep=' ') if j.find('axis') is not None else np.array([1., 0., 0.])
             index = None
@@ -150,6 +161,21 @@ class ArmKinematics:
                 self.velocity.append(float(limit.get('velocity')))
             self.chain.append((origin, kind, axis, index))
         self.lower, self.upper, self.velocity = map(np.array, (self.lower, self.upper, self.velocity))
+
+    def fixed_transform(self, parent, child):
+        """Get a fixed URDF transform between links outside the solved chain."""
+        transforms = []
+        current = child
+        while current != parent:
+            joint = self.by_child.get(current)
+            if joint is None or joint.get('type') != 'fixed':
+                raise ValueError(f'No fixed URDF transform from {parent} to {child}')
+            transforms.append(_joint_origin(joint))
+            current = joint.find('parent').get('link')
+        result = np.eye(4)
+        for transform in reversed(transforms):
+            result = result @ transform
+        return result
 
     def fk(self, joints):
         result = np.eye(4)

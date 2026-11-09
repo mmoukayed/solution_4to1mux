@@ -27,6 +27,7 @@ from .ros_topics import configure_ros
 from .geometry import ArmKinematics, pose_xyz, rotation, transform_matrix, yaw
 
 GRIPPER_JOINT = 'gripper_right_finger_joint'
+GRIPPER_GRASP_FRAME = 'gripper_right_grasping_link'
 ARM_JOINTS = [f'arm_right_{i}_joint' for i in range(1, 8)]
 # User-calibrated high carry pose.  This is arm-only: torso_lift_joint remains
 # at its measured current value.
@@ -42,8 +43,12 @@ class ManipulationNode(Node):
         super().__init__('manipulation_node')
         self.ros = configure_ros(self)
         topics = self.ros.topics
+        simulation = self.ros.profile == 'simulation'
         for name, value in {
-            'gripper_open': 0.0, 'gripper_closed': 0.79,
+            # The sim clamp's joint convention is opposite to the live robot:
+            # sim 0.0 is closed and 0.069 is fully open; live 0.0 is open.
+            'gripper_open': 0.066 if simulation else 0.0,
+            'gripper_closed': 0.0 if simulation else 0.79,
             # Insert past the measured spine rather than asking the base to
             # violate its shelf keepout. Keep the lateral target centred on
             # perception; the former 1.5 cm right bias led to left-only contact.
@@ -70,12 +75,19 @@ class ManipulationNode(Node):
             'bin_inset': 0.22, 'bin_release_height': 0.21,
         }.items():
             self.declare_parameter(name, value)
+        gripper_limit = 0.069 if simulation else 0.803
         for key in ('gripper_open', 'gripper_closed'):
-            if not 0 <= self.p(key) <= 0.803:
-                raise ValueError(f'{key} must lie in the ERC clamp interval [0, 0.803]')
+            if not 0 <= self.p(key) <= gripper_limit:
+                raise ValueError(
+                    f'{key} must lie in the {self.ros.profile} gripper interval '
+                    f'[0, {gripper_limit:.3f}]')
+        if self.p('gripper_open') == self.p('gripper_closed'):
+            raise ValueError('gripper_open and gripper_closed must be different positions')
         self.tf = Buffer()
         self.listener = TransformListener(self.tf, self)
         self.model = None
+        self.model_error = ''
+        self.base_to_grasp = None
         self.joints = {}
         self.joint_stamp = None
         self.targets = {}
@@ -127,6 +139,7 @@ class ManipulationNode(Node):
         self.active = None
         self.phase = None
         self.phases = []
+        self.deferred_plan = None
         self.handles = []
         self.pending = 0
         self.token = 0
@@ -136,7 +149,9 @@ class ManipulationNode(Node):
         # Motion deadlines still use the simulator clock in tick().
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(0.1, self.tick, clock=self.wall_clock)
-        self.get_logger().info('Manipulation BUILD 5.14: shared ROS topics + row-aware top-shelf grasp.')
+        self.get_logger().info(
+            f'Manipulation BUILD 5.19: {self.ros.profile} gripper positions '
+            f'open={self.p("gripper_open"):.3f}, closed={self.p("gripper_closed"):.3f}.')
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -153,7 +168,18 @@ class ManipulationNode(Node):
                 self.model = ArmKinematics(msg.data, base=self.ros.frames['base'],
                                            tip=self.ros.frames['arm_tip'])
                 self.get_logger().info(f'Loaded right-arm/torso kinematics and limits from {self.ros.topics["robot_description"]}.')
+                try:
+                    self.base_to_grasp = self.model.fixed_transform(
+                        self.ros.frames['arm_tip'], GRIPPER_GRASP_FRAME)
+                    self.get_logger().info(
+                        f'Loaded fixed grasp-frame transform from '
+                        f'{self.ros.frames["arm_tip"]} to {GRIPPER_GRASP_FRAME}.')
+                except ValueError as error:
+                    self.get_logger().warn(
+                        f'{error}; manipulation requests will remain blocked until the URDF '
+                        'provides the grasp-frame transform.')
             except (ValueError, AttributeError) as error:
+                self.model_error = str(error)
                 self.get_logger().error(f'Cannot load arm model: {error}')
 
     def on_joints(self, msg):
@@ -189,17 +215,41 @@ class ManipulationNode(Node):
             if self.holding_book in names and any('collection_bin' in n for n in names):
                 self.bin_contact_stamp = self.now()
 
+    def readiness_issues(self):
+        issues = []
+        if self.model is None:
+            detail = f'URDF model not loaded from {self.ros.topics["robot_description"]}'
+            if self.model_error:
+                detail += f' ({self.model_error})'
+            issues.append(detail)
+        elif self.base_to_grasp is None:
+            issues.append(
+                f'URDF has no fixed transform from {self.ros.frames["arm_tip"]} '
+                f'to {GRIPPER_GRASP_FRAME}')
+        if not self.fresh(self.joint_stamp):
+            issues.append(f'no fresh joint feedback on {self.ros.topics["joint_states"]}')
+        elif self.model is not None:
+            missing = [name for name in self.model.names+[GRIPPER_JOINT]
+                       if name not in self.joints]
+            if missing:
+                issues.append(f'{self.ros.topics["joint_states"]} is missing {missing}')
+        if not self.arm.server_is_ready():
+            issues.append(f'arm action unavailable: {self.ros.actions["right_arm_trajectory"]}')
+        if not self.torso.server_is_ready():
+            issues.append(f'torso action unavailable: {self.ros.actions["torso_trajectory"]}')
+        if self.gripper_pub.get_subscription_count() == 0:
+            issues.append(f'no subscriber on gripper topic {self.ros.topics["right_gripper_command"]}')
+        return issues
+
     def ready(self):
-        return (self.model is not None and self.fresh(self.joint_stamp)
-                and all(n in self.joints for n in self.model.names+[GRIPPER_JOINT])
-                and self.arm.server_is_ready() and self.torso.server_is_ready()
-                and self.gripper_pub.get_subscription_count() > 0)
+        return not self.readiness_issues()
 
     def request(self, sequence):
         if self.active:
             return
-        if not self.ready():
-            self.report(sequence, False, 'Missing robot description, fresh joint states, arm/torso actions or gripper topic subscriber.')
+        issues = self.readiness_issues()
+        if issues:
+            self.report(sequence, False, 'Readiness blocked: '+'; '.join(issues)+'.')
             return
         if sequence in ('place', 'prepare_place', 'finish_place', 'raise_carry') and not self.holding_book:
             self.report(sequence, False, 'Cannot place: no verified grasp.')
@@ -239,10 +289,24 @@ class ManipulationNode(Node):
         self.arm_in_shelf = False
         if sequence != 'finish_grab':
             self.retreat_target = None
-        self.phase = 'planning'
-        self.deadline = self.now()+self.p('planning_timeout')
         current = np.array([self.joints[n] for n in self.model.names])
         params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'top_book_clearance_height', 'top_book_front_standoff', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'bin_inset', 'bin_release_height')}
+        self.deferred_plan = None
+        self.phases = []
+        if sequence == 'prepare_grab' and self.book_row == 1:
+            # Raise first, before IK is attempted, so an unreachable seed can
+            # never prevent the torso from moving to the top-row reach height.
+            self.deferred_plan = (sequence, point, normal, params)
+            torso_target = current.copy()
+            torso_target[0] = self.model.upper[0]
+            if abs(torso_target[0]-current[0]) > 0.005:
+                duration = self.model.duration(current, torso_target, 1.0)
+                self.phases = [('raise_torso_for_top_book', 'torso',
+                                torso_target, duration)]
+            self.next_phase()
+            return
+        self.phase = 'planning'
+        self.deadline = self.now()+self.p('planning_timeout')
         self.plan_future = self.pool.submit(self.plan, sequence, point, normal, current, params)
         self.get_logger().info(f'{sequence}: planning for camera target in base frame {point.round(3)}')
 
@@ -318,7 +382,7 @@ class ManipulationNode(Node):
             release = point-normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
             targets = [('over_bin', release+np.array([0, 0, 0.06])), ('lower_to_bin', release)]
         errors = []
-        motions = None
+        candidates = []
         # Parallel fingers can grasp with either 0 or 180 degree wrist roll.
         # A bin release may also require the wrist sideways while lowering from
         # the calibrated upright carry pose, so try quarter turns as well.
@@ -326,23 +390,47 @@ class ManipulationNode(Node):
                  if sequence in ('place', 'prepare_place', 'finish_place')
                  else (math.pi, 0.0))
         for roll in rolls:
-            orientation = facing @ rotation([1, 0, 0], roll)
+            grasp_sequence = sequence in ('grab', 'prepare_grab', 'finish_grab')
+            grasp_orientation = facing @ rotation([1, 0, 0], roll)
+            if grasp_sequence and self.base_to_grasp is not None:
+                # `targets` are expressed at the URDF grasp frame. Convert
+                # them back to the configured arm-tip link so IK places the
+                # fingers and their approach axis at the book, not the wrist
+                # base (whose fixed grasp-frame joint is translated/rotated).
+                orientation = grasp_orientation @ self.base_to_grasp[:3, :3].T
+                offset = self.base_to_grasp[:3, 3]
+            else:
+                orientation = grasp_orientation
+                offset = None
             q = current.copy()
             if sequence == 'prepare_place':
                 q[0] = min(self.model.upper[0], params['place_torso_hover'])
+            elif sequence == 'prepare_grab' and self.book_row == 1:
+                # Top-row IK needs the torso at its upper travel limit. Solve
+                # with that value fixed; the torso is raised in its own phase
+                # before any arm waypoint begins.
+                q[0] = self.model.upper[0]
             candidate = []
             try:
                 for name, xyz in targets:
-                    fixed = {0: q[0]} if sequence == 'prepare_place' else None
-                    solved = self.model.solve(xyz, orientation, q, fixed=fixed)
+                    fixed_torso = (sequence == 'prepare_place' or
+                                   sequence == 'finish_grab' and self.book_row == 1 or
+                                   sequence == 'prepare_grab' and self.book_row == 1)
+                    fixed = {0: q[0]} if fixed_torso else None
+                    tip_xyz = xyz if offset is None else xyz-orientation @ offset
+                    solved = self.model.solve(tip_xyz, orientation, q, fixed=fixed)
                     if candidate and np.max(np.abs(solved[1:]-q[1:])) > 1.4:
                         raise ValueError(f'{name}: IK branch jump; adjust docking pose before retrying.')
                     candidate.append((name, 'motion', solved, self.model.duration(q, solved, 1.0)))
                     q = solved
-                motions = candidate
-                break
+                # Both parallel-jaw rolls can grasp the same book. Keep the
+                # wrist nearer its current orientation by selecting the valid
+                # complete path with the least estimated joint travel time,
+                # rather than accepting the first roll that happens to solve.
+                candidates.append((sum(step[3] for step in candidate), candidate))
             except ValueError as error:
                 errors.append(str(error))
+        motions = min(candidates, key=lambda item: item[0])[1] if candidates else None
         if motions is None:
             raise ValueError('; '.join(errors))
         if sequence == 'grab':
@@ -401,6 +489,22 @@ class ManipulationNode(Node):
         self.phase_started = self.now()
         self.handles = []
         if not self.phases:
+            if self.deferred_plan is not None:
+                if not self.fresh(self.joint_stamp):
+                    self.abort('Joint feedback went stale after the top-row torso lift; refusing arm motion.')
+                    return
+                sequence, point, normal, params = self.deferred_plan
+                self.deferred_plan = None
+                current = np.array([self.joints[n] for n in self.model.names])
+                self.phase = 'planning'
+                self.phase_name = 'planning_after_torso_lift'
+                self.deadline = self.now()+self.p('planning_timeout')
+                self.plan_future = self.pool.submit(
+                    self.plan, sequence, point, normal, current, params)
+                self.get_logger().info(
+                    f'{sequence}: torso lift complete; planning the top-row pregrasp '
+                    f'from joint feedback {current[0]:.3f} m.')
+                return
             sequence = self.active
             self.active = self.phase = None
             self.report(sequence, True, 'Confirmed sequence complete.')
@@ -418,7 +522,7 @@ class ManipulationNode(Node):
             elif self.phase_name == 'verify_book_held':
                 self.arm_in_shelf = False
         self.get_logger().info(f'{self.active}: {self.phase_name}')
-        if self.phase == 'motion':
+        if self.phase in ('motion', 'torso'):
             if not self.fresh(self.joint_stamp):
                 self.abort('Joint feedback went stale before motion.')
                 return
@@ -427,9 +531,13 @@ class ManipulationNode(Node):
             start = np.array([self.joints[n] for n in self.model.names])
             duration = max(duration, self.model.duration(start, q))
             self.deadline = self.now()+duration+self.p('motion_timeout_margin')
-            self.pending = 2
+            clients = (((self.torso, ['torso_lift_joint'], q[:1]),)
+                       if self.phase == 'torso' else
+                       ((self.torso, ['torso_lift_joint'], q[:1]),
+                        (self.arm, ARM_JOINTS, q[1:])))
+            self.pending = len(clients)
             token = self.token
-            for client, names, values in ((self.torso, ['torso_lift_joint'], q[:1]), (self.arm, ARM_JOINTS, q[1:])):
+            for client, names, values in clients:
                 goal = FollowJointTrajectory.Goal()
                 goal.trajectory = self.trajectory(names, values, duration)
                 future = client.send_goal_async(goal)
@@ -472,6 +580,20 @@ class ManipulationNode(Node):
                 return
             self.pending -= 1
             if self.pending == 0:
+                if self.phase == 'torso':
+                    actual = self.joints.get('torso_lift_joint')
+                    target = float(self.phase_target[0])
+                    if (not self.fresh(self.joint_stamp) or actual is None or
+                            abs(actual-target) > 0.02):
+                        # The action result may arrive just before the next
+                        # joint-state sample. Wait briefly for measured lift;
+                        # never start the arm using only the planned height.
+                        self.phase = 'torso_feedback'
+                        self.phase_name = 'confirm_torso_lift'
+                        self.deadline = self.now()+3.0
+                        return
+                    self.get_logger().info(
+                        f'Top-row torso lift confirmed at {actual:.3f} m; starting arm approach.')
                 self.next_phase()
         except Exception as error:
             self.abort(f'Action result failed: {error}')
@@ -512,6 +634,14 @@ class ManipulationNode(Node):
                     self.next_phase()
                 except Exception as error:
                     self.abort(f'No valid grasp/placement plan: {error}')
+        elif self.phase == 'torso_feedback':
+            actual = self.joints.get('torso_lift_joint')
+            target = float(self.phase_target[0])
+            if (self.fresh(self.joint_stamp) and actual is not None and
+                    abs(actual-target) <= 0.02):
+                self.get_logger().info(
+                    f'Top-row torso lift confirmed at {actual:.3f} m; starting arm approach.')
+                self.next_phase()
         elif self.phase == 'open':
             if self.fresh(self.joint_stamp) and abs(self.joints.get(GRIPPER_JOINT, -1)-self.p('gripper_open')) < 0.006 and self.now()-self.phase_started > 0.8:
                 self.next_phase()
@@ -547,6 +677,7 @@ class ManipulationNode(Node):
         if self.plan_future:
             self.plan_future.cancel()
         self.phases = []
+        self.deferred_plan = None
         self.active = self.phase = None
         self.retract_if_in_shelf()
         if sequence:

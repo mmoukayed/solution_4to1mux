@@ -46,11 +46,12 @@ class RosTopicProfiles(unittest.TestCase):
     def test_simulation_keeps_existing_camera_and_controller_endpoints(self):
         config = get_ros_config('simulation')
         self.assertTrue(config.use_sim_time)
-        self.assertEqual(config.topics['camera_depth'], '/head_front_camera/depth/image_rect_raw')
-        self.assertEqual(config.topics['camera_info'], '/head_front_camera/color/camera_info')
+        self.assertEqual(config.topics['camera_depth'], '/head_front_camera/head_front_camera/depth/image_rect_raw')
+        self.assertEqual(config.topics['camera_info'], '/head_front_camera/head_front_camera/color/camera_info')
         self.assertEqual(config.topics['right_arm_command'], '/arm_right_controller/joint_trajectory')
-        self.assertEqual(config.topics['right_gripper_command'], '/erc/gripper_right_controller/joint_trajectory')
-        self.assertEqual(config.actions['right_arm_trajectory'], '/erc/arm_right_controller/follow_joint_trajectory')
+        self.assertEqual(config.topics['right_gripper_command'], '/gripper_right_controller/joint_trajectory')
+        self.assertEqual(config.actions['right_arm_trajectory'], '/arm_right_controller/follow_joint_trajectory')
+        self.assertEqual(config.actions['torso_trajectory'], '/torso_controller/follow_joint_trajectory')
         self.assertEqual(config.frames['arm_tip'], 'gripper_right_base_link')
 
     def test_real_profile_inherits_inter_node_topics(self):
