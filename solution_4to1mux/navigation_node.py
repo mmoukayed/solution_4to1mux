@@ -21,9 +21,17 @@ from .geometry import (body_velocity, forward_command, pose_xyz, row_for_height,
                        scan_points, transform_matrix, wrap, yaw)
 
 
+# The live robot's resting tuck (measured on the robot), inside the base footprint.
+# The simulators start with both arms held out to the sides instead.
+TUCK_POSES = {
+    'left': (0.3595, -1.8291, 0.4695, -2.3492, 0.0, -1.2008, 0.0),
+    'right': (-0.3595, -1.8291, -0.4695, -2.3492, 0.0, -1.2008, 0.0),
+}
 DOCK_STOW_POSES = {
     # joint 2 stops at 1.134 rad on the live arm and /erc wants 0.05 of margin (was 1.25)
-    'left': (0.0, 1.07, 0.0, -1.0, -0.4, 0.0, 0.0),
+    # the left arm is never used: it stays in the resting tuck. Stowed out to the side it
+    # swept the bin when the base turned beside the bin table.
+    'left': TUCK_POSES['left'],
     'right': (0.0, 1.07, 0.0, -1.0, 0.4, 0.0, 0.0),
 }
 
@@ -136,6 +144,9 @@ class NavigationNode(Node):
         self.arm_joints = {}
         self.arm_joint_stamp = None
         self.arm_stow_last = None
+        self.arms_tucked = False
+        self.arm_tuck_last = None
+        self.arm_tuck_secs = 2.0
         self.last_gate = 'clear'
         self.blocked_since = None
         self.active_shelf_keepout_distance = self.p('shelf_keepout_distance')
@@ -548,6 +559,40 @@ class NavigationNode(Node):
             self.look(tilt=tilts[index])
         self.warn('book', f'Book reacquisition: {self.book_diagnostics}')
 
+    def tuck_arms_at_start(self):
+        """Both arms into the resting tuck, slowly; True once there (or settled)."""
+        names = {side: [f'arm_{side}_{i}_joint' for i in range(1, 8)] for side in ('left', 'right')}
+        if not self.fresh(self.arm_joint_stamp) or any(
+                name not in self.arm_joints for side in names.values() for name in side):
+            self.warn('arm_feedback', 'Waiting for fresh left/right arm joint feedback before tucking.')
+            return False
+        if all(abs(self.arm_joints[name]-target) < 0.08
+               for side, joint_names in names.items()
+               for name, target in zip(joint_names, TUCK_POSES[side])):
+            self.get_logger().info('Both arms in the resting tuck.')
+            return True
+        if self.arm_tuck_last is not None:
+            if self.now()-self.arm_tuck_last < self.arm_tuck_secs+1.0:
+                return False
+            self.warn('arm_tuck_settle', 'Arm tuck settled without exact joint feedback; continuing.')
+            return True
+        self.arm_tuck_secs = 2.0
+        for side, publisher in (('left', self.left_arm_pub), ('right', self.right_arm_pub)):
+            move = max(abs(self.arm_joints[n]-q) for n, q in zip(names[side], TUCK_POSES[side]))
+            secs = max(2.0, move/0.25)
+            self.arm_tuck_secs = max(self.arm_tuck_secs, secs)
+            msg = JointTrajectory()
+            msg.joint_names = names[side]
+            point = JointTrajectoryPoint()
+            point.positions = list(TUCK_POSES[side])
+            point.time_from_start.sec = int(secs)
+            point.time_from_start.nanosec = int((secs % 1)*1e9)
+            msg.points = [point]
+            publisher.publish(msg)
+        self.arm_tuck_last = self.now()
+        self.get_logger().info(f'Tucking both arms before moving the base ({self.arm_tuck_secs:.1f} s).')
+        return False
+
     def stow_arms_for_dock(self):
         """Fold both parked arms before the base enters the shelf keepout.
 
@@ -556,10 +601,8 @@ class NavigationNode(Node):
         of command used for live calibration, and docking starts only after
         feedback confirms the complete pose.
         """
-        # Only the working (right) arm: the left arm stays in its start tuck, inside the
-        # base footprint. Stowed out to the side it swept the bin when the base turned
-        # beside the bin table.
         names = {
+            'left': [f'arm_left_{i}_joint' for i in range(1, 8)],
             'right': [f'arm_right_{i}_joint' for i in range(1, 8)],
         }
         if not self.fresh(self.arm_joint_stamp) or any(
@@ -581,7 +624,7 @@ class NavigationNode(Node):
             self.warn('arm_stow_settle',
                       'Arm stow trajectory settled without exact joint feedback; continuing with the calibrated parked pose.')
             return True
-        for side, publisher in (('right', self.right_arm_pub),):
+        for side, publisher in (('left', self.left_arm_pub), ('right', self.right_arm_pub)):
             msg = JointTrajectory()
             msg.joint_names = names[side]
             point = JointTrajectoryPoint()
@@ -594,7 +637,7 @@ class NavigationNode(Node):
             msg.points = [point]
             publisher.publish(msg)
         self.arm_stow_last = self.now()
-        self.get_logger().info('Stowing the right arm to its calibrated full pose before ALIGN_BOOK.')
+        self.get_logger().info('Tucking the left arm and stowing the right before ALIGN_BOOK.')
         return False
 
     def recover_book_view(self):
@@ -865,6 +908,13 @@ class NavigationNode(Node):
             State.WAIT_FOR_PLACE_PREP, State.APPROACH_BIN_FOR_PLACE, State.WAIT_FOR_PLACE)))
         if self.state in (State.DONE, State.FAILED):
             self.stop()
+            return
+        if not self.arms_tucked:
+            # Before the base moves at all: arms held out sweep whatever is beside the start
+            # (the bin table) on the first search turn.
+            self.stop()
+            self.last_gate = 'tucking_arms'
+            self.arms_tucked = self.tuck_arms_at_start()
             return
         if self.state == State.FIND_SHELF:
             self.look_for_shelf(elapsed)
