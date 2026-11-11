@@ -547,8 +547,10 @@ class NavigationNode(Node):
         of command used for live calibration, and docking starts only after
         feedback confirms the complete pose.
         """
+        # Only the working (right) arm: the left arm stays in its start tuck, inside the
+        # base footprint. Stowed out to the side it swept the bin when the base turned
+        # beside the bin table.
         names = {
-            'left': [f'arm_left_{i}_joint' for i in range(1, 8)],
             'right': [f'arm_right_{i}_joint' for i in range(1, 8)],
         }
         if not self.fresh(self.arm_joint_stamp) or any(
@@ -570,7 +572,7 @@ class NavigationNode(Node):
             self.warn('arm_stow_settle',
                       'Arm stow trajectory settled without exact joint feedback; continuing with the calibrated parked pose.')
             return True
-        for side, publisher in (('left', self.left_arm_pub), ('right', self.right_arm_pub)):
+        for side, publisher in (('right', self.right_arm_pub),):
             msg = JointTrajectory()
             msg.joint_names = names[side]
             point = JointTrajectoryPoint()
@@ -583,7 +585,7 @@ class NavigationNode(Node):
             msg.points = [point]
             publisher.publish(msg)
         self.arm_stow_last = self.now()
-        self.get_logger().info('Stowing both arms to calibrated full poses before ALIGN_BOOK.')
+        self.get_logger().info('Stowing the right arm to its calibrated full pose before ALIGN_BOOK.')
         return False
 
     def recover_book_view(self):
