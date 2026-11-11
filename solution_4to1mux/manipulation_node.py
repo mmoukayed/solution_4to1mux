@@ -175,9 +175,12 @@ class ManipulationNode(Node):
                         f'Loaded fixed grasp-frame transform from '
                         f'{self.ros.frames["arm_tip"]} to {GRIPPER_GRASP_FRAME}.')
                 except ValueError as error:
-                    self.get_logger().warn(
-                        f'{error}; manipulation requests will remain blocked until the URDF '
-                        'provides the grasp-frame transform.')
+                    # The live TIAGo Pro URDF has no grasping link: use the simulator's
+                    # fixed gripper_right_grasping_frame_joint (xyz 0 0 0.157157, rpy 0 -1.57 0).
+                    c, s = np.cos(-1.57), np.sin(-1.57)
+                    self.base_to_grasp = np.array([[c, 0., s, 0.], [0., 1., 0., 0.],
+                                                   [-s, 0., c, 0.157157], [0., 0., 0., 1.]])
+                    self.get_logger().warn(f'{error}; using the simulator grasp-frame offset.')
             except (ValueError, AttributeError) as error:
                 self.model_error = str(error)
                 self.get_logger().error(f'Cannot load arm model: {error}')
