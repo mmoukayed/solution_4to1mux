@@ -1,0 +1,109 @@
+/**:
+  ros__parameters:
+    mujoco_plugins:
+      base_velocity_plugin:
+        type: "mujoco_ros2_control_plugins/BaseVelocityPlugin"
+        body: "base_footprint"
+        # The base is moved by its own wheels, not by a velocity override:
+        # mecanum_drive_controller turns /cmd_vel into wheel velocities, and this
+        # plugin turns the wheels' measured rotation back into a force-limited push
+        # on the floating base. The plugin reads no command in this mode and creates
+        # no subscription, so cmd_vel_topic does not apply; hold_pose_on_idle is
+        # unnecessary too, because at rest the servo actively holds the base against
+        # arm reaction torques instead of freezing its pose.
+        drive_mode: "traction"
+        wheel_joints: ["wheel_front_left_joint", "wheel_front_right_joint",
+                       "wheel_rear_left_joint", "wheel_rear_right_joint"]
+        wheel_radius: 0.0762
+        # lx + ly from the measured hub positions (+-0.244, +-0.22317). This is the
+        # same quantity mecanum_drive_controller calls
+        # kinematics.sum_of_robot_center_projection_on_X_Y_axis, and it must match
+        # the value in controller_params.yaml or the two kinematics disagree.
+        wheel_lever: 0.46717
+        # Measured over a 10 s cycle of both arms swinging: at 0.05 s the idle
+        # base wandered 5 degrees, at 0.02 s it wanders 0.2 degrees, and shorter
+        # than that the contact solver starts to ring. max_hold_offset bounds the
+        # position the servo will try to recover, so it holds station without
+        # storing up a lurch when an obstacle clears.
+        settling_time: 0.02
+        max_hold_offset: 0.02
+        # What four wheels at PAL's own 6 Nm effort limit could push: 4 * 6.0 /
+        # 0.0762 = 315 N, and 315 * 0.46717 = 147 Nm about z. Driving into the shelf
+        # saturates these and stalls the base instead of sailing through it.
+        max_force: 315.0
+        max_torque: 147.0
+      free_joint_state_publisher:
+        type: "mujoco_ros2_control_plugins/FreeJointStatePublisherPlugin"
+      # Contact reporting, on the topics and message type the Gazebo build
+      # published. One instance per watched subtree; the rates are the ones
+      # upstream's sensors ran at.
+      contact_sensor:
+        type: "erc_bringup/ContactSensorPlugin"
+        body: "base_footprint"
+        topic: "/contacts"
+        publish_rate: 30.0
+      # Unlike every other body_names/body parameter here, a body the scene
+      # does not contain is survivable: the sensor watches nothing and reports
+      # nothing, so a custom scene:= without a bin still launches.
+      bin_contact_sensor:
+        type: "erc_bringup/ContactSensorPlugin"
+        body: "erc_collection_bin"
+        topic: "/bin_contacts"
+        publish_rate: 10.0
+      # The key must be spelled exactly "mujoco_3d_lidar_plugin": like the
+      # camera plugin, it reads its parameters from that hard-coded prefix,
+      # not from the key it was loaded under.
+      mujoco_3d_lidar_plugin:
+        type: "mujoco_ros2_control_plugins/Mujoco3dLidarPlugin"
+        scan_front_raw:
+          frame_name: "base_front_laser_link"
+          topic: "/scan_front_raw"
+        scan_rear_raw:
+          frame_name: "base_rear_laser_link"
+          topic: "/scan_rear_raw"
+      mujoco_camera_plugin:
+        # Without a type the plugin is skipped and the cameras fall back to
+        # the deprecated auto-registration path. The key must be spelled
+        # exactly "mujoco_camera_plugin": CameraPlugin reads its parameters
+        # from that hard-coded prefix, not from the plugin key it was
+        # loaded under.
+        type: "mujoco_ros2_control_plugins/CameraPlugin"
+        camera_publish_rate: 30.0
+        head_front_camera:
+          frame_name: "head_front_camera_color_optical_frame"
+          info_topic: "/head_front_camera/head_front_camera/color/camera_info"
+          image_topic: "/head_front_camera/head_front_camera/color/image_raw"
+          # This camera's own depth is not the robot's: the D435's depth is a
+          # camera of its own below (generate_mujoco_urdf.py), so this one's
+          # goes where nothing reads it (unread topics are not published).
+          depth_topic: "/head_front_camera/head_front_camera/color/depth_unused"
+        head_front_camera_depth:
+          frame_name: "head_front_camera_depth_optical_frame"
+          info_topic: "/head_front_camera/head_front_camera/depth/camera_info"
+          image_topic: "/head_front_camera/head_front_camera/depth/colour_unused"
+          depth_topic: "/head_front_camera/head_front_camera/depth/image_rect_raw"
+          # The D435 has a minimum range: the model's near plane is 1 cm
+          # (generate_mujoco_urdf.py), and depth nearer than the competition's
+          # own depth clip (Gazebo's <clip><near>0.2</near>) reads 0, no return.
+          min_depth: 0.2
+          # The depth the robot's own D435 gives, measured on the real robot
+          # (slot 1, 2026-10-31): blurred over the stereo window (a board's 20 mm
+          # front leaves no step), noise 0.010 z^2 in patches, 10-23 % no
+          # return in blobs. See depth_model.hpp. ERC_DEPTH=exact for the
+          # renderer's exact depth (and the colour's optics), ERC_DEPTH_K to set
+          # its k (sigma = k z^2).
+          depth_model: "d435"
+        spectator:
+          frame_name: "spectator_frame"
+          info_topic: "/spectator/camera_info"
+          image_topic: "/spectator/color"
+          depth_topic: "/spectator/depth"
+    # No body_names filter: publish every free-joint body, which in the arena
+    # is all 20 books plus the collection bin. Naming a body that the scene
+    # does not contain fails plugin init and takes the whole hardware
+    # interface down with it.
+    # Not an indentation slip: FreeJointStatePublisherPlugin declares these
+    # without a plugin prefix, unlike BaseVelocityPlugin. Nesting them under
+    # free_joint_state_publisher above would silently do nothing.
+    topic: "/model_states"
+    publish_rate: 25.0

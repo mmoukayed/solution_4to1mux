@@ -1,0 +1,5 @@
+bool paused
+---
+bool success
+string message
+builtin_interfaces/Time time    # where the simulator stands after the call, as /clock carries it

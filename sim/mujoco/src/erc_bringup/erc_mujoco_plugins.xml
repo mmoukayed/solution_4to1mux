@@ -1,0 +1,12 @@
+<library path="erc_mujoco_plugins">
+  <class name="erc_bringup/ContactSensorPlugin"
+         type="erc_bringup::ContactSensorPlugin"
+         base_class_type="mujoco_ros2_control_plugins::MuJoCoROS2ControlPluginBase">
+    <description>
+      Publishes every MuJoCo contact on one body subtree as
+      ros_gz_interfaces/msg/Contacts, matching the topic and message type the
+      Gazebo build of this simulator exposed. One instance per subtree: the
+      robot on /contacts, the collection bin on /bin_contacts.
+    </description>
+  </class>
+</library>

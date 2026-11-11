@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>erc_bringup</name>
+  <version>1.0.0</version>
+  <description>ERC 2026 — competition launch files and controller configs</description>
+  <maintainer email="erc@dubaifuturelabs.ae">ERC Committee</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>tiago_pro_description</depend>
+  <depend>erc_description</depend>
+  <depend>robot_state_publisher</depend>
+  <depend>controller_manager</depend>
+
+  <!-- Contact sensor plugin -->
+  <depend>geometry_msgs</depend>
+  <depend>pluginlib</depend>
+  <depend>realtime_tools</depend>
+  <depend>ros_gz_interfaces</depend>
+  <depend>mujoco_ros2_control_plugins</depend>
+
+  <!-- Simulation -->
+  <exec_depend>mujoco_ros2_control</exec_depend>
+  <!-- provides the mujoco.plugin.lidar engine plugin the model requires -->
+  <exec_depend>mujoco_3d_lidar</exec_depend>
+  <exec_depend>omni_base_description</exec_depend>
+  <exec_depend>joint_trajectory_controller</exec_depend>
+  <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>topic_tools</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>trajectory_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>imu_sensor_broadcaster</exec_depend>
+  <exec_depend>mecanum_drive_controller</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>sensors</exec_depend>
+  <exec_depend>xacro</exec_depend>
+
+  <export><build_type>ament_cmake</build_type></export>
+</package>

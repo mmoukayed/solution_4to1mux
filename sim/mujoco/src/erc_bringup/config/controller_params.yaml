@@ -1,0 +1,79 @@
+arm_left_controller:
+  ros__parameters:
+    joints:
+      - arm_left_1_joint
+      - arm_left_2_joint
+      - arm_left_3_joint
+      - arm_left_4_joint
+      - arm_left_5_joint
+      - arm_left_6_joint
+      - arm_left_7_joint
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+
+arm_right_controller:
+  ros__parameters:
+    joints:
+      - arm_right_1_joint
+      - arm_right_2_joint
+      - arm_right_3_joint
+      - arm_right_4_joint
+      - arm_right_5_joint
+      - arm_right_6_joint
+      - arm_right_7_joint
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+
+head_controller:
+  ros__parameters:
+    joints: [head_1_joint, head_2_joint]
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+
+torso_controller:
+  ros__parameters:
+    joints: [torso_lift_joint]
+    command_interfaces: [position]
+    state_interfaces: [position]
+
+gripper_left_controller_raw:
+  ros__parameters:
+    joints: [gripper_left_finger_joint]
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+
+gripper_right_controller_raw:
+  ros__parameters:
+    joints: [gripper_right_finger_joint]
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+
+imu_sensor_broadcaster:
+  ros__parameters:
+    sensor_name: base_imu_sensor
+    frame_id: base_imu_link
+
+# The omni base. /cmd_vel is relayed onto this controller's reference topic by the
+# launch file; the controller turns it into the four wheel velocities and integrates
+# the wheels' measured speed back into odometry, exactly as the competition's Gazebo
+# build does with gz-sim-mecanum-drive-system. odom_relay.py republishes that
+# odometry on /odom and owns the odom -> base_footprint transform, so the controller
+# does not broadcast TF itself.
+mecanum_drive_controller:
+  ros__parameters:
+    reference_timeout: 0.5
+    front_left_wheel_command_joint_name: wheel_front_left_joint
+    front_right_wheel_command_joint_name: wheel_front_right_joint
+    rear_left_wheel_command_joint_name: wheel_rear_left_joint
+    rear_right_wheel_command_joint_name: wheel_rear_right_joint
+    use_stamped_vel: false
+    base_frame_id: base_footprint
+    odom_frame_id: odom
+    enable_odom_tf: false
+    kinematics:
+      wheels_radius: 0.0762
+      # lx + ly for the measured hub positions (+-0.244, +-0.22317). Upstream's
+      # Gazebo plugin computes the same lever from wheel_separation 0.44715 and
+      # wheelbase 0.488; only their half-sum enters the kinematics. Must match
+      # wheel_lever in mujoco_plugins.yaml.
+      sum_of_robot_center_projection_on_X_Y_axis: 0.46717
