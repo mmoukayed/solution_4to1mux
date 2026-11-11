@@ -81,7 +81,7 @@ class NavigationNode(Node):
             'phase_timeout': 90.0, 'grab_timeout': 120.0, 'place_timeout': 90.0,
             'reading_max_age': 1.0,
             'book_standoff': 0.68, 'book_lateral_offset': -0.18,
-            'bin_standoff': 0.95, 'bin_final_advance_max': 0.65,
+            'bin_standoff': 0.85, 'bin_final_advance_max': 0.65, 'bin_min_distance': 0.80,
             'bin_turn_backoff': 0.25, 'max_bin_turn_recoveries': 2, 'carry_turn_clearance': 0.85,
             'bin_turn_backoff_timeout': 8.0,
             'place_base_advance': 0.35,
@@ -1175,7 +1175,17 @@ class NavigationNode(Node):
             elif elapsed > self.p('bin_turn_backoff_timeout'):
                 self.fail(f'Bin-turn retreat could not finish within {self.p("bin_turn_backoff_timeout"):.0f} s; gate={self.last_gate}.')
         elif self.state == State.APPROACH_BIN_FOR_PLACE:
-            if self.drive_forward_to(self.goal):
+            # The LiDAR sees only the bin table's legs: stop by the bin's own measured pose too.
+            bin_pose = self.observations.get('bin')
+            too_close = False
+            if bin_pose is not None:
+                heading = np.array([math.cos(self.pose[2]), math.sin(self.pose[2])])
+                ahead = float((pose_xyz(bin_pose)[:2]-self.pose[:2]) @ heading)
+                too_close = ahead < self.p('bin_min_distance')
+                if too_close:
+                    self.stop()
+                    self.get_logger().info(f'Bin {ahead:.2f} m ahead: closest allowed, placing from here.')
+            if too_close or self.drive_forward_to(self.goal):
                 self.result = None
                 self.transition(State.WAIT_FOR_PLACE_PREP)
                 self.prepare_place_pub.publish(Bool(data=True))
