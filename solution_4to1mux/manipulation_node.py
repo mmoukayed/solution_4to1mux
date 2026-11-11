@@ -65,7 +65,7 @@ class ManipulationNode(Node):
             # Must match navigation.place_base_advance.  The high pre-place
             # target is compensated while the base is still before the table.
             'place_base_advance': 0.35, 'place_clearance_height': 0.20,
-            'place_torso_hover': 0.35,
+            'place_torso_hover': 0.35, 'place_torso_drop': 0.0,
             'target_max_age': 2.0, 'gripper_timeout': 8.0,
             'placement_target_max_age': 30.0,
             'grip_contact_hold': 1.0,
@@ -307,7 +307,7 @@ class ManipulationNode(Node):
         if sequence != 'finish_grab':
             self.retreat_target = None
         current = np.array([self.joints[n] for n in self.model.names])
-        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'top_book_clearance_height', 'top_book_front_standoff', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'bin_inset', 'bin_release_height')}
+        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'top_book_clearance_height', 'top_book_front_standoff', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'place_torso_drop', 'bin_inset', 'bin_release_height')}
         self.deferred_plan = None
         self.phases = []
         if sequence == 'prepare_grab' and self.book_row == 1:
@@ -349,9 +349,13 @@ class ManipulationNode(Node):
         if sequence == 'finish_place':
             if self.placement_hover_target is None:
                 raise ValueError('No staged crane pose is available; run prepare_place before finish_place.')
+            if params['place_torso_drop'] < 0.01:
+                # release from the hover: lowering the torso put the upper arm on the table edge
+                return [('release_book', 'open', None, 1.0),
+                        ('verify_delivery', 'delivery', None, 3.0)]
             lowered = self.placement_hover_target.copy()
             lowered[0] = max(self.model.lower[0],
-                             lowered[0]-params['place_clearance_height'])
+                             lowered[0]-params['place_torso_drop'])
             if self.placement_hover_target[0]-lowered[0] < 0.05:
                 raise ValueError('Torso has less than 5 cm of safe downward travel from the bin hover pose.')
             duration = self.model.duration(current, lowered, 1.0)
@@ -391,7 +395,9 @@ class ManipulationNode(Node):
             # the final straight down motion after this hover pose is reached.
             release = point-normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
             hover = release+np.array([0, 0, params['place_clearance_height']])
-            targets = [('crane_hover', hover)]
+            # pass high over the bin first: straight from the carry pose the forearm
+            # swung down through the bin's rim
+            targets = [('crane_high', hover+np.array([0, 0, 0.20])), ('crane_hover', hover)]
         elif sequence == 'finish_place':
             release = point-normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
             targets = [('lower_to_bin', release)]
@@ -645,7 +651,7 @@ class ManipulationNode(Node):
                 try:
                     self.phases = self.plan_future.result()
                     if self.active == 'prepare_place':
-                        hover = next((phase[2] for phase in self.phases
+                        hover = next((phase[2] for phase in reversed(self.phases)
                                       if phase[1] == 'motion'), None)
                         if hover is None:
                             raise ValueError('The bin hover plan did not contain a joint waypoint.')
