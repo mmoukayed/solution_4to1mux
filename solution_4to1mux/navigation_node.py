@@ -81,7 +81,7 @@ class NavigationNode(Node):
             'phase_timeout': 90.0, 'grab_timeout': 120.0, 'place_timeout': 90.0,
             'reading_max_age': 1.0,
             'book_standoff': 0.68, 'book_lateral_offset': -0.18,
-            'bin_standoff': 0.85, 'bin_final_advance_max': 0.65, 'bin_min_distance': 0.80,
+            'bin_standoff': 0.95, 'bin_final_advance_max': 0.65, 'bin_min_distance': 0.90,
             'bin_turn_backoff': 0.25, 'max_bin_turn_recoveries': 2, 'carry_turn_clearance': 0.85,
             'bin_turn_backoff_timeout': 8.0,
             'place_base_advance': 0.35,
