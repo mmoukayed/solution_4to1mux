@@ -64,8 +64,8 @@ class NavigationNode(Node):
         self.ros = configure_ros(self)
         topics = self.ros.topics
         defaults = {
-            'shelf_column_number': 1, 'linear_speed': 0.85, 'strafe_speed': 0.25,
-            'rotate_speed': 0.85, 'search_rotate_speed': 0.45,
+            'shelf_column_number': 1, 'linear_speed': 0.35, 'strafe_speed': 0.12,
+            'rotate_speed': 0.4, 'search_rotate_speed': 0.3,
             'search_direction': 'right',
             # The fixed bin is normally behind the west-facing start pose;
             # begin its complete sweep counterclockwise.
@@ -86,16 +86,16 @@ class NavigationNode(Node):
             # Before folding the arms, square the mobile base to the shelf and
             # correct its lateral position at low speed while still staged.
             'shelf_alignment_standoff': 1.35,
-            'shelf_alignment_strafe_speed': 0.12,
+            'shelf_alignment_strafe_speed': 0.08,
             'shelf_alignment_timeout': 15.0,
             # Low-row arm links sweep close to the shelf even in the dock
             # stow pose. Keep the base farther back while ALIGN_BOOK runs.
             'lower_book_standoff': 0.92, 'lower_book_keepout_distance': 0.84,
             'top_book_marker_offset': 0.335, 'row_spacing': 0.33,
             'column_half_width': 0.43,
-            'arm_stow_timeout': 10.0, 'arm_stow_settle_time': 6.0,
+            'arm_stow_timeout': 20.0, 'arm_stow_settle_time': 9.0,
             'scan_half_width': 2.6, 'scan_step': 0.65, 'scan_observe_time': 1.0,
-            'docking_speed': 0.25, 'book_search_timeout': 8.0,
+            'docking_speed': 0.12, 'book_search_timeout': 8.0,
             'align_block_timeout': 3.0,
             'grasp_base_retreat': 0.25,
             # Keep a 3 cm buffer above the shelf keepout while returning to
@@ -577,9 +577,9 @@ class NavigationNode(Node):
             msg.joint_names = names[side]
             point = JointTrajectoryPoint()
             point.positions = list(DOCK_STOW_POSES[side])
-            # /erc rejects segments over 0.60 rad/s (joints 1-2) / 0.75: time it at 0.5 rad/s
+            # /erc rejects segments over 0.60 rad/s (joints 1-2) / 0.75: time it at 0.25 rad/s
             move = max(abs(self.arm_joints[n]-q) for n, q in zip(names[side], DOCK_STOW_POSES[side]))
-            secs = max(2.0, move/0.5)
+            secs = max(2.0, move/0.25)
             point.time_from_start.sec = int(secs)
             point.time_from_start.nanosec = int((secs % 1)*1e9)
             msg.points = [point]

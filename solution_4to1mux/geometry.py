@@ -240,4 +240,5 @@ class ArmKinematics:
 
     def duration(self, start, end, minimum=1.0):
         # Torso limit is only 0.035 m/s: 0.35 m cannot be commanded in 2 seconds.
-        return max(minimum, float(np.max(np.abs(np.asarray(end)-start)/(0.7*self.velocity))))
+        # 0.4 of the (checker-capped) joint speed: slow enough to stop before damage on contact
+        return max(minimum, float(np.max(np.abs(np.asarray(end)-start)/(0.4*self.velocity))))
