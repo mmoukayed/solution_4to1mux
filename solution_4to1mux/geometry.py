@@ -153,12 +153,19 @@ class ArmKinematics:
                 limit = j.find('limit')
                 safety = j.find('safety_controller')
                 lo, hi = float(limit.get('lower')), float(limit.get('upper'))
+                # the live /erc checker rejects goals within 0.05 (rad or m) of a URDF limit
+                lo, hi = lo + 0.06, hi - 0.06
                 if safety is not None:
                     lo = max(lo, float(safety.get('soft_lower_limit', lo)))
                     hi = min(hi, float(safety.get('soft_upper_limit', hi)))
                 self.lower.append(lo)
                 self.upper.append(hi)
-                self.velocity.append(float(limit.get('velocity')))
+                # ...and segments faster than its per-joint speeds
+                name = j.get('name')
+                cap = (0.60 if name.endswith(('_1_joint', '_2_joint')) and 'arm_' in name
+                       else 0.75 if 'arm_' in name else 0.035 if 'torso' in name else None)
+                velocity = float(limit.get('velocity'))
+                self.velocity.append(min(velocity, cap) if cap else velocity)
             self.chain.append((origin, kind, axis, index))
         self.lower, self.upper, self.velocity = map(np.array, (self.lower, self.upper, self.velocity))
 
