@@ -471,6 +471,8 @@ class ManipulationNode(Node):
         target = current.copy()
         target[0] = current[0]
         target[1:] = HIGH_CARRY_RIGHT_ARM
+        # the live arm's joint 2 stops at 1.134 rad (the simulator allowed 1.25): stay inside its limits
+        target = np.clip(target, self.model.lower, self.model.upper)
         if np.max(np.abs(target-current)) <= 0.005:
             return []
         return [('raise_carried_book', 'motion', target, self.model.duration(current, target, 1.0))]
