@@ -22,8 +22,9 @@ from .geometry import (body_velocity, forward_command, pose_xyz, row_for_height,
 
 
 DOCK_STOW_POSES = {
-    'left': (0.0, 1.25, 0.0, -1.0, -0.4, 0.0, 0.0),
-    'right': (0.0, 1.25, 0.0, -1.0, 0.4, 0.0, 0.0),
+    # joint 2 stops at 1.134 rad on the live arm and /erc wants 0.05 of margin (was 1.25)
+    'left': (0.0, 1.07, 0.0, -1.0, -0.4, 0.0, 0.0),
+    'right': (0.0, 1.07, 0.0, -1.0, 0.4, 0.0, 0.0),
 }
 
 
@@ -92,7 +93,7 @@ class NavigationNode(Node):
             'lower_book_standoff': 0.92, 'lower_book_keepout_distance': 0.84,
             'top_book_marker_offset': 0.335, 'row_spacing': 0.33,
             'column_half_width': 0.43,
-            'arm_stow_timeout': 10.0, 'arm_stow_settle_time': 2.5,
+            'arm_stow_timeout': 10.0, 'arm_stow_settle_time': 6.0,
             'scan_half_width': 2.6, 'scan_step': 0.65, 'scan_observe_time': 1.0,
             'docking_speed': 0.25, 'book_search_timeout': 8.0,
             'align_block_timeout': 3.0,
@@ -574,7 +575,11 @@ class NavigationNode(Node):
             msg.joint_names = names[side]
             point = JointTrajectoryPoint()
             point.positions = list(DOCK_STOW_POSES[side])
-            point.time_from_start.sec = 2
+            # /erc rejects segments over 0.60 rad/s (joints 1-2) / 0.75: time it at 0.5 rad/s
+            move = max(abs(self.arm_joints[n]-q) for n, q in zip(names[side], DOCK_STOW_POSES[side]))
+            secs = max(2.0, move/0.5)
+            point.time_from_start.sec = int(secs)
+            point.time_from_start.nanosec = int((secs % 1)*1e9)
             msg.points = [point]
             publisher.publish(msg)
         self.arm_stow_last = self.now()
