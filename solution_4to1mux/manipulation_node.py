@@ -93,6 +93,7 @@ class ManipulationNode(Node):
         self.targets = {}
         self.book_row = None
         self.contacts = {}
+        self.grip_history = []   # (time, gripper position): the grasp check where no contact topic exists
         self.holding_book = None
         self.bin_contact_stamp = None
         self.arm = ActionClient(self, FollowJointTrajectory, self.ros.actions['right_arm_trajectory'])
@@ -188,6 +189,9 @@ class ManipulationNode(Node):
     def on_joints(self, msg):
         self.joints.update(zip(msg.name, msg.position))
         self.joint_stamp = Time.from_msg(msg.header.stamp).nanoseconds/1e9
+        if GRIPPER_JOINT in msg.name:
+            self.grip_history.append((self.joint_stamp, self.joints[GRIPPER_JOINT]))
+            self.grip_history = [h for h in self.grip_history if h[0] > self.joint_stamp-0.6]
 
     def on_book_row(self, msg):
         self.book_row = int(msg.data) if 1 <= msg.data <= 4 else None
@@ -203,6 +207,16 @@ class ManipulationNode(Node):
                     self.contacts[(book, side)] = self.now()
 
     def held_book(self):
+        if self.ros.topics['contacts'] is None:
+            # The live robot has no contact topic: the fingers held still for 0.5 s, stopped
+            # clearly short of fully shut (0.79) and clearly closed from open (0.0), is a book.
+            if not self.fresh(self.joint_stamp, 0.5) or len(self.grip_history) < 5:
+                return None
+            span = self.grip_history[-1][0]-self.grip_history[0][0]
+            qs = [q for _, q in self.grip_history]
+            if span >= 0.5 and max(qs)-min(qs) < 0.004 and 0.35 <= qs[-1] <= 0.75:
+                return 'book_by_gripper_position'
+            return None
         books = {book for book, _ in self.contacts}
         for book in books:
             if all(self.fresh(self.contacts.get((book, side)), 0.5) for side in ('left', 'right')):
@@ -670,7 +684,12 @@ class ManipulationNode(Node):
                 else:
                     self.abort('Book contact lost after lift/extraction; grasp not confirmed.')
         elif self.phase == 'delivery':
-            if self.bin_contact_stamp is not None and self.bin_contact_stamp >= self.phase_started-1.5:
+            if self.ros.topics['bin_contacts'] is None:
+                # nothing on the live robot reports the book in the bin: released is done
+                if self.now()-self.phase_started > 1.0:
+                    self.holding_book = None
+                    self.next_phase()
+            elif self.bin_contact_stamp is not None and self.bin_contact_stamp >= self.phase_started-1.5:
                 self.holding_book = None
                 self.next_phase()
 
