@@ -95,7 +95,7 @@ class NavigationNode(Node):
             # correct its lateral position at low speed while still staged.
             'shelf_alignment_standoff': 1.35,
             'shelf_alignment_strafe_speed': 0.08,
-            'shelf_alignment_timeout': 15.0,
+            'shelf_alignment_timeout': 40.0,
             # Low-row arm links sweep close to the shelf even in the dock
             # stow pose. Keep the base farther back while ALIGN_BOOK runs.
             'lower_book_standoff': 0.92, 'lower_book_keepout_distance': 0.84,

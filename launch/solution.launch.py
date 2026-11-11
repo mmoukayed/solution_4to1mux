@@ -33,7 +33,7 @@ def generate_launch_description():
         'lower_book_keepout_distance': ('0.84', float),
         'shelf_alignment_standoff': ('1.35', float),
         'shelf_alignment_strafe_speed': ('0.08', float),
-        'shelf_alignment_timeout': ('15.0', float),
+        'shelf_alignment_timeout': ('40.0', float),
         'docking_speed': ('0.12', float),
         'book_search_timeout': ('8.0', float),
         'max_book_recoveries': ('2', int),
