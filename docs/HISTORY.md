@@ -1,4 +1,4 @@
-# ERC 4To1MUX solution — revision 3 (14 September 2026)
+# History: the build-by-build notes (moved from the old README)
 ## Setting Up Solution (First Run)
 Run these commands to first setup the ROS 2 environment:
 ```
