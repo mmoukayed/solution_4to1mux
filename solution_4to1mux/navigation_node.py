@@ -768,6 +768,16 @@ class NavigationNode(Node):
             self.last_gate = 'stale_or_missing_lidar'
             self.warn('return_lidar', 'Waiting for fresh front/rear LiDAR before returning to the start.')
             return False
+        # The start sits right beside the bin table, whose top the LiDAR cannot see between
+        # its legs: near the start, stop as soon as anything is inside the carried-arm radius
+        # rather than driving the torso into the table's edge.
+        points = np.concatenate([scan[1] for scan in self.scans.values()])
+        if (distance <= 0.8 and len(points)
+                and np.linalg.norm(points, axis=1).min() < self.p('carry_turn_clearance')):
+            self.stop()
+            self.get_logger().info(f'Stopping the return {distance:.2f} m short of the start: '
+                                   'an obstacle (the bin table) is close.')
+            return True
 
         desired_world = delta/distance
         c, s = math.cos(self.pose[2]), math.sin(self.pose[2])
