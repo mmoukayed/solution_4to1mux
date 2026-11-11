@@ -66,7 +66,7 @@ class ManipulationNode(Node):
             # target is compensated while the base is still before the table.
             'place_base_advance': 0.35, 'place_clearance_height': 0.20,
             'place_torso_hover': 0.35, 'place_torso_drop': 0.0,
-            'target_max_age': 2.0, 'gripper_timeout': 8.0,
+            'target_max_age': 2.0, 'finish_grab_target_max_age': 15.0, 'gripper_timeout': 8.0,
             'placement_target_max_age': 30.0,
             'grip_contact_hold': 1.0,
             'motion_timeout_margin': 8.0, 'planning_timeout': 60.0,
@@ -285,7 +285,10 @@ class ManipulationNode(Node):
         if sequence == 'prepare_place':
             self.placement_hover_target = None
         target = self.targets.get('book' if sequence in ('grab', 'prepare_grab', 'finish_grab') else 'bin')
+        # finish_grab: the hand at the pregrasp hides the book from the head camera; the book and
+        # the parked base have not moved, so its last pose (in odom) is still good
         target_age = (self.p('placement_target_max_age') if sequence in ('place', 'prepare_place', 'finish_place')
+                      else self.p('finish_grab_target_max_age') if sequence == 'finish_grab'
                       else self.p('target_max_age'))
         if target is None or target.header.frame_id != self.ros.frames['odom'] or not self.fresh(Time.from_msg(target.header.stamp).nanoseconds/1e9, target_age):
             self.report(sequence, False, f'No fresh target pose in {self.ros.frames["odom"]}; inspect RGB-D perception.')
