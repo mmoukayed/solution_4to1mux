@@ -74,7 +74,7 @@ class NavigationNode(Node):
             'reading_max_age': 1.0,
             'book_standoff': 0.68, 'book_lateral_offset': -0.18,
             'bin_standoff': 0.95, 'bin_final_advance_max': 0.65,
-            'bin_turn_backoff': 0.25, 'max_bin_turn_recoveries': 2,
+            'bin_turn_backoff': 0.25, 'max_bin_turn_recoveries': 2, 'carry_turn_clearance': 0.85,
             'bin_turn_backoff_timeout': 8.0,
             'place_base_advance': 0.35,
             'obstacle_margin': 0.12,
@@ -455,20 +455,29 @@ class NavigationNode(Node):
                 vx, vy = vx*scale, vy*scale
                 if scale < 1.0:
                     self.last_gate = f'clearance_speed_limit_{clearance_cap:.2f}m/s'
-        if abs(omega) > 0 and len(points) and np.linalg.norm(points, axis=1).min() < 0.49:
+        # While the book is carried the arm sweeps well outside the base, and the bin
+        # table's top overhangs between legs the LiDAR plane cannot see: turn only with
+        # every LiDAR return outside the swept radius.
+        carrying = self.state in (State.RETREAT_FROM_SHELF, State.WAIT_FOR_CARRY_RAISE, State.RETURN_TO_START,
+                                  State.FIND_BIN, State.APPROACH_BIN, State.BACK_OUT_FOR_BIN_TURN)
+        turn_radius = self.p('carry_turn_clearance') if carrying else 0.49
+        if abs(omega) > 0 and len(points) and np.linalg.norm(points, axis=1).min() < turn_radius:
             omega = 0.0
             self.last_gate = 'turning_envelope_blocked'
             self.warn('turn', 'Obstacle inside turning envelope; rotation stopped.')
             if allow_turn_recovery and vx == 0.0 and vy == 0.0:
                 # Rotation needed but blocked, and no translation commanded either:
-                # without this the robot freezes at the shelf until the phase times
-                # out. Back straight out (if the rear is clear) to regain turning room.
-                behind = points[(points[:, 0] < 0) & (np.abs(points[:, 1]) < 0.35)]
-                rear_clearance = float(-behind[:, 0].max())-0.36 if len(behind) else 10.0
-                if rear_clearance > self.p('obstacle_margin'):
-                    vx = -0.08
-                    self.last_gate = 'turn_blocked_backing_straight_out'
-                    self.warn('turn_back', 'Rotation blocked near the shelf; backing straight out to regain turning room.')
+                # slide slowly straight away from the nearest return, if that path is clear.
+                nearest = points[int(np.argmin(np.linalg.norm(points, axis=1)))]
+                away = -nearest/max(float(np.linalg.norm(nearest)), 1e-6)
+                side = np.array([-away[1], away[0]])
+                along, across = points @ away, points @ side
+                ahead = along[(along > 0) & (np.abs(across) < 0.35)]
+                clearance = float(ahead.min())-0.36 if len(ahead) else 10.0
+                if clearance > self.p('obstacle_margin')+0.05:
+                    vx, vy = 0.08*float(away[0]), 0.08*float(away[1])
+                    self.last_gate = 'turn_blocked_moving_away'
+                    self.warn('turn_back', 'Rotation blocked; sliding away from the nearest obstacle to regain turning room.')
         msg = Twist()
         msg.linear.x, msg.linear.y, msg.angular.z = float(vx), float(vy), float(omega)
         if not hard_shelf_blocked and any(abs(v) > 1e-6 for v in (vx, vy, omega)):
@@ -707,8 +716,10 @@ class NavigationNode(Node):
         delta = self.start[:2]-self.pose[:2]
         distance = float(np.linalg.norm(delta))
         if distance <= 0.10:
+            # No turn back to the start heading: the start sits beside the bin table and the
+            # bin search turns anyway (through the carried-arm clearance check).
             self.stop()
-            return self.rotate_to(self.start[2])
+            return True
         if len(self.scans) < 2 or not all(self.fresh(scan[0]) for scan in self.scans.values()):
             self.stop()
             self.last_gate = 'stale_or_missing_lidar'
