@@ -65,7 +65,7 @@ class ManipulationNode(Node):
             # Must match navigation.place_base_advance.  The high pre-place
             # target is compensated while the base is still before the table.
             'place_base_advance': 0.35, 'place_clearance_height': 0.20,
-            'place_torso_hover': 0.35, 'place_torso_drop': 0.0,
+            'place_torso_hover': 0.0, 'place_torso_drop': 0.0,
             'target_max_age': 2.0, 'finish_grab_target_max_age': 15.0, 'gripper_timeout': 8.0,
             'placement_target_max_age': 30.0,
             'grip_contact_hold': 1.0,
@@ -430,7 +430,7 @@ class ManipulationNode(Node):
                 offset = None
             q = current.copy()
             if sequence == 'prepare_place':
-                q[0] = min(self.model.upper[0], params['place_torso_hover'])
+                q[0] = min(self.model.upper[0], max(self.model.lower[0], params['place_torso_hover']))
             elif sequence == 'prepare_grab' and self.book_row == 1:
                 # Top-row IK needs the torso at its upper travel limit. Solve
                 # with that value fixed; the torso is raised in its own phase
@@ -490,9 +490,11 @@ class ManipulationNode(Node):
                         ('verify_delivery', 'delivery', None, 3.0)]
 
     def plan_carry_raise(self, current):
-        """Move the held book to the fixed top-shelf carry pose, without torso motion."""
+        """Move the held book to the fixed top-shelf carry pose, the torso fully down."""
         target = current.copy()
-        target[0] = current[0]
+        # torso fully down for the trip to the bin: raised, the tucked left gripper rides at
+        # the bin table's top and hits its edge on the final approach
+        target[0] = self.model.lower[0]
         target[1:] = HIGH_CARRY_RIGHT_ARM
         # the live arm's joint 2 stops at 1.134 rad (the simulator allowed 1.25): stay inside its limits
         target = np.clip(target, self.model.lower, self.model.upper)
