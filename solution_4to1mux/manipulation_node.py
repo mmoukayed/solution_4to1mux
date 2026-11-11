@@ -72,7 +72,8 @@ class ManipulationNode(Node):
             'motion_timeout_margin': 8.0, 'planning_timeout': 60.0,
             # The measured bin point is near the far half of its opening;
             # release 22 cm back toward the robot for a centred drop.
-            'bin_inset': 0.22, 'bin_release_height': 0.21,
+            'bin_inset': 0.33,  # the book sticks ~0.2 m out of the hand: centre the BOOK, not the hand (0.22 dropped it on the far rim)
+             'bin_release_height': 0.21,
         }.items():
             self.declare_parameter(name, value)
         gripper_limit = 0.069 if simulation else 0.803
