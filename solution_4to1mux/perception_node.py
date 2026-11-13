@@ -210,7 +210,7 @@ class PerceptionNode(Node):
             'column_half_width': 0.43, 'top_book_marker_offset': 0.335,
             'row_spacing': 0.33, 'bin_min_area_fraction': 0.006,
             # the gripper's visible centroid in its own frame (calibrated on the fault-free twin)
-            'hand_frame': 'gripper_right_base_link', 'hand_bias': [0.0, 0.0, 0.0],
+            'hand_frame': 'gripper_right_base_link', 'hand_bias': [-0.038, 0.020, -0.116],
         }
         for key, value in defaults.items():
             self.declare_parameter(key, value)
