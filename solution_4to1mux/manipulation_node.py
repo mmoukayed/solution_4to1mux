@@ -72,7 +72,8 @@ class ManipulationNode(Node):
             'motion_timeout_margin': 8.0, 'planning_timeout': 60.0,
             # The measured bin point is near the far half of its opening;
             # release 22 cm back toward the robot for a centred drop.
-            'bin_inset': 0.33,  # the book sticks ~0.2 m out of the hand: centre the BOOK, not the hand (0.22 dropped it on the far rim)
+            'bin_release_z': 1.10,  # the grasp point's height at release: the book hangs ~7 cm under it, the rim is at 0.95
+            'bin_inset': 0.20,  # aim this far short of the measured bin point (it reads ~0.12 m past the bin's centre)
              'bin_release_height': 0.21,
         }.items():
             self.declare_parameter(name, value)
@@ -322,7 +323,7 @@ class ManipulationNode(Node):
         if sequence != 'finish_grab':
             self.retreat_target = None
         current = np.array([self.joints[n] for n in self.model.names])
-        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'top_book_clearance_height', 'top_book_front_standoff', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'place_torso_drop', 'bin_inset', 'bin_release_height')}
+        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'top_book_clearance_height', 'top_book_front_standoff', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'place_torso_drop', 'bin_inset', 'bin_release_height', 'bin_release_z')}
         self.deferred_plan = None
         self.phases = []
         if sequence == 'prepare_grab' and self.book_row == 1:
@@ -408,11 +409,13 @@ class ManipulationNode(Node):
             # bin. Move against it to centre the book in the opening. The base
             # has already reached its calibrated standoff; the torso supplies
             # the final straight down motion after this hover pose is reached.
-            release = point-normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
-            hover = release+np.array([0, 0, params['place_clearance_height']])
-            # pass high over the bin first: straight from the carry pose the forearm
-            # swung down through the bin's rim
-            targets = [('crane_high', hover+np.array([0, 0, 0.20])), ('crane_hover', hover)]
+            # A reliable drop, not an elegant one: fingers straight down, the book hanging under the hand
+            # (where it falls no longer depends on how it was gripped), the grasp point a fixed height
+            # above the floor and short of the measured bin point (the red blob's depth reads ~12 cm
+            # past the bin's centre; its 0.56 m opening runs along the approach), then let go.
+            release = point-normal*params['bin_inset']
+            release[2] = params['bin_release_z']
+            targets = [('crane_high', release+np.array([0, 0, 0.18])), ('crane_hover', release)]
         elif sequence == 'finish_place':
             release = point-normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
             targets = [('lower_to_bin', release)]
@@ -424,13 +427,14 @@ class ManipulationNode(Node):
         # Parallel fingers can grasp with either 0 or 180 degree wrist roll.
         # A bin release may also require the wrist sideways while lowering from
         # the calibrated upright carry pose, so try quarter turns as well.
-        rolls = ((math.pi, 0.0, math.pi/2, -math.pi/2)
-                 if sequence in ('place', 'prepare_place', 'finish_place')
-                 else (math.pi, 0.0))
+        placing = sequence in ('place', 'prepare_place', 'finish_place')
+        rolls = (0.0, math.pi, math.pi/2, -math.pi/2) if placing else (math.pi, 0.0)
         for roll in rolls:
             grasp_sequence = sequence in ('grab', 'prepare_grab', 'finish_grab')
-            grasp_orientation = facing @ rotation([1, 0, 0], roll)
-            if grasp_sequence and self.base_to_grasp is not None:
+            # placing: the approach axis straight down (rolls 0/pi lay the book's long side along the approach)
+            grasp_orientation = (facing @ rotation([0, 1, 0], math.pi/2) @ rotation([1, 0, 0], roll)
+                                 if placing else facing @ rotation([1, 0, 0], roll))
+            if (grasp_sequence or placing) and self.base_to_grasp is not None:
                 # `targets` are expressed at the URDF grasp frame. Convert
                 # them back to the configured arm-tip link so IK places the
                 # fingers and their approach axis at the book, not the wrist
@@ -465,7 +469,9 @@ class ManipulationNode(Node):
                 # wrist nearer its current orientation by selecting the valid
                 # complete path with the least estimated joint travel time,
                 # rather than accepting the first roll that happens to solve.
-                candidates.append((sum(step[3] for step in candidate), candidate))
+                # placing: prefer the rolls that keep the book's long side along the bin's long axis
+                penalty = 100.0 if placing and abs(math.sin(roll)) > 0.5 else 0.0
+                candidates.append((sum(step[3] for step in candidate)+penalty, candidate))
             except ValueError as error:
                 errors.append(str(error))
         motions = min(candidates, key=lambda item: item[0])[1] if candidates else None
