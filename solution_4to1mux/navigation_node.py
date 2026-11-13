@@ -681,12 +681,16 @@ class NavigationNode(Node):
             return
         if self.head_pub.get_subscription_count() == 0:
             return
+        # the /erc checker rejects head_2 faster than 0.5 rad/s: size the move at 0.35 rad/s
+        travel = abs(tilt-self.last_head) if self.last_head is not None else 1.2
+        duration = max(1.0, travel/0.35)
         self.last_head = tilt
         msg = JointTrajectory()
         msg.joint_names = ['head_1_joint', 'head_2_joint']
         point = JointTrajectoryPoint()
         point.positions = [0.0, tilt]
-        point.time_from_start.sec = 1
+        point.time_from_start.sec = int(duration)
+        point.time_from_start.nanosec = int((duration-int(duration))*1e9)
         msg.points = [point]
         self.head_pub.publish(msg)
 
