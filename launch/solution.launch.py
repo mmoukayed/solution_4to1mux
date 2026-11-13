@@ -22,7 +22,7 @@ def generate_launch_description():
         'book_lateral_offset': ('-0.18', float),
         'grab_timeout': ('120.0', float),
         'place_timeout': ('90.0', float),
-        'phase_timeout': ('90.0', float),
+        'phase_timeout': ('240.0', float),
         'perception_rate': ('8.0', float),
         'marker_min_height': ('1.75', float),
         'marker_max_height': ('2.55', float),
@@ -35,7 +35,7 @@ def generate_launch_description():
         'shelf_alignment_strafe_speed': ('0.08', float),
         'shelf_alignment_timeout': ('40.0', float),
         'docking_speed': ('0.12', float),
-        'book_search_timeout': ('8.0', float),
+        'book_search_timeout': ('20.0', float),
         'max_book_recoveries': ('2', int),
         'book_view_backoff': ('0.35', float),
     }
