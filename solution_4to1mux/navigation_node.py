@@ -259,8 +259,9 @@ class NavigationNode(Node):
             return  # All-NaN scan is a sensor failure, not an empty arena.
         points = scan_points(msg.ranges, msg.angle_min, msg.angle_increment,
                              msg.range_min, msg.range_max, transform_matrix(tf.transform))
-        # Ignore returns from inside the robot's own footprint.
-        points = points[(np.abs(points[:, 0]) > 0.36) | (np.abs(points[:, 1]) > 0.32)]
+        # Ignore returns from the robot's own body. The real rear laser sees the base's rear edge at
+        # x = -0.36 m (slot 3: it held a turn for minutes), so the box needs a margin over the footprint.
+        points = points[(np.abs(points[:, 0]) > 0.41) | (np.abs(points[:, 1]) > 0.36)]
         self.scans[name] = (Time.from_msg(msg.header.stamp).nanoseconds/1e9, points)
 
     def warn(self, key, text):
