@@ -981,7 +981,22 @@ class NavigationNode(Node):
                         self.p('scan_observe_time'), 3*self.p('head_scan_dwell'))
                     self.last_gate = 'observing_columns'
         elif self.state == State.APPROACH_COLUMN:
-            if self.drive_to(self.goal):
+            # The goal comes from the markers seen during the search, in odom; the search's turns put a few
+            # degrees of heading error into odom (the robot's wheel odometry reads its turns 4.4 % short), so
+            # the goal can land inside the shelf keep-out. Held there, close and facing the shelf, is arrived:
+            # the book search and the LiDAR shelf alignment that follow re-measure from here.
+            arrived = self.drive_to(self.goal)
+            remaining = float(np.linalg.norm(self.goal[:2]-self.pose[:2]))
+            if not arrived and str(self.last_gate).startswith('shelf_keepout') and remaining < 0.5:
+                self.keepout_since = getattr(self, 'keepout_since', None) or self.now()
+                if self.now()-self.keepout_since > 3.0:
+                    self.get_logger().info(f'Column approach held by the shelf keep-out {remaining:.2f} m short: '
+                                           'close enough, looking for the book from here.')
+                    arrived = True
+            else:
+                self.keepout_since = None
+            if arrived:
+                self.keepout_since = None
                 self.transition(State.FIND_BOOK)
         elif self.state in (State.FIND_BOOK, State.REACQUIRE_BOOK):
             book = self.observation('book')
