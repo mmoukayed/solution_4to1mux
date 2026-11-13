@@ -12,7 +12,7 @@ import numpy as np
 import rclpy
 from action_msgs.msg import GoalStatus
 from control_msgs.action import FollowJointTrajectory
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PointStamped, PoseStamped
 from rclpy.action import ActionClient
 from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
@@ -115,6 +115,9 @@ class ManipulationNode(Node):
         self.create_subscription(JointState, topics['joint_states'], self.on_joints, qos_profile_sensor_data)
         for name in ('book', 'bin'):
             self.create_subscription(PoseStamped, topics[f'{name}_pose'], lambda m, n=name: self.targets.update({n: m}), 10)
+        self.measure_pub = self.create_publisher(Bool, topics['measure_hand'], 10)
+        self.hand_corr = None           # (correction in base_footprint, when) from the hand measurement
+        self.create_subscription(PointStamped, topics['hand_offset'], self.on_hand_offset, 10)
         self.create_subscription(Bool, topics['request_grab'], lambda m: self.request('grab') if m.data else None, 10)
         self.create_subscription(Bool, topics['request_prepare_grab'], lambda m: self.request('prepare_grab') if m.data else None, 10)
         self.create_subscription(Bool, topics['request_finish_grab'], lambda m: self.request('finish_grab') if m.data else None, 10)
@@ -206,6 +209,9 @@ class ManipulationNode(Node):
                 side = 'left' if 'left' in gripper else 'right' if 'right' in gripper else None
                 if side:
                     self.contacts[(book, side)] = self.now()
+
+    def on_hand_offset(self, msg):
+        self.hand_corr = (np.array([msg.point.x, msg.point.y, msg.point.z]), self.now())
 
     def held_book(self):
         if self.ros.topics['contacts'] is None:
@@ -301,6 +307,11 @@ class ManipulationNode(Node):
             return
         matrix = transform_matrix(tf.transform)
         point = (matrix @ np.r_[pose_xyz(target), 1])[:3]
+        if sequence in ('grab', 'finish_grab') and self.hand_corr is not None and self.now()-self.hand_corr[1] < 120.0:
+            # the auto-calibrated grasp: aim where the camera says the book is, shifted by the
+            # difference between where the arm's kinematics and the camera put the hand
+            point = point+self.hand_corr[0]
+            self.get_logger().info(f'{sequence}: grasp target corrected by the hand measurement {self.hand_corr[0].round(3)} m')
         normal_world = np.array([math.cos(yaw(target.pose.orientation)), math.sin(yaw(target.pose.orientation)), 0])
         normal = matrix[:3, :3] @ normal_world
         normal[2] = 0
@@ -471,8 +482,8 @@ class ManipulationNode(Node):
             if self.book_row == 1:
                 # Keep the solved pregrasp as the safe retreat if insertion fails.
                 self.retreat_target = motions[-1][2]
-                return [('open_gripper', 'open', None, 1.0)]+motions
-            return [('open_gripper', 'open', None, 1.0), motions[0]]
+                return [('open_gripper', 'open', None, 1.0)]+motions+[('measure_hand', 'measure', None, 5.0)]
+            return [('open_gripper', 'open', None, 1.0), motions[0], ('measure_hand', 'measure', None, 5.0)]
         if sequence == 'finish_grab':
             if self.book_row == 1:
                 if self.retreat_target is None:
@@ -580,6 +591,10 @@ class ManipulationNode(Node):
             self.gripper_pub.publish(self.trajectory([GRIPPER_JOINT], [value], duration))
             self.deadline = self.now()+self.p('gripper_timeout')
             self.contact_since = None
+        elif self.phase == 'measure':
+            self.hand_corr = None
+            self.measure_pub.publish(Bool(data=True))
+            self.deadline = self.now()+duration+5.0
         else:
             self.deadline = self.now()+duration+3.0
 
@@ -634,6 +649,13 @@ class ManipulationNode(Node):
             if not self.ready() and self.now()-self.warned_at > 5.0:
                 self.warned_at = self.now()
                 self.get_logger().warn(f'Waiting for robot/controllers: model={self.model is not None}, joints={self.fresh(self.joint_stamp)}, arm={self.arm.server_is_ready()}, torso={self.torso.server_is_ready()}, gripper_subscribers={self.gripper_pub.get_subscription_count()}')
+            return
+        if self.phase == 'measure':
+            if self.hand_corr is not None and self.hand_corr[1] >= self.phase_started:
+                self.next_phase()
+            elif self.now()-self.phase_started > 5.0:
+                self.get_logger().warn('No hand measurement within 5 s: grasping on the camera estimate alone.')
+                self.next_phase()
             return
         if self.now() > self.deadline:
             detail = ''

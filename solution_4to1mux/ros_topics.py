@@ -58,6 +58,9 @@ TOPICS = {
     'solution_state': '/solution/state',
     'solution_failure': '/solution/failure',
     'book_row': '/solution/book_row',
+    # The auto-calibrated grasp: manipulation asks perception to measure the hand at the pregrasp.
+    'measure_hand': '/perception/measure_hand',
+    'hand_offset': '/perception/hand_offset',
 
     # Navigation and manipulation exchange.
     'manipulation_ready': '/manipulation/ready',

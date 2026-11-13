@@ -15,7 +15,7 @@ import numpy as np
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PointStamped, PoseStamped
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.duration import Duration
@@ -209,6 +209,8 @@ class PerceptionNode(Node):
             'marker_min_height': 1.75, 'marker_max_height': 2.55,
             'column_half_width': 0.43, 'top_book_marker_offset': 0.335,
             'row_spacing': 0.33, 'bin_min_area_fraction': 0.006,
+            # the gripper's visible centroid in its own frame (calibrated on the fault-free twin)
+            'hand_frame': 'gripper_right_base_link', 'hand_bias': [0.0, 0.0, 0.0],
         }
         for key, value in defaults.items():
             self.declare_parameter(key, value)
@@ -279,6 +281,10 @@ class PerceptionNode(Node):
         self.create_subscription(CameraInfo, topics['camera_info'], self.on_info, SENSOR_QOS)
         
         self.create_subscription(Bool, topics['looking_for_bin'], self.on_mode, 10)
+        self.create_subscription(Bool, topics['measure_hand'], self.on_measure_hand, 10)
+        self.hand_pub = self.create_publisher(PointStamped, topics['hand_offset'], 10)
+        self.hand_until = 0.0
+        self.hand_samples = []
         self.ready_pub = self.create_publisher(Bool, topics['perception_ready'], 10)
         self.shelf_pub = self.create_publisher(PoseStamped, topics['shelf_pose'], 10)
         self.unit_pub = self.create_publisher(PoseStamped, topics['shelf_unit_pose'], 10)
@@ -391,6 +397,41 @@ class PerceptionNode(Node):
 
     def on_info(self, msg):
         self.info = msg
+
+    def on_measure_hand(self, msg):
+        if msg.data:
+            self.hand_until = self.get_clock().now().nanoseconds/1e9+4.5
+            self.hand_samples = []
+
+    def measure_hand(self, depth_m, K_d, T_od, stamp):
+        """The auto-calibrated grasp: the gripper seen in depth vs where the arm's kinematics put it.
+        Both the book and the hand are measured through this camera, so the camera's own error (the
+        real robot's head camera sits ~3.5 cm and ~1 deg off its TF) cancels, and the arm's encoder
+        error is measured too. Returns (correction in odom, implied bias in the hand frame) or None."""
+        try:
+            T_oh = transform_matrix(self.tf.lookup_transform(self.ros.frames['odom'], self.get_parameter('hand_frame').value,
+                                                             stamp, timeout=Duration(seconds=0.05)).transform)
+        except TransformException:
+            return None
+        bias = np.array(self.get_parameter('hand_bias').value, float)
+        expected = T_oh[:3, 3]+T_oh[:3, :3] @ bias
+        step = 2 if depth_m.shape[1] >= 400 else 1
+        d = depth_m[::step, ::step]
+        v, u = np.nonzero(np.isfinite(d) & (d > 0.2) & (d < 1.6))
+        z = d[v, u]
+        pts = np.stack([(u*step-K_d[0, 2])*z/K_d[0, 0], (v*step-K_d[1, 2])*z/K_d[1, 1], z])
+        P = (T_od[:3, :3] @ pts + T_od[:3, 3:4]).T
+        c = expected.copy()
+        for radius in (0.14, 0.11, 0.09, 0.09):
+            near = P[np.linalg.norm(P-c, axis=1) < radius]
+            if len(near) < 80:
+                return None
+            c = near.mean(axis=0)
+        correction = expected-c
+        if np.linalg.norm(correction) > 0.10:
+            self.get_logger().warn(f'Hand measurement {correction.round(3)} m is implausible; ignored.')
+            return None
+        return correction, T_oh[:3, :3].T @ (c-T_oh[:3, 3])
 
     def on_mode(self, msg):
         self.mode = 'bin' if msg.data else 'shelf'
@@ -546,6 +587,30 @@ class PerceptionNode(Node):
         raw = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
         depth_m = raw.astype(np.float32)/(1000.0 if depth_msg.encoding == '16UC1' else 1.0)
         self.measure_tilt(depth_m, K_d, T_od)
+        if self.get_clock().now().nanoseconds/1e9 < self.hand_until:
+            c_, s__ = math.cos(self.head_tilt), math.sin(self.head_tilt)
+            tilt_ = np.eye(4)
+            tilt_[1:3, 1:3] = [[c_, -s__], [s__, c_]]
+            m = self.measure_hand(depth_m, K_d, T_od @ tilt_, depth_stamp)
+            if m is not None:
+                self.hand_samples.append(m)
+            if len(self.hand_samples) >= 4:
+                corr = np.median([a for a, _ in self.hand_samples], axis=0)
+                implied = np.median([b for _, b in self.hand_samples], axis=0)
+                try:
+                    R = transform_matrix(self.tf.lookup_transform(self.ros.frames['base'], target_frame, Time()).transform)[:3, :3]
+                except TransformException:
+                    R = None
+                if R is not None:
+                    corr_base = R @ corr
+                    msg = PointStamped()
+                    msg.header.stamp = depth_msg.header.stamp
+                    msg.header.frame_id = self.ros.frames['base']
+                    msg.point.x, msg.point.y, msg.point.z = (float(v) for v in corr_base)
+                    self.hand_pub.publish(msg)
+                    self.get_logger().info(f'Hand measured: grasp correction {corr_base.round(3)} m in the base frame '
+                                           f'(gripper centroid in its frame {implied.round(3)}; hand_bias {self.get_parameter("hand_bias").value})')
+                self.hand_until = 0.0
         c, s_ = math.cos(self.head_tilt), math.sin(self.head_tilt)
         tilt = np.eye(4)
         tilt[1:3, 1:3] = [[c, -s_], [s_, c]]
