@@ -4,6 +4,7 @@ import io
 import math
 import shutil
 import subprocess
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -17,6 +18,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.duration import Duration
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Bool, Int32, String
@@ -26,12 +28,6 @@ from .digit_detector import DigitDetector
 from .ros_topics import configure_ros
 from .geometry import depth_median, pose_xyz, row_for_height, transform_matrix, yaw
 
-COLOR_RANGES = {
-    'green': [((40, 60, 40), (85, 255, 255))],
-    'blue': [((95, 60, 40), (140, 255, 255))],
-    'yellow': [((18, 60, 40), (38, 255, 255))],
-    'red': [((0, 60, 40), (10, 255, 255)), ((170, 60, 40), (180, 255, 255))],
-}
 SENSOR_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
 
 
@@ -119,13 +115,78 @@ def read_text_label_boxes(crop, target):
     return matches
 
 
-def colour_boxes(image, colour, minimum_area=12):
+# Hue/saturation bands measured on 60 labelled real-robot frames (slots 1-2, MBR library): the old
+# wide bands found every book but also 970 false boxes (wood panelling and floor read red, the
+# library's book wall blue). STRICT is the measured band with a margin; RELAXED is for a dark frame
+# after a camera restart flips the exposure preset (books read dull: saturation 56-90, red ~orange).
+STRICT = {'red': [((0, 100, 80), (8, 255, 255)), ((172, 100, 80), (180, 255, 255))],
+          'green': [((58, 80, 50), (80, 255, 255))], 'yellow': [((16, 100, 110), (28, 255, 255))],
+          'blue': [((93, 140, 80), (108, 255, 255))]}
+RELAXED = {'red': [((0, 45, 45), (16, 255, 255)), ((168, 45, 45), (180, 255, 255))],
+           'green': [((48, 45, 40), (85, 255, 255))], 'yellow': [((16, 45, 70), (36, 255, 255))],
+           'blue': [((90, 50, 40), (112, 255, 255))]}
+
+
+def normalise_exposure(image, mean_lo=110, sd_lo=40):
+    """A dark or flat frame (the robot's exposure preset after a camera restart): grey-world white
+    balance on the brightest unsaturated pixels (the white shelf), then stretch the shelf to white.
+    A normal frame is returned unchanged."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if gray.mean() >= mean_lo and gray.std() >= sd_lo:
+        return image
+    f = image.astype(np.float32)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    ref = (hsv[..., 1] < 90) & (gray > np.percentile(gray, 60))
+    if ref.sum() < 500:
+        ref = gray > np.percentile(gray, 80)
+    m = f[ref].mean(axis=0)
+    f = f*(m.mean()/np.maximum(m, 1))
+    f = f*(235.0/max(np.percentile(f[ref].mean(axis=1), 90), 1))
+    return np.clip(f, 0, 255).astype(np.uint8)
+
+
+def _raw_boxes(image, bands, minimum_area):
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     mask = np.zeros(image.shape[:2], np.uint8)
-    for lower, upper in COLOR_RANGES[colour]:
+    for lower, upper in bands:
         mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) >= minimum_area]
+    return [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) >= minimum_area], hsv
+
+
+def _in_white_bay(hsv, boxes, need=0.55, max_saturation=60, min_side=7):
+    """A competition book stands in a white bay: most of a ring around it is unsaturated. Wood,
+    people and the library's own book wall are not (real frames: 546 -> 16 false red boxes)."""
+    h_img, w_img = hsv.shape[:2]
+    kept = []
+    for (x, y, w, h) in boxes:
+        if min(w, h) < min_side:
+            continue
+        pad = max(4, int(0.6*min(w, h)))
+        x0, y0 = max(0, x-pad), max(0, y-pad//2)
+        x1, y1 = min(w_img, x+w+pad), min(h_img, y+h+pad//2)
+        ring = hsv[y0:y1, x0:x1, 1].astype(np.int32)
+        inner = np.zeros(ring.shape, bool)
+        inner[y-y0:y-y0+h, x-x0:x-x0+w] = True
+        values = ring[~inner]
+        if values.size and (values < max_saturation).mean() >= need:
+            kept.append((x, y, w, h))
+    return kept
+
+
+def colour_boxes(image, colour, minimum_area=60, books=True):
+    """Boxes of `colour`. Books: the strict band, kept only inside a white bay; on a dark frame
+    with nothing found, the relaxed band (stricter ring). The bin (books=False): the strict band."""
+    dark = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).mean() < 110
+    image = normalise_exposure(image)
+    boxes, hsv = _raw_boxes(image, STRICT[colour], minimum_area)
+    if not books:
+        return boxes
+    kept = _in_white_bay(hsv, boxes)
+    if not kept and dark:
+        boxes, hsv = _raw_boxes(image, RELAXED[colour], minimum_area)
+        kept = _in_white_bay(hsv, boxes, need=0.65)
+    return kept
 
 
 class PerceptionNode(Node):
@@ -138,7 +199,8 @@ class PerceptionNode(Node):
             'perception_rate': 8.0, 'book_text_ocr_period': 0.45,
             'erc_images_dir': str(Path(__file__).resolve().parents[1] / 'erc_images'),
             'template_dir': str(Path(get_package_share_directory('solution_4to1mux')) / 'templates'),
-            'depth_frame': self.ros.frames['depth_camera'],
+            # registered depth is in the colour camera's pixels: project from the colour frame
+            'depth_frame': self.ros.frames['colour_camera'],
             'depth_max_skew': 0.20, 'observation_max_age': 0.8,
             'tf_latest_fallback_tolerance': 0.10,
             # Current simulator: marker centre 1.93 m, top active book 1.595 m.
@@ -151,7 +213,7 @@ class PerceptionNode(Node):
         self.target_column = self.get_parameter('shelf_column_number').value
         self.target_colour = self.get_parameter('book_colour').value.lower()
         self.target_text = str(self.get_parameter('book_text').value).strip()
-        if self.target_column not in range(1, 6) or (not self.target_text and self.target_colour not in COLOR_RANGES):
+        if self.target_column not in range(1, 6) or (not self.target_text and self.target_colour not in STRICT):
             raise ValueError('shelf_column_number must be 1..5; set book_colour to red/green/blue/yellow or provide book_text')
         if self.target_text and shutil.which('tesseract') is None:
             raise RuntimeError('book_text requires Tesseract OCR. Install it in the simulator container with: apt install tesseract-ocr')
@@ -180,6 +242,11 @@ class PerceptionNode(Node):
         self.tf = Buffer()
         self.listener = TransformListener(self.tf, self)
         self.rgb = self.depth = self.info = None
+        self.depth_buffer = deque(maxlen=12)
+        self.depth_infos = {}
+        self.last_pair = None
+        self.head_tilt = 0.0            # measured head pitch error (rad), from the floor
+        self.tilt_samples = 0
         self.processed = None
         self.mode = 'shelf'
         self.column_pose = None
@@ -201,7 +268,12 @@ class PerceptionNode(Node):
         self.ocr_submit_at = -100.0
         
         self.create_subscription(Image, topics['camera_rgb'], self.on_rgb, SENSOR_QOS)
-        self.create_subscription(Image, topics['camera_depth'], self.on_depth, SENSOR_QOS)
+        # Raw depth, registered to colour here (depth intrinsics + the depth->colour TF): the robot's
+        # depth comes from its own camera (wider view) and at two sizes on one topic (848x480 and
+        # the decimated 172x96, slot 3); scaling pixel coordinates by the size ratio is wrong for both.
+        self.create_subscription(Image, topics['camera_depth_raw'], self.on_depth, SENSOR_QOS)
+        self.create_subscription(CameraInfo, topics['camera_depth_raw'].rsplit('/', 1)[0]+'/camera_info',
+                                 self.on_depth_info, SENSOR_QOS)
         self.create_subscription(CameraInfo, topics['camera_info'], self.on_info, SENSOR_QOS)
         
         self.create_subscription(Bool, topics['looking_for_bin'], self.on_mode, 10)
@@ -225,6 +297,95 @@ class PerceptionNode(Node):
 
     def on_depth(self, msg):
         self.depth = msg
+        self.depth_buffer.append(msg)
+
+    def on_depth_info(self, msg):
+        self.depth_infos[(msg.width, msg.height)] = msg
+
+    def pick_depth(self, stamp):
+        """The depth frame nearest the colour frame: full-size preferred, a decimated one only when
+        no full frame is near; the window widens when nothing has paired for a while (the robot's
+        camera drops to a few Hz)."""
+        now = self.get_clock().now().nanoseconds/1e9
+        wide = self.last_pair is None or now-self.last_pair > 5.0
+        limit = 0.6 if wide else self.get_parameter('depth_max_skew').value
+        best = None
+        for msg in self.depth_buffer:
+            dt = abs((stamp-Time.from_msg(msg.header.stamp)).nanoseconds)/1e9
+            if dt > limit:
+                continue
+            score = dt+(0.0 if msg.width >= 400 else 0.3)
+            if best is None or score < best[0]:
+                best = (score, msg)
+        return None if best is None else best[1]
+
+    def depth_K(self, msg):
+        info = self.depth_infos.get((msg.width, msg.height))
+        if info is not None:
+            return np.array(info.k, float).reshape(3, 3)
+        full = [i for (w, h), i in self.depth_infos.items() if w >= 400]
+        if not full:
+            return None
+        K = np.array(full[0].k, float).reshape(3, 3).copy()
+        K[:2] *= msg.width/float(full[0].width)
+        return K
+
+    def register(self, depth_m, K_d, T_cd, K_c, width, height):
+        """Depth (its own camera) -> a depth image in the colour camera's pixels, nearest surface
+        per pixel, small holes filled from neighbours."""
+        step = 2 if depth_m.shape[1] >= 400 else 1
+        d = depth_m[::step, ::step]
+        v, u = np.nonzero(np.isfinite(d) & (d > 0.15) & (d < 8.0))
+        z = d[v, u]
+        u, v = u*step, v*step
+        pts = np.stack([(u-K_d[0, 2])*z/K_d[0, 0], (v-K_d[1, 2])*z/K_d[1, 1], z])
+        P = T_cd[:3, :3] @ pts + T_cd[:3, 3:4]
+        ok = P[2] > 0.15
+        P = P[:, ok]
+        uc = np.round(K_c[0, 0]*P[0]/P[2]+K_c[0, 2]).astype(int)
+        vc = np.round(K_c[1, 1]*P[1]/P[2]+K_c[1, 2]).astype(int)
+        inside = (uc >= 0) & (uc < width) & (vc >= 0) & (vc < height)
+        uc, vc, zc = uc[inside], vc[inside], P[2, inside]
+        order = np.argsort(-zc)                 # far first, so the nearest surface is written last
+        reg = np.zeros((height, width), np.float32)
+        reg[vc[order], uc[order]] = zc[order]
+        k = max(3, int(round(width/depth_m.shape[1]*step))*2+1)
+        filled = cv2.erode(np.where(reg > 0, reg, 1e3).astype(np.float32), np.ones((k, k), np.uint8))
+        reg = np.where((reg == 0) & (filled < 1e3), filled, reg)
+        return reg
+
+    def measure_tilt(self, depth_m, K_d, T_od):
+        """The head's pitch error from the floor: the floor is z = 0 in odom, so the camera rotation
+        about its x axis that puts the most floor points on it is the encoder's error (the real
+        robot read its head tilt 4.3 deg off at slot 3). Smoothed; only with enough floor seen."""
+        step = 4 if depth_m.shape[1] >= 400 else 1
+        d = depth_m[::step, ::step]
+        v, u = np.nonzero(np.isfinite(d) & (d > 0.4) & (d < 3.5))
+        if v.size < 400:
+            return
+        z = d[v, u]
+        pts = np.stack([(u*step-K_d[0, 2])*z/K_d[0, 0], (v*step-K_d[1, 2])*z/K_d[1, 1], z])
+        world = T_od[:3, :3] @ pts + T_od[:3, 3:4]
+        near_floor = np.abs(world[2]) < 0.25
+        if near_floor.sum() < 400:
+            return
+        pts = pts[:, near_floor]
+        best = (0, 0.0)
+        for delta in np.arange(-0.14, 0.1401, 0.002):
+            c, s_ = math.cos(delta), math.sin(delta)
+            R = np.array([[1, 0, 0], [0, c, -s_], [0, s_, c]])
+            zz = (T_od[2, :3] @ (R @ pts)) + T_od[2, 3]
+            n = int((np.abs(zz) < 0.02).sum())
+            if n > best[0]:
+                best = (n, delta)
+        if best[0] < 300:
+            return
+        a = 0.3 if self.tilt_samples > 3 else 0.6
+        self.head_tilt = (1-a)*self.head_tilt+a*best[1]
+        self.tilt_samples += 1
+        if self.tilt_samples in (1, 5, 20) or self.tilt_samples % 50 == 0:
+            self.get_logger().info(f'Head tilt from the floor: {math.degrees(self.head_tilt):+.2f} deg '
+                                   f'({best[0]} floor points, sample {self.tilt_samples})')
 
     def on_info(self, msg):
         self.info = msg
@@ -340,17 +501,23 @@ class PerceptionNode(Node):
         key = stamp.nanoseconds
         if key == self.processed:
             return
-        depth_stamp = Time.from_msg(self.depth.header.stamp)
-        if abs((stamp-depth_stamp).nanoseconds)/1e9 > self.get_parameter('depth_max_skew').value:
-            self.warn('RGB/depth timestamps too far apart; waiting for matching frames.')
+        depth_msg = self.pick_depth(stamp)
+        if depth_msg is None:
+            self.warn('No depth frame near this colour frame yet; waiting for matching frames.')
             return
+        K_d = self.depth_K(depth_msg)
+        if K_d is None:
+            self.warn('Waiting for the depth camera_info.')
+            return
+        depth_stamp = Time.from_msg(depth_msg.header.stamp)
+        self.last_pair = self.get_clock().now().nanoseconds/1e9
         if (self.get_clock().now()-stamp).nanoseconds/1e9 > self.get_parameter('observation_max_age').value:
             self.warn('Camera frames are stale; check Gazebo real-time factor and use_sim_time.')
             return
         target_frame = self.ros.frames['odom']
         camera_frame = self.get_parameter('depth_frame').value
         try:
-            tf = self.tf.lookup_transform(target_frame, camera_frame, depth_stamp)
+            tf = self.tf.lookup_transform(target_frame, camera_frame, stamp)
         except TransformException as error:
             # Sensor images can be stamped a few milliseconds after the most
             # recent /tf sample. Use the latest transform only when it is very
@@ -360,7 +527,7 @@ class PerceptionNode(Node):
             except TransformException:
                 self.warn(f'Waiting for {camera_frame} -> {target_frame} TF: {error}')
                 return
-            lag = (depth_stamp-Time.from_msg(latest.header.stamp)).nanoseconds/1e9
+            lag = (stamp-Time.from_msg(latest.header.stamp)).nanoseconds/1e9
             tolerance = self.get_parameter('tf_latest_fallback_tolerance').value
             if not 0.0 <= lag <= tolerance:
                 self.warn(f'Waiting for {camera_frame} -> {target_frame} TF at image time; '
@@ -368,10 +535,25 @@ class PerceptionNode(Node):
                 return
             tf = latest
             self.warn(f'Image is {lag*1000:.1f} ms ahead of TF; using the latest transform.')
-        self.camera_to_odom = transform_matrix(tf.transform)
+        try:
+            T_od = transform_matrix(self.tf.lookup_transform(
+                target_frame, depth_msg.header.frame_id, depth_stamp, timeout=Duration(seconds=0.05)).transform)
+        except TransformException as error:
+            self.warn(f'Waiting for the depth camera TF: {error}')
+            return
+        raw = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
+        depth_m = raw.astype(np.float32)/(1000.0 if depth_msg.encoding == '16UC1' else 1.0)
+        self.measure_tilt(depth_m, K_d, T_od)
+        c, s_ = math.cos(self.head_tilt), math.sin(self.head_tilt)
+        tilt = np.eye(4)
+        tilt[1:3, 1:3] = [[c, -s_], [s_, c]]
+        self.camera_to_odom = transform_matrix(tf.transform) @ tilt
+        # depth -> colour through odom, each at its own stamp: the pair may be up to 0.6 s apart while
+        # the base turns, and a fixed depth->colour transform would smear every point by that motion
+        T_cd = np.linalg.inv(self.camera_to_odom) @ (T_od @ tilt)
         self.image = self.bridge.imgmsg_to_cv2(self.rgb, 'bgr8')
-        raw = self.bridge.imgmsg_to_cv2(self.depth, 'passthrough')
-        self.depth_image = raw.astype(np.float32) / (1000.0 if self.depth.encoding == '16UC1' else 1.0)
+        K_c = np.array(self.info.k, float).reshape(3, 3)
+        self.depth_image = self.register(depth_m, K_d, T_cd, K_c, self.image.shape[1], self.image.shape[0])
         self.processed = key
         self.ready_pub.publish(Bool(data=True))
         if self.mode == 'bin':
@@ -575,7 +757,7 @@ class PerceptionNode(Node):
     def process_bin(self):
         frame_area = self.image.shape[0]*self.image.shape[1]
         candidates = []
-        for box in colour_boxes(self.image, 'red', frame_area*self.get_parameter('bin_min_area_fraction').value):
+        for box in colour_boxes(self.image, 'red', frame_area*self.get_parameter('bin_min_area_fraction').value, books=False):
             x, y, w, h = box
             if w < 1.15*h:
                 continue
