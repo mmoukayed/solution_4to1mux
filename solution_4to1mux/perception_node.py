@@ -610,6 +610,11 @@ class PerceptionNode(Node):
         # so publish it only when two separated signs establish the shelf line.
         if reliable_normal:
             self.unit_pub.publish(self.make_pose(centre, heading))
+            last = getattr(self, 'logged_unit', None)
+            if last is None or np.linalg.norm(centre[:2]-last[0]) > 0.2 or abs(math.remainder(heading-last[1], 2*math.pi)) > 0.17:
+                self.logged_unit = (centre[:2].copy(), heading)
+                self.get_logger().info(f'Shelf line from markers {sorted(c[0] for c in candidates)}: centre '
+                                       f'({centre[0]:.2f}, {centre[1]:.2f}, {centre[2]:.2f}) facing {math.degrees(heading):.0f} deg')
         target = next((c for c in candidates if c[0] == self.target_column), None)
         if target is None:
             labels = sorted({candidate[0] for candidate in candidates})
