@@ -78,7 +78,7 @@ class NavigationNode(Node):
             # The fixed bin is normally behind the west-facing start pose;
             # begin its complete sweep counterclockwise.
             'bin_search_direction': 'left',
-            'phase_timeout': 90.0, 'grab_timeout': 120.0, 'place_timeout': 90.0,
+            'phase_timeout': 240.0, 'grab_timeout': 120.0, 'place_timeout': 90.0,
             'reading_max_age': 1.0,
             'book_standoff': 0.68, 'book_lateral_offset': -0.18,
             'bin_standoff': 0.95, 'bin_final_advance_max': 0.65, 'bin_min_distance': 0.90,
@@ -103,7 +103,7 @@ class NavigationNode(Node):
             'column_half_width': 0.43,
             'arm_stow_timeout': 20.0, 'arm_stow_settle_time': 9.0,
             'scan_half_width': 2.6, 'scan_step': 0.65, 'scan_observe_time': 1.0,
-            'docking_speed': 0.12, 'book_search_timeout': 8.0,
+            'docking_speed': 0.12, 'book_search_timeout': 20.0,
             'align_block_timeout': 3.0,
             'grasp_base_retreat': 0.25,
             # Keep a 3 cm buffer above the shelf keepout while returning to
@@ -113,7 +113,7 @@ class NavigationNode(Node):
             # bottom-row grasp needs this full straight withdrawal before that
             # pose is commanded, otherwise its elbow can still hit the shelf.
             'carry_raise_retreat': 0.80,
-            'max_book_recoveries': 2, 'head_scan_dwell': 1.4,
+            'max_book_recoveries': 2, 'head_scan_dwell': 3.0,
             'book_view_backoff': 0.35,
         }
         for key, value in defaults.items():
