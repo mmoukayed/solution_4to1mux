@@ -72,7 +72,7 @@ class ManipulationNode(Node):
             'motion_timeout_margin': 8.0, 'planning_timeout': 60.0,
             # The measured bin point is near the far half of its opening;
             # release 22 cm back toward the robot for a centred drop.
-            'bin_release_z': 1.10,  # the grasp point's height at release: the book hangs ~7 cm under it, the rim is at 0.95
+            'bin_release_z': 1.08,  # the grasp point's height at release: the book hangs ~7 cm under it, the rim is at 0.95
             'bin_inset': 0.20,  # aim this far short of the measured bin point (it reads ~0.12 m past the bin's centre)
              'bin_release_height': 0.21,
         }.items():
@@ -415,7 +415,9 @@ class ManipulationNode(Node):
             # past the bin's centre; its 0.56 m opening runs along the approach), then let go.
             release = point-normal*params['bin_inset']
             release[2] = params['bin_release_z']
-            targets = [('crane_high', release+np.array([0, 0, 0.18])), ('crane_hover', release)]
+            # come in over the rim from above and behind: straight above the release is past the
+            # fingers-down reach (IK failed at 0.18 m up, 0.76 m out with the torso at its 0.29 m top)
+            targets = [('crane_high', release-normal*0.12+np.array([0, 0, 0.10])), ('crane_hover', release)]
         elif sequence == 'finish_place':
             release = point-normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
             targets = [('lower_to_bin', release)]
