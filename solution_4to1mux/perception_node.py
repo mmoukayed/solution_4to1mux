@@ -428,10 +428,12 @@ class PerceptionNode(Node):
                 return None
             c = near.mean(axis=0)
         correction = expected-c
+        implied = T_oh[:3, :3].T @ (c-T_oh[:3, 3])
         if np.linalg.norm(correction) > 0.10:
-            self.get_logger().warn(f'Hand measurement {correction.round(3)} m is implausible; ignored.')
+            self.warn(f'Hand measurement {correction.round(3)} m is implausible; ignored '
+                      f'(gripper centroid in its frame {implied.round(3)}; hand_bias may need calibrating).')
             return None
-        return correction, T_oh[:3, :3].T @ (c-T_oh[:3, 3])
+        return correction, implied
 
     def on_mode(self, msg):
         self.mode = 'bin' if msg.data else 'shelf'
