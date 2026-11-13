@@ -139,6 +139,8 @@ def normalise_exposure(image, mean_lo=110, sd_lo=40):
     ref = (hsv[..., 1] < 90) & (gray > np.percentile(gray, 60))
     if ref.sum() < 500:
         ref = gray > np.percentile(gray, 80)
+    if ref.sum() < 50:
+        return image                    # a near-uniform frame: nothing to balance against
     m = f[ref].mean(axis=0)
     f = f*(m.mean()/np.maximum(m, 1))
     f = f*(235.0/max(np.percentile(f[ref].mean(axis=1), 90), 1))
