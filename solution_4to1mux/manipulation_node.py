@@ -225,7 +225,9 @@ class ManipulationNode(Node):
                     self.contacts[(book, side)] = self.now()
 
     def on_hand_offset(self, msg):
-        self.hand_corr = (np.array([msg.point.x, msg.point.y, msg.point.z]), self.now())
+        # height barely matters on a 0.29 m book, a grip near its bottom edge does: the book swung out of the
+        # fingers on the carry raise after a -5.2 cm vertical correction (twin m1 s23, bottom row)
+        self.hand_corr = (np.array([msg.point.x, msg.point.y, float(np.clip(msg.point.z, -0.02, 0.02))]), self.now())
 
     def held_book(self):
         if not self.finger_feedback:
