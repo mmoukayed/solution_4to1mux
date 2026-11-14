@@ -338,6 +338,9 @@ class ManipulationNode(Node):
                                 torso_target, duration)]
             self.next_phase()
             return
+        if sequence == 'prepare_grab':
+            self.hand_applied = False
+            self.prepare_args = (point.copy(), normal.copy(), params)
         self.phase = 'planning'
         self.deadline = self.now()+self.p('planning_timeout')
         self.plan_future = self.pool.submit(self.plan, sequence, point, normal, current, params)
@@ -490,8 +493,10 @@ class ManipulationNode(Node):
             if self.book_row == 1:
                 # Keep the solved pregrasp as the safe retreat if insertion fails.
                 self.retreat_target = motions[-1][2]
-                return [('open_gripper', 'open', None, 1.0)]+motions+[('measure_hand', 'measure', None, 5.0)]
-            return [('open_gripper', 'open', None, 1.0), motions[0], ('measure_hand', 'measure', None, 5.0)]
+                measure = [] if getattr(self, 'hand_applied', False) else [('measure_hand', 'measure', None, 5.0)]
+                return [('open_gripper', 'open', None, 1.0)]+motions+measure
+            measure = [] if getattr(self, 'hand_applied', False) else [('measure_hand', 'measure', None, 5.0)]
+            return [('open_gripper', 'open', None, 1.0), motions[0]]+measure
         if sequence == 'finish_grab':
             if self.book_row == 1:
                 if self.retreat_target is None:
@@ -660,6 +665,19 @@ class ManipulationNode(Node):
             return
         if self.phase == 'measure':
             if self.hand_corr is not None and self.hand_corr[1] >= self.phase_started:
+                if self.active == 'prepare_grab' and not getattr(self, 'hand_applied', True) \
+                        and np.linalg.norm(self.hand_corr[0]) > 0.005:
+                    # the hand's sideways position is set HERE (the base then drives it onto the book):
+                    # move the arm to the corrected pre-alignment before reporting the prepare done
+                    self.hand_applied = True
+                    point, normal, params = self.prepare_args
+                    current = np.array([self.joints[n] for n in self.model.names])
+                    self.get_logger().info(f'prepare_grab: re-aiming the pregrasp by the hand measurement {self.hand_corr[0].round(3)} m')
+                    self.phase = 'planning'
+                    self.phases = []
+                    self.deadline = self.now()+self.p('planning_timeout')
+                    self.plan_future = self.pool.submit(self.plan, 'prepare_grab', point+self.hand_corr[0], normal, current, params)
+                    return
                 self.next_phase()
             elif self.now()-self.phase_started > 5.0:
                 self.get_logger().warn('No hand measurement within 5 s: grasping on the camera estimate alone.')
