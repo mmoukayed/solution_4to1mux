@@ -621,6 +621,8 @@ class ManipulationNode(Node):
             self.gripper_pub.publish(self.trajectory([GRIPPER_JOINT], [value], duration))
             self.deadline = self.now()+self.p('gripper_timeout')
             self.contact_since = None
+        elif self.phase == 'verify' and not self.finger_feedback:
+            self.deadline = self.now()+9.0      # the visual grasp check answers within ~5 s
         elif self.phase == 'measure':
             self.hand_corr = None
             self.measure_pub.publish(Bool(data=True))
