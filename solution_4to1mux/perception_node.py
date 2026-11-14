@@ -589,13 +589,35 @@ class PerceptionNode(Node):
         raw = self.bridge.imgmsg_to_cv2(depth_msg, 'passthrough')
         depth_m = raw.astype(np.float32)/(1000.0 if depth_msg.encoding == '16UC1' else 1.0)
         self.measure_tilt(depth_m, K_d, T_od)
+        c, s_ = math.cos(self.head_tilt), math.sin(self.head_tilt)
+        tilt = np.eye(4)
+        tilt[1:3, 1:3] = [[c, -s_], [s_, c]]
+        self.camera_to_odom = transform_matrix(tf.transform) @ tilt
+        # depth -> colour through odom, each at its own stamp: the pair may be up to 0.6 s apart while
+        # the base turns, and a fixed depth->colour transform would smear every point by that motion
+        T_cd = np.linalg.inv(self.camera_to_odom) @ (T_od @ tilt)
+        self.image = self.bridge.imgmsg_to_cv2(self.rgb, 'bgr8')
+        K_c = np.array(self.info.k, float).reshape(3, 3)
+        self.depth_image = self.register(depth_m, K_d, T_cd, K_c, self.image.shape[1], self.image.shape[0])
         if self.get_clock().now().nanoseconds/1e9 < self.hand_until:
             c_, s__ = math.cos(self.head_tilt), math.sin(self.head_tilt)
             tilt_ = np.eye(4)
             tilt_[1:3, 1:3] = [[c_, -s__], [s__, c_]]
             m = self.measure_hand(depth_m, K_d, T_od @ tilt_, depth_stamp)
             if m is not None:
-                self.hand_samples.append(m)
+                # the book again, in this same frame and from this same distance (the camera's yaw error
+                # shifts things sideways in proportion to range: book at 1.8 m and hand at 0.6 m do not cancel)
+                shift = np.zeros(3)
+                if self.latest_book is not None and not self.target_text:
+                    best = None
+                    for (x, y, w, h) in colour_boxes(self.image, self.target_colour):
+                        q = self.point(x+w/2, y+h/2)
+                        if q is not None and np.linalg.norm(q[:2]-self.latest_book[:2]) < 0.15:
+                            if best is None or np.linalg.norm(q[:2]-self.latest_book[:2]) < np.linalg.norm(best[:2]-self.latest_book[:2]):
+                                best = q
+                    if best is not None:
+                        shift[:2] = best[:2]-self.latest_book[:2]
+                self.hand_samples.append((m[0]+shift, m[1]))
             if len(self.hand_samples) >= 4:
                 corr = np.median([a for a, _ in self.hand_samples], axis=0)
                 implied = np.median([b for _, b in self.hand_samples], axis=0)
@@ -613,16 +635,6 @@ class PerceptionNode(Node):
                     self.get_logger().info(f'Hand measured: grasp correction {corr_base.round(3)} m in the base frame '
                                            f'(gripper centroid in its frame {implied.round(3)}; hand_bias {self.get_parameter("hand_bias").value})')
                 self.hand_until = 0.0
-        c, s_ = math.cos(self.head_tilt), math.sin(self.head_tilt)
-        tilt = np.eye(4)
-        tilt[1:3, 1:3] = [[c, -s_], [s_, c]]
-        self.camera_to_odom = transform_matrix(tf.transform) @ tilt
-        # depth -> colour through odom, each at its own stamp: the pair may be up to 0.6 s apart while
-        # the base turns, and a fixed depth->colour transform would smear every point by that motion
-        T_cd = np.linalg.inv(self.camera_to_odom) @ (T_od @ tilt)
-        self.image = self.bridge.imgmsg_to_cv2(self.rgb, 'bgr8')
-        K_c = np.array(self.info.k, float).reshape(3, 3)
-        self.depth_image = self.register(depth_m, K_d, T_cd, K_c, self.image.shape[1], self.image.shape[0])
         self.processed = key
         self.ready_pub.publish(Bool(data=True))
         if self.mode == 'bin':
