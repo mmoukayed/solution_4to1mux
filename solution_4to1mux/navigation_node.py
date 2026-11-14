@@ -81,6 +81,7 @@ class NavigationNode(Node):
             'phase_timeout': 240.0, 'grab_timeout': 120.0, 'place_timeout': 90.0,
             'reading_max_age': 1.0,
             'book_standoff': 0.68, 'book_lateral_offset': -0.18,
+            'table_gap': 0.10,    # the base's front stops this far from the bin table's front legs
             'bin_standoff': 0.95, 'bin_final_advance_max': 0.65, 'bin_min_distance': 0.90,
             'bin_turn_backoff': 0.25, 'max_bin_turn_recoveries': 2, 'carry_turn_clearance': 0.85,
             'bin_turn_backoff_timeout': 8.0,
@@ -1198,11 +1199,24 @@ class NavigationNode(Node):
             # The LiDAR sees only the bin table's legs: stop by the bin's own measured pose too.
             bin_pose = self.observations.get('bin')
             too_close = False
+            # ...and by the table itself. The base fits under the table top but the arms do not: with the
+            # camera faults the bin blob read 11 cm short and the tucked left gripper hit the table's top rail
+            # (twin w8, the bin knocked 1.5 m). The nearest leg ahead is the table's front edge.
+            if len(self.scans) == 2 and all(self.fresh(v[0]) for v in self.scans.values()):
+                pts = np.concatenate([v[1] for v in self.scans.values()])
+                ahead = pts[(pts[:, 0] > 0.30) & (pts[:, 0] < 1.8) & (np.abs(pts[:, 1]) < 0.95)]
+                if len(ahead):
+                    gap = float(ahead[:, 0].min())-0.36
+                    if gap <= self.p('table_gap'):
+                        self.stop()
+                        too_close = True
+                        self.get_logger().info(f'Table edge {gap:.2f} m ahead of the base: placing from here.')
             if bin_pose is not None:
                 heading = np.array([math.cos(self.pose[2]), math.sin(self.pose[2])])
                 ahead = float((pose_xyz(bin_pose)[:2]-self.pose[:2]) @ heading)
-                too_close = ahead < self.p('bin_min_distance')
-                if too_close:
+                blob_close = ahead < self.p('bin_min_distance')
+                too_close = too_close or blob_close
+                if blob_close:
                     self.stop()
                     self.get_logger().info(f'Bin {ahead:.2f} m ahead: closest allowed, placing from here.')
             if too_close or self.drive_forward_to(self.goal):
