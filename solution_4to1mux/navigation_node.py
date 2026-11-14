@@ -1126,6 +1126,16 @@ class NavigationNode(Node):
                     self.transition(State.RETURN_FOR_GRAB)
         elif self.state == State.RETURN_FOR_GRAB:
             arrived = self.drive_to(self.goal, keep_heading=True)
+            # held a few cm short by an obstacle-clearance gate (a neighbouring divider or book; twin m4 s3: 0.04 m
+            # short for 240 s): the arm reaches the frozen book pose from there, odom knows where the base stopped
+            held = (not arrived and str(self.last_gate).startswith('obstacle_clearance') and
+                    float(np.linalg.norm(self.goal[:2]-self.pose[:2])) < 0.08)
+            self.return_held_since = (getattr(self, 'return_held_since', None) or self.now()) if held else None
+            if held and self.now()-self.return_held_since > 3.0:
+                self.get_logger().warn(f'Return-to-grab held {np.linalg.norm(self.goal[:2]-self.pose[:2]):.2f} m short '
+                                       f'by {self.last_gate}: grabbing from here.')
+                self.return_held_since = None
+                arrived = True
             if arrived or self.shelf_limited_return_arrived(self.goal):
                 if not arrived:
                     self.get_logger().warn('Return-to-grab stopped by the shelf keepout at the safe boundary; starting the compensated arm close.')
