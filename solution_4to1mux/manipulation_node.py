@@ -312,6 +312,13 @@ class ManipulationNode(Node):
         target_age = (self.p('placement_target_max_age') if sequence in ('place', 'prepare_place', 'finish_place')
                       else self.p('finish_grab_target_max_age') if sequence == 'finish_grab'
                       else self.p('target_max_age'))
+        if sequence == 'finish_place' and self.p('place_torso_drop') < 0.01:
+            # the release is only "open the gripper": the hand may hide the bin from the camera by now
+            self.active = sequence
+            self.token += 1
+            self.phases = [('release_book', 'open', None, 1.0), ('verify_delivery', 'delivery', None, 3.0)]
+            self.next_phase()
+            return
         if target is None or target.header.frame_id != self.ros.frames['odom'] or not self.fresh(Time.from_msg(target.header.stamp).nanoseconds/1e9, target_age):
             self.report(sequence, False, f'No fresh target pose in {self.ros.frames["odom"]}; inspect RGB-D perception.')
             return
@@ -442,8 +449,8 @@ class ManipulationNode(Node):
                 normal = np.array([1.0, 0.0, 0.0])
                 release = np.array([params['bin_release_x'], point[1], 0.0])
             release[2] = params['bin_release_z']
-            # come in over the rim from above and behind: straight above the release is past the
-            # fingers-down reach (IK failed at 0.18 m up, 0.76 m out with the torso at its 0.29 m top)
+            # solved and reached before the base drives in (the table out of reach); fixed in the base frame, so
+            # wherever the table-edge stop halts the base the hand ends 0.78 m ahead of it
             targets = [('crane_high', release-normal*0.12+np.array([0, 0, 0.10])), ('crane_hover', release)]
         elif sequence == 'finish_place':
             release = point-normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])

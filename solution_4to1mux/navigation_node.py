@@ -1184,7 +1184,12 @@ class NavigationNode(Node):
                 advance = float(np.clip(distance-self.p('bin_standoff'), 0.0,
                                          self.p('bin_final_advance_max')+self.bin_turn_retreat_total))
                 self.goal = np.r_[self.pose[:2]+advance*heading, self.pose[2]]
-                self.transition(State.APPROACH_BIN_FOR_PLACE)
+                # swing the arm into the drop pose HERE, with the table out of its reach: from the carry pose the
+                # joint-space swing dips the wrist to 0.62 m and the elbow to 0.76 m in front of the robot (table top
+                # 0.72), and they hit the table and the bin (twin w10). The base then drives in with the arm still.
+                self.result = None
+                self.transition(State.WAIT_FOR_PLACE_PREP)
+                self.prepare_place_pub.publish(Bool(data=True))
             elif self.last_gate == 'turning_envelope_blocked':
                 self.back_out_for_bin_turn()
         elif self.state == State.BACK_OUT_FOR_BIN_TURN:
@@ -1221,16 +1226,15 @@ class NavigationNode(Node):
                     self.get_logger().info(f'Bin {ahead:.2f} m ahead: closest allowed, placing from here.')
             if too_close or self.drive_forward_to(self.goal):
                 self.result = None
-                self.transition(State.WAIT_FOR_PLACE_PREP)
-                self.prepare_place_pub.publish(Bool(data=True))
+                self.transition(State.WAIT_FOR_PLACE)
+                self.finish_place_pub.publish(Bool(data=True))
         elif self.state == State.WAIT_FOR_PLACE_PREP:
             self.stop()
             if self.result is False:
                 self.fail(f'Bin hover failed: {self.manip_failure or self.ros.topics["manipulation_failure"]}')
             elif self.result is True:
                 self.result = None
-                self.transition(State.WAIT_FOR_PLACE)
-                self.finish_place_pub.publish(Bool(data=True))
+                self.transition(State.APPROACH_BIN_FOR_PLACE)
         elif self.state == State.WAIT_FOR_PLACE:
             self.stop()
             if self.result is False:
