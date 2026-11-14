@@ -72,6 +72,7 @@ class ManipulationNode(Node):
             'motion_timeout_margin': 8.0, 'planning_timeout': 60.0,
             # The measured bin point is near the far half of its opening;
             # release 22 cm back toward the robot for a centred drop.
+            'bin_release_x': 0.78,  # base frame, with the base stopped by the table edge; <= 0 to use the bin pose
             'bin_release_z': 1.08,  # the grasp point's height at release: the book hangs ~7 cm under it, the rim is at 0.95
             'bin_inset': 0.20,  # aim this far short of the measured bin point (it reads ~0.12 m past the bin's centre)
              'bin_release_height': 0.21,
@@ -336,7 +337,7 @@ class ManipulationNode(Node):
         if sequence != 'finish_grab':
             self.retreat_target = None
         current = np.array([self.joints[n] for n in self.model.names])
-        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'top_book_clearance_height', 'top_book_front_standoff', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'place_torso_drop', 'bin_inset', 'bin_release_height', 'bin_release_z')}
+        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'top_book_clearance_height', 'top_book_front_standoff', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'place_torso_drop', 'bin_inset', 'bin_release_height', 'bin_release_z', 'bin_release_x')}
         self.deferred_plan = None
         self.phases = []
         if sequence == 'prepare_grab' and self.book_row == 1:
@@ -434,6 +435,12 @@ class ManipulationNode(Node):
             # above the floor and short of the measured bin point (the red blob's depth reads ~12 cm
             # past the bin's centre; its 0.56 m opening runs along the approach), then let go.
             release = point-normal*params['bin_inset']
+            if params['bin_release_x'] > 0:
+                # the base stops 0.10 m short of the bin table's front legs (LiDAR), so the bin's centre sits at
+                # a fixed ~0.86 m: release there, 8 cm short of it. The red blob's range is not usable for this
+                # (under the camera faults it read 0.85 in one run and 1.05 in the next); its bearing is.
+                normal = np.array([1.0, 0.0, 0.0])
+                release = np.array([params['bin_release_x'], point[1], 0.0])
             release[2] = params['bin_release_z']
             # come in over the rim from above and behind: straight above the release is past the
             # fingers-down reach (IK failed at 0.18 m up, 0.76 m out with the torso at its 0.29 m top)
