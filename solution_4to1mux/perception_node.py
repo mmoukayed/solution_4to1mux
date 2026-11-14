@@ -282,6 +282,10 @@ class PerceptionNode(Node):
         
         self.create_subscription(Bool, topics['looking_for_bin'], self.on_mode, 10)
         self.create_subscription(Bool, topics['measure_hand'], self.on_measure_hand, 10)
+        self.create_subscription(Bool, topics['check_held'], self.on_check_held, 10)
+        self.held_pub = self.create_publisher(Bool, topics['book_held'], 10)
+        self.held_until = 0.0
+        self.held_votes = []
         self.hand_pub = self.create_publisher(PointStamped, topics['hand_offset'], 10)
         self.hand_until = 0.0
         self.hand_samples = []
@@ -434,6 +438,26 @@ class PerceptionNode(Node):
                       f'(gripper centroid in its frame {implied.round(3)}; hand_bias may need calibrating).')
             return None
         return correction, implied
+
+    def on_check_held(self, msg):
+        if msg.data:
+            self.held_until = self.get_clock().now().nanoseconds/1e9+4.0
+            self.held_votes = []
+
+    def book_at_hand(self, stamp):
+        """Is a book of the target colour within 18 cm of the grasp point (the fingers)? None when the
+        hand's pose is unknown."""
+        try:
+            T_oh = transform_matrix(self.tf.lookup_transform(self.ros.frames['odom'], self.get_parameter('hand_frame').value,
+                                                             stamp, timeout=Duration(seconds=0.05)).transform)
+        except TransformException:
+            return None
+        grasp = T_oh[:3, :3] @ np.array([0.0, 0.0, 0.157]) + T_oh[:3, 3]
+        for (x, y, w, h) in colour_boxes(self.image, self.target_colour, books=False):
+            q = self.point(x+w/2, y+h/2)
+            if q is not None and np.linalg.norm(q-grasp) < 0.18:
+                return True
+        return False
 
     def on_mode(self, msg):
         self.mode = 'bin' if msg.data else 'shelf'
@@ -599,6 +623,16 @@ class PerceptionNode(Node):
         self.image = self.bridge.imgmsg_to_cv2(self.rgb, 'bgr8')
         K_c = np.array(self.info.k, float).reshape(3, 3)
         self.depth_image = self.register(depth_m, K_d, T_cd, K_c, self.image.shape[1], self.image.shape[0])
+        if self.get_clock().now().nanoseconds/1e9 < self.held_until and not self.target_text:
+            vote = self.book_at_hand(stamp)
+            if vote is not None:
+                self.held_votes.append(vote)
+            if len(self.held_votes) >= 3:
+                held = sum(self.held_votes) >= 2
+                self.held_pub.publish(Bool(data=held))
+                self.get_logger().info(f'Grasp check: book at the hand in {sum(self.held_votes)}/{len(self.held_votes)} frames -> '
+                                       f'{"held" if held else "NOT held"}')
+                self.held_until = 0.0
         if self.get_clock().now().nanoseconds/1e9 < self.hand_until:
             c_, s__ = math.cos(self.head_tilt), math.sin(self.head_tilt)
             tilt_ = np.eye(4)

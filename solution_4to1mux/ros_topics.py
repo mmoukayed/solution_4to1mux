@@ -61,6 +61,10 @@ TOPICS = {
     # The auto-calibrated grasp: manipulation asks perception to measure the hand at the pregrasp.
     'measure_hand': '/perception/measure_hand',
     'hand_offset': '/perception/hand_offset',
+    # The right gripper has no usable feedback on the robot (finger position read 0 all session on 6 Nov,
+    # effort NaN, no contacts): perception confirms a grasp by seeing the book at the hand.
+    'check_held': '/perception/check_held',
+    'book_held': '/perception/book_held',
 
     # Navigation and manipulation exchange.
     'manipulation_ready': '/manipulation/ready',

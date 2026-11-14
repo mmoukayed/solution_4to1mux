@@ -117,6 +117,11 @@ class ManipulationNode(Node):
         for name in ('book', 'bin'):
             self.create_subscription(PoseStamped, topics[f'{name}_pose'], lambda m, n=name: self.targets.update({n: m}), 10)
         self.measure_pub = self.create_publisher(Bool, topics['measure_hand'], 10)
+        self.check_held_pub = self.create_publisher(Bool, topics['check_held'], 10)
+        self.seen_held = None           # (held?, when) from perception's grasp check
+        self.create_subscription(Bool, topics['book_held'], lambda m: setattr(self, 'seen_held', (m.data, self.now())), 10)
+        # the robot's right finger position is dead (read 0 all session, 6 Nov): no position feedback there
+        self.finger_feedback = self.ros.profile != 'real'
         self.hand_corr = None           # (correction in base_footprint, when) from the hand measurement
         self.create_subscription(PointStamped, topics['hand_offset'], self.on_hand_offset, 10)
         self.create_subscription(Bool, topics['request_grab'], lambda m: self.request('grab') if m.data else None, 10)
@@ -215,6 +220,8 @@ class ManipulationNode(Node):
         self.hand_corr = (np.array([msg.point.x, msg.point.y, msg.point.z]), self.now())
 
     def held_book(self):
+        if not self.finger_feedback:
+            return self.holding_book          # decided by the timed close and the visual check
         if self.ros.topics['contacts'] is None:
             # The live robot has no contact topic: the fingers held still for 0.5 s, stopped
             # clearly short of fully shut (0.79) and clearly closed from open (0.0), is a book.
@@ -347,6 +354,9 @@ class ManipulationNode(Node):
         if sequence == 'prepare_grab':
             self.hand_applied = False
             self.prepare_args = (point.copy(), normal.copy(), params)
+        if sequence == 'finish_grab':
+            self.finish_args = (point.copy(), normal.copy(), params)
+            self.grasp_retries = 0
         self.phase = 'planning'
         self.deadline = self.now()+self.p('planning_timeout')
         self.plan_future = self.pool.submit(self.plan, sequence, point, normal, current, params)
@@ -703,12 +713,20 @@ class ManipulationNode(Node):
                           'without bilateral contact, the fingers closed beside/in front of the '
                           'book; if it stayed open, inspect the gripper trajectory controller '
                           f'and {self.ros.topics["joint_states"]}.')
+            closed = self.joints.get(GRIPPER_JOINT)
+            if (self.phase == 'close' and self.finger_feedback and closed is not None
+                    and abs(closed-self.p('gripper_closed')) < 0.05
+                    and self.retry_grasp('the fingers closed on nothing')):
+                return
             self.abort(f'{self.phase}: timed out.{detail} Check controller feedback, contacts, target pose and Gazebo.')
             return
         if self.phase == 'planning':
             if self.plan_future.done():
                 try:
                     self.phases = self.plan_future.result()
+                    if getattr(self, 'retry_open', False):
+                        self.retry_open = False
+                        self.phases = [('open_gripper', 'open', None, 1.0)]+self.phases
                     if self.active == 'prepare_place':
                         hover = next((phase[2] for phase in reversed(self.phases)
                                       if phase[1] == 'motion'), None)
@@ -729,6 +747,10 @@ class ManipulationNode(Node):
         elif self.phase == 'open':
             if self.fresh(self.joint_stamp) and abs(self.joints.get(GRIPPER_JOINT, -1)-self.p('gripper_open')) < 0.006 and self.now()-self.phase_started > 0.8:
                 self.next_phase()
+        elif self.phase == 'close' and not self.finger_feedback:
+            if self.now()-self.phase_started > 2.5:
+                self.holding_book = 'assumed_by_timed_close'
+                self.next_phase()
         elif self.phase == 'close':
             # This is a position trajectory. Once the one close trajectory
             # finishes, the controller holds its target; republishing a shorter
@@ -742,6 +764,18 @@ class ManipulationNode(Node):
                     self.next_phase()
             else:
                 self.contact_since = None
+        elif self.phase == 'verify' and not self.finger_feedback:
+            if self.now()-self.phase_started < 0.3:
+                self.seen_held = None
+                self.check_held_pub.publish(Bool(data=True))
+            elif self.seen_held is not None and self.seen_held[1] >= self.phase_started:
+                if self.seen_held[0]:
+                    self.next_phase()
+                elif not self.retry_grasp('the book is not at the hand after the lift'):
+                    self.abort('Book not at the hand after the lift and the side retries; grasp not confirmed.')
+            elif self.now()-self.phase_started > 5.0:
+                self.get_logger().warn('No grasp check from perception: assuming the book is held.')
+                self.next_phase()
         elif self.phase == 'verify':
             if self.now()-self.phase_started > 0.5:
                 if self.held_book() == self.holding_book:
@@ -757,6 +791,27 @@ class ManipulationNode(Node):
             elif self.bin_contact_stamp is not None and self.bin_contact_stamp >= self.phase_started-1.5:
                 self.holding_book = None
                 self.next_phase()
+
+    def retry_grasp(self, why):
+        """A missed grasp leaves the book standing a centimetre or two to the side (what is left of the
+        camera's colour-vs-depth error): reopen and reach again a little to each side. False when spent."""
+        offsets = (0.012, -0.012, 0.024, -0.024)
+        if self.active != 'finish_grab' or getattr(self, 'finish_args', None) is None or self.grasp_retries >= len(offsets):
+            return False
+        point, normal, params = self.finish_args
+        offset = offsets[self.grasp_retries]
+        self.grasp_retries += 1
+        side = np.array([-normal[1], normal[0], 0.0])
+        current = np.array([self.joints[n] for n in self.model.names])
+        self.get_logger().warn(f'finish_grab: {why}; retry {self.grasp_retries}/{len(offsets)} {offset*100:+.1f} cm to the side.')
+        self.holding_book = None
+        self.gripper_pub.publish(self.trajectory([GRIPPER_JOINT], [self.p('gripper_open')], 1.0))
+        self.retry_open = True
+        self.phase = 'planning'
+        self.phases = []
+        self.deadline = self.now()+self.p('planning_timeout')+2.0
+        self.plan_future = self.pool.submit(self.plan, 'finish_grab', point+side*offset, normal, current, params)
+        return True
 
     def abort(self, reason):
         sequence = self.active
