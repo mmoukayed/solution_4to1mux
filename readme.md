@@ -67,9 +67,33 @@ What the `feat/thisas_fixes` branch changed for the live robot (each is its own 
   bin's measured position (the LiDAR only sees the table's legs);
 - the final grab uses the last book pose when the hand hides the book from the camera.
 
-Known open problem: the drop. The book is carried flat and sticks ~0.2 m out of the hand; from
-the safe 0.95 m standoff it lands on the bin's rim. It needs the book turned end-down and
-lowered into the bin before release.
+### Slot run sheet (state of `feat/thisas_fixes`, 14 Nov)
+
+Before launching, check the robot is really there (the nodes otherwise just wait):
+
+```bash
+ros2 topic hz /joint_states            # steady ~50 Hz
+ros2 topic list | grep /erc/           # the /erc/..._controller topics
+ros2 topic hz /head_front_camera/color/image_raw
+```
+
+Then:
+
+```bash
+scripts/run_trial.sh robot_profile:=real shelf_column_number:=3 book_colour:=green
+# long shelf on open floor (column at its far end): add scan_half_width:=2.6
+```
+
+What to expect (Isaac twin, every measured real-robot fault on):
+
+- **middle rows**: pick, carry and drop into the bin work (clean passes in hall and platform layouts);
+  the drop is fingers-down from above the bin, the base stops 0.10 m from the table legs by LiDAR;
+- **top row**: refused on purpose. Every arm path from the dock crosses the board below the target bay, so
+  the plan is rejected before anything moves (`top-row path puts ... through the shelf face`): no points,
+  no shelf contact;
+- **bottom row**: unreliable (missed grasps, one book slipped in the carry);
+- the grasp is confirmed by the camera (the right finger sensor reads 0 on the robot): up to 4 side retries;
+- a failed run stops in `FAILED` with the reason on `/solution/failure`. Keep a hand on the e-stop.
 
 ## More
 

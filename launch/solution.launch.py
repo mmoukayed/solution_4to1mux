@@ -38,6 +38,9 @@ def generate_launch_description():
         'book_search_timeout': ('20.0', float),
         'max_book_recoveries': ('2', int),
         'book_view_backoff': ('0.35', float),
+        # how far either side of the shelf numbers the column sweep goes: 1.3 keeps it on a small platform,
+        # a long shelf on open floor needs ~2.6 to reach its end columns
+        'scan_half_width': ('1.3', float),
     }
     params = {name: ParameterValue(LaunchConfiguration(name), value_type=kind)
               for name, (_, kind) in arguments.items()}
@@ -69,7 +72,7 @@ def generate_launch_description():
             node('perception_node', ['shelf_column_number', 'book_colour', 'book_text', 'perception_rate',
                                      'marker_min_height', 'marker_max_height', 'top_book_marker_offset',
                                      'row_spacing', 'column_half_width']),
-            node('navigation_node', ['shelf_column_number', 'linear_speed', 'strafe_speed',
+            node('navigation_node', ['shelf_column_number', 'scan_half_width', 'linear_speed', 'strafe_speed',
                                     'rotate_speed', 'search_rotate_speed', 'search_direction',
                                     'book_standoff', 'book_lateral_offset', 'grab_timeout',
                                     'place_timeout', 'phase_timeout', 'docking_speed',
