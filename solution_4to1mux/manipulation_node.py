@@ -66,7 +66,7 @@ class ManipulationNode(Node):
             # target is compensated while the base is still before the table.
             'place_base_advance': 0.35, 'place_clearance_height': 0.20,
             'place_torso_hover': 0.35, 'place_torso_drop': 0.0,
-            'target_max_age': 2.0, 'finish_grab_target_max_age': 120.0,  # the book pose is frozen at prepare_grab 'gripper_timeout': 8.0,
+            'target_max_age': 2.0, 'finish_grab_target_max_age': 120.0, 'gripper_timeout': 8.0,  # finish_grab reuses the book pose frozen at prepare_grab
             'placement_target_max_age': 30.0,
             'grip_contact_hold': 1.0,
             'motion_timeout_margin': 8.0, 'planning_timeout': 60.0,
