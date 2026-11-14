@@ -225,10 +225,9 @@ class ManipulationNode(Node):
                     self.contacts[(book, side)] = self.now()
 
     def on_hand_offset(self, msg):
-        # the height comes from the book itself (camera: within 1-4 cm of the true centre on every twin run); the
-        # hand's vertical reading is biased when the head looks steeply down at the gripper (lower rows: -2 to
-        # -6.5 cm, the grasp ended below the book centre and the wrist met the board under it, twin m7 s37)
-        self.hand_corr = (np.array([msg.point.x, msg.point.y, 0.0]), self.now())
+        # all three axes: on the real robot the camera reads book heights ~10 cm off (slot 14 Nov) and the hand,
+        # seen through the same camera, is what cancels it (zeroing z sent the arm a board too high)
+        self.hand_corr = (np.array([msg.point.x, msg.point.y, msg.point.z]), self.now())
 
     def held_book(self):
         if not self.finger_feedback:
