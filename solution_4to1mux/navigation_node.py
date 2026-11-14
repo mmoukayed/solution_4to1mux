@@ -681,13 +681,19 @@ class NavigationNode(Node):
                 tilt = math.atan2(p[2]-0.25, max(math.hypot(p[0], p[1]), 0.1))
             except TransformException:
                 pass
-        tilt = float(np.clip(tilt, -0.9, 0.30))
+        # /erc rejects a head_2 goal within 0.05 of its 0.3491 limit: 0.30 was rejected (twin, 4 runs)
+        tilt = float(np.clip(tilt, -0.9, 0.29))
         if self.last_head is not None and abs(self.last_head-tilt) < 0.04:
             return
         if self.head_pub.get_subscription_count() == 0:
             return
         # the /erc checker rejects head_2 faster than 0.5 rad/s: size the move at 0.35 rad/s
         travel = abs(tilt-self.last_head) if self.last_head is not None else 1.2
+        # the pan returns to 0 in the same goal: size by the measured travel of both joints (a pan swing alone
+        # went 0.53 rad/s against the 0.5 cap, twin m1)
+        pan, cur_tilt = self.arm_joints.get('head_1_joint'), self.arm_joints.get('head_2_joint')
+        if pan is not None and cur_tilt is not None:
+            travel = max(travel, abs(pan), abs(tilt-cur_tilt))
         duration = max(1.0, travel/0.35)
         self.last_head = tilt
         msg = JointTrajectory()
