@@ -69,12 +69,21 @@ What the `feat/thisas_fixes` branch changed for the live robot (each is its own 
 
 ### Slot run sheet (state of `feat/thisas_fixes`, 14 Nov)
 
-Before launching, check the robot is really there (the nodes otherwise just wait):
+Inside the ERC container (`source /opt/ros/humble/setup.bash && source install/setup.bash`), with the
+DDS bridge up:
 
 ```bash
-ros2 topic hz /joint_states            # steady ~50 Hz
-ros2 topic list | grep /erc/           # the /erc/..._controller topics
-ros2 topic hz /head_front_camera/color/image_raw
+python3 scripts/preflight.py      # listens 8 s: every topic the nodes use, its rate and timestamp age,
+                                  # the /erc controllers, the URDF, TF. Must end in READY.
+```
+
+A clock offset between the laptop and the robot shows up as a large "stamp age": fix it before running
+(the nodes judge a pose's freshness by its timestamp).
+
+Second terminal, same container - record every try, stop with Ctrl-C after it:
+
+```bash
+scripts/record.sh try1            # -> bags/<date>_<time>_try1 (mcap, ~2 MB/s; --light without depth)
 ```
 
 Then:
