@@ -617,10 +617,11 @@ class PerceptionNode(Node):
                                 best = q
                     if best is not None:
                         shift[:2] = best[:2]-self.latest_book[:2]
-                self.hand_samples.append((m[0]+shift, m[1]))
+                self.hand_samples.append((m[0]+shift, m[1], shift))
             if len(self.hand_samples) >= 4:
-                corr = np.median([a for a, _ in self.hand_samples], axis=0)
-                implied = np.median([b for _, b in self.hand_samples], axis=0)
+                corr = np.median([a for a, _, _ in self.hand_samples], axis=0)
+                implied = np.median([b for _, b, _ in self.hand_samples], axis=0)
+                book_shift = np.median([c for _, _, c in self.hand_samples], axis=0)
                 try:
                     R = transform_matrix(self.tf.lookup_transform(self.ros.frames['base'], target_frame, Time()).transform)[:3, :3]
                 except TransformException:
@@ -633,6 +634,7 @@ class PerceptionNode(Node):
                     msg.point.x, msg.point.y, msg.point.z = (float(v) for v in corr_base)
                     self.hand_pub.publish(msg)
                     self.get_logger().info(f'Hand measured: grasp correction {corr_base.round(3)} m in the base frame '
+                                           f'(of which the book re-measured beside the hand: {(R @ book_shift).round(3)}) '
                                            f'(gripper centroid in its frame {implied.round(3)}; hand_bias {self.get_parameter("hand_bias").value})')
                 self.hand_until = 0.0
         self.processed = key
