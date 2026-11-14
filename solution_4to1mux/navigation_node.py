@@ -512,6 +512,9 @@ class NavigationNode(Node):
             self.arm_stow_last = None
         if state == State.RETURN_TO_START:
             self.return_detour_side = 0
+            # the lower-row dock raised the shelf keep-out to 0.84 m; left in force it blocks the bin approach
+            # wherever the table stands within that of the shelf's line (twin m6 s37: held 0.81 m for 240 s)
+            self.active_shelf_keepout_distance = self.p('shelf_keepout_distance')
         self.state_pub.publish(String(data=state.name))
         self.get_logger().info(f'-> {state.name}')
         if state in (State.FIND_SHELF, State.FIND_BIN):
