@@ -38,6 +38,7 @@ def entity_name(value):
     return value if isinstance(value, str) else getattr(value, 'name', '')
 
 
+
 class ManipulationNode(Node):
     def __init__(self):
         super().__init__('manipulation_node')
@@ -179,6 +180,12 @@ class ManipulationNode(Node):
             try:
                 self.model = ArmKinematics(msg.data, base=self.ros.frames['base'],
                                            tip=self.ros.frames['arm_tip'])
+                self.link_models = []
+                for link in ('arm_right_3_link', 'arm_right_4_link', 'arm_right_5_link', 'arm_right_6_link'):
+                    try:
+                        self.link_models.append(ArmKinematics(msg.data, base=self.ros.frames['base'], tip=link))
+                    except Exception:
+                        pass
                 self.get_logger().info(f'Loaded right-arm/torso kinematics and limits from {self.ros.topics["robot_description"]}.')
                 try:
                     self.base_to_grasp = self.model.fixed_transform(
@@ -280,6 +287,7 @@ class ManipulationNode(Node):
     def request(self, sequence):
         if self.active:
             return
+        self.pending_request = None
         issues = self.readiness_issues()
         if issues:
             self.report(sequence, False, 'Readiness blocked: '+'; '.join(issues)+'.')
@@ -319,7 +327,25 @@ class ManipulationNode(Node):
             self.phases = [('release_book', 'open', None, 1.0), ('verify_delivery', 'delivery', None, 3.0)]
             self.next_phase()
             return
-        if target is None or target.header.frame_id != self.ros.frames['odom'] or not self.fresh(Time.from_msg(target.header.stamp).nanoseconds/1e9, target_age):
+        stale = (target is None or target.header.frame_id != self.ros.frames['odom'] or
+                 not self.fresh(Time.from_msg(target.header.stamp).nanoseconds/1e9, target_age))
+        if stale and sequence == 'prepare_grab':
+            # robot_worst: depth stalls at 0.3 Hz for a minute and the camera drops to 1/4 rate, so the book pose
+            # can be a few s old at the moment of asking (twin m2 s13). Wait for a fresh one; the base is parked,
+            # so a pose up to 8 s old is still the book.
+            first = getattr(self, 'target_wait_since', None) or self.now()
+            self.target_wait_since = first
+            waited = self.now()-first
+            old_ok = (target is not None and target.header.frame_id == self.ros.frames['odom'] and
+                      self.fresh(Time.from_msg(target.header.stamp).nanoseconds/1e9, 8.0))
+            if waited < 12.0 and not (waited > 6.0 and old_ok):
+                self.pending_request = sequence
+                return
+            stale = not old_ok
+            if not stale:
+                self.grab_target = target
+        self.target_wait_since = None
+        if stale:
             self.report(sequence, False, f'No fresh target pose in {self.ros.frames["odom"]}; inspect RGB-D perception.')
             return
         try:
@@ -478,6 +504,10 @@ class ManipulationNode(Node):
         # the calibrated upright carry pose, so try quarter turns as well.
         placing = sequence in ('place', 'prepare_place', 'finish_place')
         rolls = (0.0, math.pi, math.pi/2, -math.pi/2) if placing else (math.pi, 0.0)
+        top_grasp = sequence in ('prepare_grab', 'finish_grab') and self.book_row == 1
+        # top row, torso up: the IK branch reaches in elbow-down and the elbow and forearm cross the shelf face at
+        # the board below the target bay (twin m2 s21: arm 4/5/6 on boards 5 and 6 on every insert). No elbow-up
+        # path from the dock stow was found offline, so such a plan is refused (fail without touching the shelf).
         for roll in rolls:
             grasp_sequence = sequence in ('grab', 'prepare_grab', 'finish_grab')
             # placing: the approach axis straight down (rolls 0/pi lay the book's long side along the approach)
@@ -519,6 +549,8 @@ class ManipulationNode(Node):
                 # complete path with the least estimated joint travel time,
                 # rather than accepting the first roll that happens to solve.
                 # placing: prefer the rolls that keep the book's long side along the bin's long axis
+                if top_grasp:
+                    self.check_shelf_clear(current, [step[2] for step in candidate], point)
                 penalty = 100.0 if placing and abs(math.sin(roll)) > 0.5 else 0.0
                 candidates.append((sum(step[3] for step in candidate)+penalty, candidate))
             except ValueError as error:
@@ -649,7 +681,7 @@ class ManipulationNode(Node):
             self.deadline = self.now()+self.p('gripper_timeout')
             self.contact_since = None
         elif self.phase == 'verify' and not self.finger_feedback:
-            self.deadline = self.now()+9.0      # the visual grasp check answers within ~5 s
+            self.deadline = self.now()+18.0     # the visual grasp check answers within ~5 s, longer in a depth stall
         elif self.phase == 'measure':
             self.hand_corr = None
             self.measure_pub.publish(Bool(data=True))
@@ -704,6 +736,8 @@ class ManipulationNode(Node):
     def tick(self):
         self.ready_pub.publish(Bool(data=self.ready()))
         self.holding_pub.publish(Bool(data=bool(self.holding_book and self.held_book() == self.holding_book)))
+        if self.active is None and getattr(self, 'pending_request', None):
+            self.request(self.pending_request)
         if self.active is None:
             if not self.ready() and self.now()-self.warned_at > 5.0:
                 self.warned_at = self.now()
@@ -802,9 +836,13 @@ class ManipulationNode(Node):
                     self.next_phase()
                 elif not self.retry_grasp('the book is not at the hand after the lift'):
                     self.abort('Book not at the hand after the lift and the side retries; grasp not confirmed.')
-            elif self.now()-self.phase_started > 5.0:
+            elif self.now()-self.phase_started > 15.0:
                 self.get_logger().warn('No grasp check from perception: assuming the book is held.')
                 self.next_phase()
+            elif int(self.now()-self.phase_started) % 4 == 3 and getattr(self, 'held_asked', -1) != int(self.now()-self.phase_started):
+                # depth stalls (robot_worst: 0.3 Hz for a minute) leave the check unanswered: ask again
+                self.held_asked = int(self.now()-self.phase_started)
+                self.check_held_pub.publish(Bool(data=True))
         elif self.phase == 'verify':
             if self.now()-self.phase_started > 0.5:
                 if self.held_book() == self.holding_book:
@@ -820,6 +858,22 @@ class ManipulationNode(Node):
             elif self.bin_contact_stamp is not None and self.bin_contact_stamp >= self.phase_started-1.5:
                 self.holding_book = None
                 self.next_phase()
+
+    def check_shelf_clear(self, start, path, point):
+        """Top row: no arm link (shoulder to wrist) may cross the shelf face outside the target's bay, at the
+        waypoints or along the joint-space moves between them. `point` is the book's front in the base frame."""
+        face = float(point[0])-0.06
+        low, high = float(point[2])-0.13, float(point[2])+0.14
+        prev = np.asarray(start, float)
+        for q in path:
+            for t in np.linspace(0.0, 1.0, 9):
+                qq = prev+(q-prev)*t
+                for m in getattr(self, 'link_models', []):
+                    p = m.fk(qq[:len(m.names)])[:3, 3]
+                    if p[0] > face and not low < p[2] < high:
+                        raise ValueError(f'top-row path puts {m.tip if hasattr(m, "tip") else "an arm link"} at '
+                                         f'{p.round(2).tolist()} through the shelf face (x {face+0.06:.2f})')
+            prev = q
 
     def retry_grasp(self, why):
         """A missed grasp leaves the book standing a centimetre or two to the side (what is left of the
