@@ -411,8 +411,9 @@ class ManipulationNode(Node):
             grasp = point+normal*params['grasp_insert_depth']
             lifted = grasp+np.array([0, 0, params['lift_distance']])
             extracted = lifted-normal*params['extract_distance']
-            targets = ([('insert', grasp), ('lift', lifted), ('extract', extracted)]
-                       if self.book_row == 1 else [('lift', lifted), ('extract', extracted)])
+            # every row inserts with the arm: the base's return advance can stop short at the shelf keep-out
+            # (twin: 0.22 of 0.28 m), leaving the fingers only 2.5 cm past the spine if the base alone inserts
+            targets = [('insert', grasp), ('lift', lifted), ('extract', extracted)]
         elif sequence == 'prepare_place':
             # Perception's bin normal points from the camera/robot toward the
             # bin. Move against it to centre the book in the opening. The base
@@ -509,8 +510,8 @@ class ManipulationNode(Node):
                     raise ValueError('Top-row pregrasp joints were not retained; prepare_grab must complete before finish_grab.')
                 return [motions[0], ('close_gripper', 'close', None, 1.0),
                         motions[1], motions[2], ('verify_book_held', 'verify', None, 0.8)]
-            self.retreat_target = motions[-1][2]
-            return [('close_gripper', 'close', None, 1.0), motions[0], motions[1],
+            self.retreat_target = current.copy()
+            return [motions[0], ('close_gripper', 'close', None, 1.0), motions[1], motions[2],
                     ('verify_book_held', 'verify', None, 0.8)]
         if sequence == 'prepare_place':
             return motions
