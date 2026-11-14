@@ -371,6 +371,19 @@ class ManipulationNode(Node):
         self.get_logger().info(f'{sequence}: planning for camera target in base frame {point.round(3)}')
 
     def plan(self, sequence, point, normal, current, params):
+        """The top row's clearance waypoint sits at the arm's reach limit with the torso up (twin: 2.6 cm
+        short at +0.16 m over a 1.55 m pregrasp): lower it step by step before giving up."""
+        if sequence != 'prepare_grab' or self.book_row != 1:
+            return self._plan(sequence, point, normal, current, params)
+        errors = []
+        for clearance in (params['top_book_clearance_height'], 0.10, 0.06, 0.03):
+            try:
+                return self._plan(sequence, point, normal, current, dict(params, top_book_clearance_height=clearance))
+            except ValueError as error:
+                errors.append(f'clearance {clearance:.2f}: {error}')
+        raise ValueError('; '.join(errors))
+
+    def _plan(self, sequence, point, normal, current, params):
         """Compute all waypoints before any actuator moves; never guess joint angles."""
         if not np.isfinite(point).all() or point[0] < 0.2:
             raise ValueError(f'Target is not in front of the arm at reachable distance: {point}')

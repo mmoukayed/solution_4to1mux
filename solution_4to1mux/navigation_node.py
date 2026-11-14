@@ -103,7 +103,7 @@ class NavigationNode(Node):
             'top_book_marker_offset': 0.335, 'row_spacing': 0.33,
             'column_half_width': 0.43,
             'arm_stow_timeout': 20.0, 'arm_stow_settle_time': 9.0,
-            'scan_half_width': 2.6, 'scan_step': 0.65, 'scan_observe_time': 1.0,
+            'scan_half_width': 1.3, 'swing_table_gap': 0.45, 'scan_step': 0.65, 'scan_observe_time': 1.0,
             'docking_speed': 0.12, 'book_search_timeout': 20.0,
             'align_block_timeout': 3.0,
             'grasp_base_retreat': 0.25,
@@ -140,6 +140,7 @@ class NavigationNode(Node):
         self.return_detour_side = 0
         self.bin_turn_recoveries = 0
         self.bin_turn_retreat_total = 0.0
+        self.swing_backed = False
         self.last_command = (0.0, 0.0, 0.0)
         self.actual_speed = 0.0
         self.arm_joints = {}
@@ -882,6 +883,21 @@ class NavigationNode(Node):
             f'({self.bin_turn_recoveries}/{self.p("max_bin_turn_recoveries")}).')
         self.transition(State.BACK_OUT_FOR_BIN_TURN)
 
+    def table_gap(self):
+        """Free distance from the base's front edge to the nearest LiDAR return ahead (the bin table's legs)."""
+        if len(self.scans) < 2 or not all(self.fresh(v[0]) for v in self.scans.values()):
+            return None
+        pts = np.concatenate([v[1] for v in self.scans.values()])
+        ahead = pts[(pts[:, 0] > 0.30) & (pts[:, 0] < 1.8) & (np.abs(pts[:, 1]) < 0.95)]
+        return float(ahead[:, 0].min())-0.36 if len(ahead) else None
+
+    def rear_clearance(self):
+        if not self.scans:
+            return 0.0
+        pts = np.concatenate([v[1] for v in self.scans.values()])
+        behind = pts[(pts[:, 0] < 0) & (np.abs(pts[:, 1]) < 0.35)]
+        return float(-behind[:, 0].max())-0.36 if len(behind) else 1.0
+
     def drive_bin_turn_backoff(self):
         # Translate along the saved heading without any simultaneous rotation.
         heading = np.array([math.cos(self.goal[2]), math.sin(self.goal[2])])
@@ -1183,6 +1199,19 @@ class NavigationNode(Node):
                             if bin_pose is not None else self.p('bin_standoff'))
                 advance = float(np.clip(distance-self.p('bin_standoff'), 0.0,
                                          self.p('bin_final_advance_max')+self.bin_turn_retreat_total))
+                gap = self.table_gap()
+                if gap is not None and gap < self.p('swing_table_gap') and not self.swing_backed:
+                    # the return can stop right beside the table (twin s13: 0.05 m): the swing into the drop pose
+                    # then sweeps the wrist through the table top and levers the robot over. Back off first.
+                    self.swing_backed = True
+                    retreat = min(self.p('swing_table_gap')-gap+0.03, max(0.0, self.rear_clearance()-self.p('obstacle_margin')))
+                    if retreat > 0.02:
+                        self.get_logger().info(f'Table {gap:.2f} m ahead: backing {retreat:.2f} m before the drop-pose swing.')
+                        self.bin_approach_heading = self.pose[2]
+                        self.bin_retreat_origin = self.pose[:2].copy()
+                        self.goal = np.r_[self.pose[:2]-retreat*heading, self.pose[2]]
+                        self.transition(State.BACK_OUT_FOR_BIN_TURN)
+                        return
                 self.goal = np.r_[self.pose[:2]+advance*heading, self.pose[2]]
                 # swing the arm into the drop pose HERE, with the table out of its reach: from the carry pose the
                 # joint-space swing dips the wrist to 0.62 m and the elbow to 0.76 m in front of the robot (table top
