@@ -103,7 +103,7 @@ class NavigationNode(Node):
             'top_book_marker_offset': 0.335, 'row_spacing': 0.33,
             'column_half_width': 0.43,
             'arm_stow_timeout': 20.0, 'arm_stow_settle_time': 9.0,
-            'scan_half_width': 1.3, 'swing_table_gap': 0.45, 'scan_step': 0.65, 'scan_observe_time': 1.0,
+            'scan_half_width': 1.3, 'swing_table_gap': 0.45, 'top_procedure_min_height': 1.50, 'scan_step': 0.65, 'scan_observe_time': 1.0,
             'docking_speed': 0.12, 'book_search_timeout': 20.0,
             'align_block_timeout': 3.0,
             'grasp_base_retreat': 0.25,
@@ -376,6 +376,11 @@ class NavigationNode(Node):
             row = row_for_height(
                 shelf.pose.position.z, book.pose.position.z,
                 self.p('top_book_marker_offset'), self.p('row_spacing'))
+        if row == 1 and book.pose.position.z < self.p('top_procedure_min_height'):
+            # the top-row procedure (torso up at the dock, reach over from above) is for a high top row (twin
+            # 1.60 m). The real shelf's top-row book stood at 1.37 m (slot, 14 Nov): there the arm-from-above path
+            # crosses the shelf face, while the normal path reaches 1.27-1.47 m clear of it (offline IK check).
+            row = 2
         standoff = self.p('book_standoff')
         keepout = self.p('shelf_keepout_distance')
         if row is not None and row >= 3:
