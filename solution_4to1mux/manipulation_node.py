@@ -29,9 +29,6 @@ from .geometry import ArmKinematics, pose_xyz, rotation, transform_matrix, yaw
 GRIPPER_JOINT = 'gripper_right_finger_joint'
 GRIPPER_GRASP_FRAME = 'gripper_right_grasping_link'
 ARM_JOINTS = [f'arm_right_{i}_joint' for i in range(1, 8)]
-# User-calibrated high carry pose.  This is arm-only: torso_lift_joint remains
-# at its measured current value.
-HIGH_CARRY_RIGHT_ARM = np.array([0.0, 1.25, 0.0, -1.0, 0.2, 1.7, 0.0])
 
 
 def entity_name(value):
@@ -54,6 +51,9 @@ class ManipulationNode(Node):
             # perception; the former 1.5 cm right bias led to left-only contact.
             'grasp_insert_depth': 0.085, 'grasp_right_offset': 0.0,
             'pregrasp_distance': 0.10,
+            'grasp_correction_limit': 0.12,
+            'grasp_position_tolerance': 0.012,
+            'grasp_orientation_tolerance': 0.10,
             'lift_distance': 0.025, 'extract_distance': 0.10,
             # Must match navigation.grasp_base_return_advance.  This offsets
             # the prealignment target while the base is backed out.
@@ -83,6 +83,10 @@ class ManipulationNode(Node):
                     f'[0, {gripper_limit:.3f}]')
         if self.p('gripper_open') == self.p('gripper_closed'):
             raise ValueError('gripper_open and gripper_closed must be different positions')
+        for key in ('grasp_correction_limit', 'grasp_position_tolerance',
+                    'grasp_orientation_tolerance'):
+            if not math.isfinite(self.p(key)) or self.p(key) <= 0:
+                raise ValueError(f'{key} must be finite and positive')
         self.tf = Buffer()
         self.listener = TransformListener(self.tf, self)
         self.model = None
@@ -135,6 +139,8 @@ class ManipulationNode(Node):
         self.plan_future = None
         self.arm_in_shelf = False
         self.retreat_target = None
+        self.close_target = None
+        self.grasp_feedback_started = None
         self.placement_hover_target = None
         self.active = None
         self.phase = None
@@ -150,7 +156,7 @@ class ManipulationNode(Node):
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(0.1, self.tick, clock=self.wall_clock)
         self.get_logger().info(
-            f'Manipulation BUILD 5.19: {self.ros.profile} gripper positions '
+            f'Manipulation BUILD 5.25 (continuous IK + robot joint limits): {self.ros.profile} gripper positions '
             f'open={self.p("gripper_open"):.3f}, closed={self.p("gripper_closed"):.3f}.')
 
     def p(self, name):
@@ -166,7 +172,9 @@ class ManipulationNode(Node):
         if self.model is None:
             try:
                 self.model = ArmKinematics(msg.data, base=self.ros.frames['base'],
-                                           tip=self.ros.frames['arm_tip'])
+                                           tip=self.ros.frames['arm_tip'], profile=self.ros.profile)
+                self.model.limits.validate([GRIPPER_JOINT],
+                                           [[self.p('gripper_open')], [self.p('gripper_closed')]])
                 self.get_logger().info(f'Loaded right-arm/torso kinematics and limits from {self.ros.topics["robot_description"]}.')
                 try:
                     self.base_to_grasp = self.model.fixed_transform(
@@ -179,6 +187,7 @@ class ManipulationNode(Node):
                         f'{error}; manipulation requests will remain blocked until the URDF '
                         'provides the grasp-frame transform.')
             except (ValueError, AttributeError) as error:
+                self.model = self.base_to_grasp = None
                 self.model_error = str(error)
                 self.get_logger().error(f'Cannot load arm model: {error}')
 
@@ -263,7 +272,7 @@ class ManipulationNode(Node):
             self.deadline = self.now()+self.p('planning_timeout')
             current = np.array([self.joints[n] for n in self.model.names])
             self.plan_future = self.pool.submit(self.plan_carry_raise, current)
-            self.get_logger().info('raise_carry: moving the held book to the predefined high right-arm carry pose.')
+            self.get_logger().info('raise_carry: solving a raised carry pose within the loaded robot limits.')
             return
         if sequence == 'prepare_place':
             self.placement_hover_target = None
@@ -289,8 +298,11 @@ class ManipulationNode(Node):
         self.arm_in_shelf = False
         if sequence != 'finish_grab':
             self.retreat_target = None
+        if sequence in ('grab', 'prepare_grab', 'finish_grab'):
+            self.close_target = None
+            self.grasp_feedback_started = None
         current = np.array([self.joints[n] for n in self.model.names])
-        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'top_book_clearance_height', 'top_book_front_standoff', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'bin_inset', 'bin_release_height')}
+        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'grasp_correction_limit', 'grasp_position_tolerance', 'grasp_orientation_tolerance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'top_book_clearance_height', 'top_book_front_standoff', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'bin_inset', 'bin_release_height')}
         self.deferred_plan = None
         self.phases = []
         if sequence == 'prepare_grab' and self.book_row == 1:
@@ -309,6 +321,39 @@ class ManipulationNode(Node):
         self.deadline = self.now()+self.p('planning_timeout')
         self.plan_future = self.pool.submit(self.plan, sequence, point, normal, current, params)
         self.get_logger().info(f'{sequence}: planning for camera target in base frame {point.round(3)}')
+
+    def grasp_pose(self, joints):
+        pose = self.model.fk(joints)
+        if self.base_to_grasp is not None:
+            pose = pose @ self.base_to_grasp
+        return pose
+
+    def grasp_alignment_issue(self):
+        """Require measured open fingers at the intended grasp, not just action success."""
+        if self.close_target is None:
+            return 'No planned finger pose is available.'
+        if (self.grasp_feedback_started is None or not self.fresh(self.joint_stamp) or
+                self.joint_stamp < self.grasp_feedback_started):
+            return 'Waiting for joint feedback after insertion.'
+        names = self.model.names+[GRIPPER_JOINT]
+        if any(name not in self.joints for name in names):
+            return 'Missing arm, torso or gripper joint feedback.'
+        current = np.array([self.joints[name] for name in self.model.names])
+        if not np.isfinite(current).all() or not math.isfinite(self.joints[GRIPPER_JOINT]):
+            return 'Nonfinite arm or gripper joint feedback.'
+        actual = self.grasp_pose(current)
+        delta = self.close_target[:3, 3]-actual[:3, 3]
+        position_error = float(np.linalg.norm(delta))
+        angle = math.acos(float(np.clip(
+            (np.trace(self.close_target[:3, :3].T @ actual[:3, :3])-1.0)/2.0, -1.0, 1.0)))
+        if (position_error > self.p('grasp_position_tolerance') or
+                angle > self.p('grasp_orientation_tolerance')):
+            return (f'Finger pose misses the book by {position_error:.3f} m '
+                    f'(target minus measured xyz={delta.round(3).tolist()} m), '
+                    f'orientation error {math.degrees(angle):.1f} deg; redock.')
+        if abs(self.joints[GRIPPER_JOINT]-self.p('gripper_open')) >= 0.006:
+            return 'Gripper is not confirmed open; refusing to close at an unverified insertion.'
+        return ''
 
     def plan(self, sequence, point, normal, current, params):
         """Compute all waypoints before any actuator moves; never guess joint angles."""
@@ -363,10 +408,16 @@ class ManipulationNode(Node):
                 targets = [('prealign', point+normal*(params['grasp_insert_depth']-params['grasp_base_advance']))]
         elif sequence == 'finish_grab':
             grasp = point+normal*params['grasp_insert_depth']
+            actual_grasp = self.grasp_pose(current)
+            correction = float(np.linalg.norm(grasp-actual_grasp[:3, 3]))
+            if correction > params['grasp_correction_limit']:
+                raise ValueError(f'Gripper needs {correction:.3f} m of correction after base return '
+                                 f'(limit {params["grasp_correction_limit"]:.3f} m); redock.')
             lifted = grasp+np.array([0, 0, params['lift_distance']])
             extracted = lifted-normal*params['extract_distance']
-            targets = ([('insert', grasp), ('lift', lifted), ('extract', extracted)]
-                       if self.book_row == 1 else [('lift', lifted), ('extract', extracted)])
+            # Base return can stop short at its tolerance or shelf keepout.
+            # Correct from the new RGB-D target for every row before closing.
+            targets = [('insert', grasp), ('lift', lifted), ('extract', extracted)]
         elif sequence == 'prepare_place':
             # Perception's bin normal points from the camera/robot toward the
             # bin. Move against it to centre the book in the opening. The base
@@ -389,6 +440,10 @@ class ManipulationNode(Node):
         rolls = ((math.pi, 0.0, math.pi/2, -math.pi/2)
                  if sequence in ('place', 'prepare_place', 'finish_place')
                  else (math.pi, 0.0))
+        if sequence == 'finish_grab':
+            # Keep the prepared wrist roll; do not flip between shelf boards.
+            rolls = [min(rolls, key=lambda roll: np.linalg.norm(
+                facing @ rotation([1, 0, 0], roll)-actual_grasp[:3, :3]))]
         for roll in rolls:
             grasp_sequence = sequence in ('grab', 'prepare_grab', 'finish_grab')
             grasp_orientation = facing @ rotation([1, 0, 0], roll)
@@ -414,31 +469,55 @@ class ManipulationNode(Node):
             try:
                 for name, xyz in targets:
                     fixed_torso = (sequence == 'prepare_place' or
-                                   sequence == 'finish_grab' and self.book_row == 1 or
+                                   sequence == 'finish_grab' and (self.book_row == 1 or name == 'insert') or
                                    sequence == 'prepare_grab' and self.book_row == 1)
                     fixed = {0: q[0]} if fixed_torso else None
                     tip_xyz = xyz if offset is None else xyz-orientation @ offset
-                    solved = self.model.solve(tip_xyz, orientation, q, fixed=fixed)
-                    if candidate and np.max(np.abs(solved[1:]-q[1:])) > 1.4:
-                        raise ValueError(f'{name}: IK branch jump; adjust docking pose before retrying.')
-                    candidate.append((name, 'motion', solved, self.model.duration(q, solved, 1.0)))
-                    q = solved
+                    if sequence == 'finish_grab':
+                        actual = self.grasp_pose(q)
+                        angle = math.acos(float(np.clip(
+                            (np.trace(grasp_orientation.T @ actual[:3, :3])-1)/2, -1, 1)))
+                        if (name == 'insert' and
+                                np.linalg.norm(xyz-actual[:3, 3]) <= params.get('grasp_position_tolerance', .012) and
+                                angle <= params.get('grasp_orientation_tolerance', .10)):
+                            # Closing an already aligned hand needs no new IK.
+                            path = np.atleast_2d(q.copy())
+                        else:
+                            # Allow bounded torso travel when it is needed to
+                            # stay on the current arm branch near a joint limit.
+                            path = self.model.cartesian_path(tip_xyz, orientation, q)
+                        times = self.model.limits.times(self.model.names, q, path, minimum=1.0)
+                        candidate.append((name, 'motion', path if len(path) > 1 else path[0], float(times[-1])))
+                        q = path[-1]
+                    else:
+                        solved = self.model.solve(tip_xyz, orientation, q, fixed=fixed)
+                        if candidate and np.max(np.abs(solved[1:]-q[1:])) > 1.4:
+                            raise ValueError(f'{name}: IK branch jump; redock before retrying.')
+                        candidate.append((name, 'motion', solved, self.model.duration(q, solved, 1.0)))
+                        q = solved
                 # Both parallel-jaw rolls can grasp the same book. Keep the
                 # wrist nearer its current orientation by selecting the valid
                 # complete path with the least estimated joint travel time,
                 # rather than accepting the first roll that happens to solve.
-                candidates.append((sum(step[3] for step in candidate), candidate))
+                candidates.append((sum(step[3] for step in candidate), candidate, grasp_orientation))
             except ValueError as error:
                 errors.append(str(error))
-        motions = min(candidates, key=lambda item: item[0])[1] if candidates else None
-        if motions is None:
+        if not candidates:
+            if sequence == 'finish_grab':
+                raise ValueError('No continuous grasp path within robot limits; redock. '+'; '.join(errors))
             raise ValueError('; '.join(errors))
+        _, motions, chosen_orientation = min(candidates, key=lambda item: item[0])
+        if sequence in ('grab', 'finish_grab'):
+            self.close_target = np.eye(4)
+            self.close_target[:3, 3] = point+normal*params['grasp_insert_depth']
+            self.close_target[:3, :3] = chosen_orientation
+            confirmation = ('confirm_grasp_alignment', 'grasp_feedback', self.close_target, 2.0)
         if sequence == 'grab':
             # Remember the pregrasp joints: they are the known-collision-free
             # retreat if anything fails while the fingers are inside the shelf.
             self.retreat_target = motions[0][2]
             return [('open_gripper', 'open', None, 1.0), motions[0], motions[1],
-                    ('close_gripper', 'close', None, 1.0), motions[2], motions[3],
+                    confirmation, ('close_gripper', 'close', None, 1.0), motions[2], motions[3],
                     ('verify_book_held', 'verify', None, 0.8)]
         if sequence == 'prepare_grab':
             if self.book_row == 1:
@@ -447,13 +526,14 @@ class ManipulationNode(Node):
                 return [('open_gripper', 'open', None, 1.0)]+motions
             return [('open_gripper', 'open', None, 1.0), motions[0]]
         if sequence == 'finish_grab':
-            if self.book_row == 1:
-                if self.retreat_target is None:
-                    raise ValueError('Top-row pregrasp joints were not retained; prepare_grab must complete before finish_grab.')
-                return [motions[0], ('close_gripper', 'close', None, 1.0),
-                        motions[1], motions[2], ('verify_book_held', 'verify', None, 0.8)]
-            self.retreat_target = motions[-1][2]
-            return [('close_gripper', 'close', None, 1.0), motions[0], motions[1],
+            if self.book_row == 1 and self.retreat_target is None:
+                raise ValueError('Top-row pregrasp joints were not retained; prepare_grab must complete before finish_grab.')
+            if self.book_row != 1:
+                # Save the measured position before correction, not an
+                # extraction/lift target from a different point on the shelf.
+                self.retreat_target = current.copy()
+            return [('open_gripper', 'open', None, 1.0), motions[0], confirmation,
+                    ('close_gripper', 'close', None, 1.0), motions[1], motions[2],
                     ('verify_book_held', 'verify', None, 0.8)]
         if sequence == 'prepare_place':
             return motions
@@ -464,25 +544,56 @@ class ManipulationNode(Node):
                         ('verify_delivery', 'delivery', None, 3.0)]
 
     def plan_carry_raise(self, current):
-        """Move the held book to the fixed top-shelf carry pose, without torso motion."""
-        target = current.copy()
-        target[0] = current[0]
-        target[1:] = HIGH_CARRY_RIGHT_ARM
-        if np.max(np.abs(target-current)) <= 0.005:
-            return []
-        return [('raise_carried_book', 'motion', target, self.model.duration(current, target, 1.0))]
+        """Solve a raised carry pose beside the shoulder within this robot's limits.
 
-    def trajectory(self, names, positions, duration):
+        Navigation has already withdrawn from the shelf. This is a joint-limit
+        and geometric endpoint check, not a mesh collision planner.
+        """
+        shoulder = self.model.arm_points(current)[0]
+        candidates, errors = [], []
+        for forward in (0.25, 0.15):
+            grasp = shoulder+np.array([forward, -0.20, 0.25])
+            for roll in (math.pi, 0.0):
+                facing = rotation([1, 0, 0], roll)
+                orientation = facing if self.base_to_grasp is None else facing @ self.base_to_grasp[:3, :3].T
+                xyz = grasp if self.base_to_grasp is None else grasp-orientation @ self.base_to_grasp[:3, 3]
+                try:
+                    target = self.model.solve(xyz, orientation, current, fixed={0: current[0]})
+                    self.model.limits.validate(self.model.names, target)
+                    points = self.model.arm_points(target, self.base_to_grasp)
+                    if points[3:, 1].max() > -abs(shoulder[1])-0.04:
+                        raise ValueError('Carry endpoint crosses the torso-side envelope.')
+                    duration = self.model.duration(current, target)
+                    candidates.append((duration, target))
+                except ValueError as error:
+                    errors.append(str(error))
+        if not candidates:
+            raise ValueError('No carry pose within robot limits: '+'; '.join(errors))
+        duration, target = min(candidates, key=lambda item: item[0])
+        return [('raise_carried_book', 'motion', target, duration)]
+
+    def trajectory(self, names, positions, duration, times=None):
         msg = JointTrajectory()
         msg.joint_names = list(names)
-        point = JointTrajectoryPoint()
-        point.positions = [float(p) for p in positions]
-        point.time_from_start.sec = int(duration)
-        point.time_from_start.nanosec = int(round((duration-int(duration))*1e9))
-        if point.time_from_start.nanosec >= 1000000000:
-            point.time_from_start.sec += 1
-            point.time_from_start.nanosec = 0
-        msg.points = [point]
+        path = np.atleast_2d(np.asarray(positions, dtype=float))
+        self.model.limits.validate(names, path)
+        if any(name not in self.joints for name in names):
+            raise ValueError('Missing current joint feedback for trajectory timing.')
+        start = [self.joints[name] for name in names]
+        if times is None:
+            times = self.model.limits.times(names, start, path, minimum=duration)
+        else:
+            times = np.asarray(times, dtype=float)
+            required = self.model.limits.times(names, start, path)
+            if (times.shape != (len(path),) or not np.isfinite(times).all() or
+                    np.any(np.diff(np.r_[0.0, times]) < np.diff(np.r_[0.0, required])-1e-9)):
+                raise ValueError('Trajectory exceeds robot joint velocity limits or has invalid times.')
+        for values, elapsed in zip(path, times):
+            point = JointTrajectoryPoint()
+            point.positions = [float(p) for p in values]
+            stamp = int(math.ceil(float(elapsed)*1e9))
+            point.time_from_start.sec, point.time_from_start.nanosec = divmod(stamp, 10**9)
+            msg.points.append(point)
         return msg
 
     def next_phase(self):
@@ -526,31 +637,50 @@ class ManipulationNode(Node):
             if not self.fresh(self.joint_stamp):
                 self.abort('Joint feedback went stale before motion.')
                 return
-            q = self.phase_target
-            # Recalculate timing from actual joint feedback; respect slow torso travel.
+            path = np.atleast_2d(self.phase_target)
+            # Recheck all positions and segment speeds before either actuator
+            # is commanded, using the actual start rather than the planned seed.
             start = np.array([self.joints[n] for n in self.model.names])
-            duration = max(duration, self.model.duration(start, q))
-            self.deadline = self.now()+duration+self.p('motion_timeout_margin')
-            clients = (((self.torso, ['torso_lift_joint'], q[:1]),)
+            try:
+                times = (self.model.limits.times(['torso_lift_joint'], start[:1], path[:, :1], minimum=duration)
+                         if self.phase == 'torso' else
+                         self.model.limits.times(self.model.names, start, path, minimum=duration))
+            except ValueError as error:
+                self.abort(f'Robot joint limits rejected {self.phase_name}: {error}')
+                return
+            self.deadline = self.now()+float(times[-1])+self.p('motion_timeout_margin')
+            clients = (((self.torso, ['torso_lift_joint'], path[:, :1]),)
                        if self.phase == 'torso' else
-                       ((self.torso, ['torso_lift_joint'], q[:1]),
-                        (self.arm, ARM_JOINTS, q[1:])))
+                       ((self.torso, ['torso_lift_joint'], path[:, :1]),
+                        (self.arm, ARM_JOINTS, path[:, 1:])))
             self.pending = len(clients)
             token = self.token
             for client, names, values in clients:
                 goal = FollowJointTrajectory.Goal()
-                goal.trajectory = self.trajectory(names, values, duration)
+                goal.trajectory = self.trajectory(names, values, duration, times=times)
                 future = client.send_goal_async(goal)
                 future.add_done_callback(lambda f, t=token: self.goal_response(f, t))
         elif self.phase in ('open', 'close'):
             value = self.p('gripper_open' if self.phase == 'open' else 'gripper_closed')
             if self.phase == 'close':
+                issue = self.grasp_alignment_issue()
+                if issue:
+                    self.abort(f'Refusing gripper close: {issue}')
+                    return
                 # Do not let contact from a previous approach/attempt count as
                 # proof of a grasp. The close phase needs fresh bilateral data.
                 self.contacts.clear()
-            self.gripper_pub.publish(self.trajectory([GRIPPER_JOINT], [value], duration))
+            try:
+                command = self.trajectory([GRIPPER_JOINT], [value], duration)
+            except ValueError as error:
+                self.abort(f'Robot gripper limits rejected {self.phase_name}: {error}')
+                return
+            self.gripper_pub.publish(command)
             self.deadline = self.now()+self.p('gripper_timeout')
             self.contact_since = None
+        elif self.phase == 'grasp_feedback':
+            self.grasp_feedback_started = self.now()
+            self.deadline = self.now()+duration
         else:
             self.deadline = self.now()+duration+3.0
 
@@ -608,7 +738,9 @@ class ManipulationNode(Node):
             return
         if self.now() > self.deadline:
             detail = ''
-            if self.phase == 'close':
+            if self.phase == 'grasp_feedback':
+                detail = ' '+self.grasp_alignment_issue()
+            elif self.phase == 'close':
                 seen = {f'{book.split("::")[0]}:{side}': f'{self.now()-stamp:.1f}s ago'
                         for (book, side), stamp in self.contacts.items()}
                 finger_position = self.joints.get(GRIPPER_JOINT)
@@ -644,6 +776,10 @@ class ManipulationNode(Node):
                 self.next_phase()
         elif self.phase == 'open':
             if self.fresh(self.joint_stamp) and abs(self.joints.get(GRIPPER_JOINT, -1)-self.p('gripper_open')) < 0.006 and self.now()-self.phase_started > 0.8:
+                self.next_phase()
+        elif self.phase == 'grasp_feedback':
+            if not self.grasp_alignment_issue():
+                self.get_logger().info('Open fingers confirmed at the measured book grasp pose; closing gripper.')
                 self.next_phase()
         elif self.phase == 'close':
             # This is a position trajectory. Once the one close trajectory

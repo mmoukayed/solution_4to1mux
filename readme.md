@@ -6,53 +6,32 @@ cd ~
 git clone https://github.com/dfl-rlab/erc_sim_2026
 cd erc_sim_2026
 ./docker/up.sh --build
-```
-Then to setup the solution program, run these commands:
-```
 cd src
 git clone https://github.com/mmoukayed/solution_4to1mux
 cd ..
 ./docker/attach.sh
 ```
-Next once you are in the docker shell, these commands will setup the environment to run ros2 commands and the gazebo simulator:
-```
-colcon build --symlink-install
-source install/setup.bash
-```
-Then use this command to start up the round 1 simulation:
-```
-ros2 launch erc_bringup simulation_round_1.launch.py   # Round 1 environment
-```
-And this for round 2:
-```
-ros2 launch erc_bringup simulation_round_2.launch.py   # Round 2 environment
-```
+Next once you are in the docker shell, you can use the automated script to run different processes:
 
-> [!NOTE]
-> If GUIs arent supported on your OS, use the `headless:=true` argument after the `ros2 launch` command of the simulator not the solution
+| Task | Command |
+| --- | --- |
+| Start Solution (No build, dds) [Competition Ready] | `./src/solution_4to1mux/scripts/startup.sh solution -s robot_profile:=real shelf_column_number:=5 book_colour:=red` |
+| Start Solution (No build, no dds) | `./src/solution_4to1mux/scripts/startup.sh solution -sn robot_profile:=simulation shelf_column_number:=5 book_colour:=red` |
+| Start Solution (Build, dds) | `./src/solution_4to1mux/scripts/startup.sh solution robot_profile:=simulation shelf_column_number:=5 book_colour:=red` |
+| Start Solution (Build, no dds) | `./src/solution_4to1mux/scripts/startup.sh solution -n robot_profile:=simulation shelf_column_number:=5 book_colour:=red` |
+| Start Sim Round 1 (No build, no dds) | `./src/solution_4to1mux/scripts/startup.sh simulation -sn` |
+| Start Sim Round 1 (Build, no dds) | `./src/solution_4to1mux/scripts/startup.sh simulation -n` |
+| Start Sim Round 2 (No build, no dds) | `./src/solution_4to1mux/scripts/startup.sh simulation2 -sn` |
+| Start Sim Round 2 (Build, no dds) | `./src/solution_4to1mux/scripts/startup.sh simulation2 -n` |
 
-## Starting Up Solution
-To startup the docker container and code or if you want to open more than one terminal, you don't need to build from scratch again, simply run these commands to start:
-> [!WARNING]
-> If your docker container is already running and you want to just open more terminals, don't run `./docker/up.sh`. Just the `attach.sh` command to connect to the shell.
-> 
-> Additionally, if you are experiencing errors and issues with the docker container or ros2 environment and re-running `colcon build` isn't working, then add the `--build` flag to the end of `up.sh`.
+### Comand Arguments
 
-```
-cd ~/erc_sim_2026
-./docker/up.sh
-./docker/attach.sh
-```
-Then similar to the previous section, once inside the docker shell:
-```
-colcon build --symlink-install
-source install/setup.bash
-ros2 launch erc_bringup solution.launch.py
-```
-The start command for our program should be as mentioned in the guidelines:
-```
-ros2 launch solution_4to1mux solution.launch.py robot_profile:=simulation shelf_column_number:=2 book_colour:=red
-```
+| Argument | Values | Description |
+| --- | --- | --- |
+| `robot_profile:=` | `simulation`/`real` | Used to tell the program if the topics and configurations should be adjusted for the real life robot or the simulation |
+| `shelf_column_number:=` | Number from 1-5 | Tells the program which column the book is located at |
+| `book_colour:=` | `red`/`yellow`/`green`/`blue` | Tells the program what color book to look for (Can be removed in place of the `book_text` argument if a book is colorless but contains text) |
+| `book_text:=` | Any text | Use only if you are aiming for a book that contains text instead of a color, you can use only either this argument or the color argument, not both. Text recognition has not been tested so this might not work |
 
 For Phase 2 Round 2, launch `erc_bringup simulation_round_2.launch.py` in the simulator. Shelf 2 uses printed labels: install Tesseract in the simulator container once (`apt install -y tesseract-ocr`), then pass the exact requested label with `book_text`. For example:
 
@@ -106,7 +85,19 @@ python3 -m unittest discover -s test -p test_ros_topics.py -v
 
 This package targets the **ERC simulator supplied in the 11 September 2026 ZIP**, ROS 2 Humble and Gazebo Harmonic. It uses the right arm only. Launch the simulator first, then launch this package.
 
-**Current navigation build: 5.17; perception build: 5.13; manipulation build: 5.19.** Startup must print `Navigation BUILD 5.17`, `Perception BUILD 5.13` and `Manipulation BUILD 5.19` — if it does not, the rebuild did not take and you are running older code.
+**Current navigation build: 5.25; perception build: 5.13; manipulation build: 5.25.** Startup must print `Navigation BUILD 5.25`, `Perception BUILD 5.13` and `Manipulation BUILD 5.25` — if it does not, the rebuild did not take and you are running older code.
+
+- **Navigation / Manipulation 5.25:** finish-grab follows the measured pose through 1 cm Cartesian steps using local IK, bounded to 0.35 rad per arm joint and 1 cm per torso step. It reuses an already aligned insertion pose, keeps the prepared wrist roll, and permits bounded torso travel instead of forcing a different arm branch. Steps are sent together as one timed trajectory per stage. An offline regression reproduces the captured insertion failure. Grasp verification still requires bilateral book contact.
+
+  `joint_limits.py` intersects the connected `/robot_description` hard/soft bounds with the selected profile. `robot_profile:=real` also applies the live interface guide's asymmetric arm ranges, 0.05 rad / 0.05 m position margins (none for grippers), and speed caps: arm joints 1-2 at 0.60 rad/s, 3-7 at 0.75 rad/s, torso at 0.035 m/s, head at 0.5 rad/s. A tighter URDF always wins. All outgoing arm, torso, gripper and head targets are validated; trajectory timing uses measured starts and a 30% speed reserve. Stow timing also accounts for cubic peak speed. Head commands require loaded limits and fresh head feedback; navigation still starts in `FIND_SHELF` immediately. The carry pose is solved from shoulder geometry with fixed measured torso height, replacing the remaining out-of-limit angle table. These are local motion and limit checks; whole-body mesh collision checking remains the robot's `/erc/` checking-layer responsibility.
+
+- **Manipulation 5.24:** `finish_grab` uses the fresh book pose after the base return to correct insertion for every row. Previously, lower rows closed immediately, assuming the nominal base advance had completed even when navigation stopped short. The correction keeps the prepared wrist roll and torso height during insertion, confirms the gripper is open before moving, then checks the measured URDF grasp-frame position and orientation before closing. A large correction requests a redock; missing bilateral contact still fails the grasp. Launch parameters `grasp_correction_limit` (0.12 m), `grasp_position_tolerance` (0.012 m), and `grasp_orientation_tolerance` (0.10 rad) control these checks. Failure logs include the measured position/orientation error when insertion does not reach its target.
+
+- **Navigation 5.23:** the simulator's default extended arms can now stow with the torso lowered. The 0.30 m transport-height envelope applies to the final pose; intermediate poses use ground clearance instead, along with the existing shelf and torso checks. Previously the planner rejected the default fingertips for being below the final transport envelope before attempting any motion. Clearance failures now identify the shelf, ground, or torso-side constraint and its margin. Docking still requires fresh joint feedback confirming the computed compact pose.
+
+- **Navigation 5.22:** `STOW_ARMS_FOR_DOCK` computes both arm poses from the live URDF and measured joint positions. It keeps the torso fixed, prefers a compact pose near each shoulder, respects joint and velocity limits, and checks the sampled joint path against a shelf plane and conservative torso/link envelopes. An already compact arm keeps its measured pose. Planning runs outside the navigation callback; base motion remains stopped. Both arms must reach their computed poses with fresh feedback before docking starts; elapsed time alone cannot complete stow. A stow failure replaces an active arm trajectory with a measured hold when feedback is fresh. These envelope checks do not provide mesh-based collision planning.
+
+  Stow geometry is configurable through launch arguments: `arm_stow_front_limit` (0.40 m), `arm_stow_half_width` (0.55 m), `arm_stow_link_radius` (0.06 m), and `arm_stow_clearance` (0.08 m). Completion uses `arm_stow_joint_tolerance` (0.06 rad), `arm_stow_settle_time` (0.3 s), and `arm_stow_timeout` (30 s). These parameters describe clearance and confirmation, not a fixed set of joint angles.
 
 - **Navigation 5.17 / Perception 5.13 / Manipulation 5.19:** before either arm moves into its shelf dock pose, navigation backs out to at least 1.35 m from the shelf if needed, rotates the base to the measured shelf heading, then strafes at up to 0.12 m/s along the shelf face to line up with the selected book's dock position. LiDAR and the virtual shelf clearance gate remain active during base alignment; if it cannot complete safely, navigation stops and reports the blocking gate instead of moving the arms. Top-row grasp preparation raises the torso to its URDF upper limit before running IK, confirms the measured torso height, then solves and executes the pregrasp with that lift fixed; the gripper opens before arm motion. This avoids relying on the IK optimizer to request torso motion incidentally. ROS topics, actions, and frames come from `ros_topics.py`, with one `robot_profile` selection passed to every node. Simulation action and gripper names match the controllers and clamp started by `erc_bringup`; the real profile keeps its `/erc/` endpoints. Perception tolerates image stamps up to 100 ms ahead of the latest TF and reports missing camera inputs by name. Manipulation reports the specific missing description, joint feedback, action server, or gripper subscriber when a grasp request is not ready. Grasp IK uses the URDF grasp frame, and gripper open/closed positions follow each profile's joint convention (simulation: 0.066/0.0; real: 0.0/0.79).
 
@@ -140,7 +131,7 @@ This package targets the **ERC simulator supplied in the 11 September 2026 ZIP**
 
 - **Build 5.3:** `APPROACH_BIN` is rotation-only. It no longer corrects target-goal x/y after reaching the calibrated pre-table/drop position, so it cannot reverse away from the bin. When heading alignment completes, navigation skips the redundant pre-place/base-advance stage and directly requests the arm's lower-and-release sequence; this removes the `WAIT_FOR_PLACE_PREP` stall.
 
-- **Build 5.2:** after `RETREAT_FROM_SHELF`, navigation stops and requests a high carry pose before returning to the start. Manipulation preserves the measured `torso_lift_joint` value and moves only the right arm to your calibrated position: `[0.0, 1.25, 0.0, -1.0, 0.2, 1.7, 0.0]`. Only after its controller confirms completion does navigation enter `RETURN_TO_START`.
+- **Build 5.2 (carry angles superseded by 5.25):** introduced the high carry stage after `RETREAT_FROM_SHELF`. The measured torso height is preserved, and navigation waits for controller completion before `RETURN_TO_START`. Build 5.25 solves the arm pose within the connected robot's limits.
 
 - **Build 4.9:** the table/bin stop is now 0.95 m away (was 0.80), keeping the base turning footprint away from the movable bin. After the arm reaches its high pose, the protected final advance is 0.35 m. Placement planning no longer rejects the raw farther bin point before applying this compensation; the final IK waypoints remain the reachability check. A placement-plan error now publishes a normal failure instead of letting an rcutils logger exception terminate the manipulation node.
 
@@ -160,7 +151,7 @@ This package targets the **ERC simulator supplied in the 11 September 2026 ZIP**
 
 - **Build 4.1:** grasping is staged around the shelf clearance. At the finished dock position the base reverses 0.25 m; manipulation opens the gripper and moves the right arm to a prealignment pose offset by the same 0.25 m. The base then returns straight to the dock, carrying the held arm into the book alignment, and only then does manipulation close, lift, extract and verify the grasp. This prevents the arm's transition from the raised stow pose from catching boards above the selected row.
 
-- **Build 4.0:** before `ALIGN_BOOK`, navigation stops and sends the calibrated complete trajectory for each arm. Left: `[0.0, 1.25, 0.0, -1.0, -0.4, 0.0, 0.0]`; right: `[0.0, 1.25, 0.0, -1.0, 0.4, 0.0, 0.0]`. Exact fresh `/joint_states` confirmation proceeds immediately; otherwise it allows the controllers' 2 s trajectory plus a 0.5 s settle period, avoiding a false stow timeout while still refusing stale joint feedback.
+- **Build 4.0 (superseded by Navigation 5.22):** introduced fixed calibrated arm poses before `ALIGN_BOOK`. Dynamic URDF planning and measured completion now replace those poses and the timer-based fallback.
 
 - **Build 3.5:** a grasp is refused with a `redock` reason when the book sits closer than 0.45 m in the base frame (base jammed against the shelf — swinging the arm from there hits the boards). Navigation reacts by backing straight out 0.35 m and re-docking (bounded by `max_book_recoveries`) instead of failing or wedging the arm.
 
@@ -348,7 +339,7 @@ python3 -m pytest -q test/test_regressions.py
 
 The callback tests use small ROS import/message stand-ins. They do **not** emulate ROS networking, controller execution, Gazebo contacts or physics. The numerical tests check waypoint reachability, not collision-free trajectories or grasp success rates.
 
-A full Gazebo trial was **not run** in the editing environment because ROS/Gazebo are unavailable there. This is a repaired implementation to test in your simulator, not a verified competition submission. Remaining concrete limits:
+Offline checks run in the existing ROS container. A full Gazebo mission and physical-robot motion were **not run** as part of these changes. Remaining concrete limits:
 
 - Local IK and joint waypoints are **not whole-body or mesh collision planning**. The base obstacle check covers its footprint, not extended arms. Validate arm clearance, especially the initial arm posture, with the simulator before repeated autonomous trials; a configured MoveIt planning scene is the next step if paths collide.
 - Printed-label targeting needs the `tesseract-ocr` executable in the simulator container. OCR uses the confirmed column crop and matches the requested label; small, occluded, or unfamiliar print may still need a closer view or more contrast.

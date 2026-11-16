@@ -99,4 +99,31 @@
     <child link="gripper_right_grasping_link" />
     <origin rpy="0 -1.57 0" xyz="0.0 0.0 0.157157" />
   </joint>
+  <joint name="head_1_joint" type="revolute">
+    <origin rpy="0 0 0" xyz="0 0 0" />
+    <parent link="torso_head_link" />
+    <child link="head_1_link" />
+    <axis xyz="0 0 1" />
+    <limit effort="5.197" lower="-1.309" upper="1.309" velocity="3.0" />
+    <dynamics damping="0.5" friction="1.0" />
+    <safety_controller k_position="20" k_velocity="20" soft_lower_limit="-1.2389999999999999" soft_upper_limit="1.2389999999999999" />
+  </joint>
+  <joint name="head_2_joint" type="revolute">
+    <origin rpy="-1.5708 0 0" xyz="0.0425 0 0.10585" />
+    <parent link="head_1_link" />
+    <child link="head_2_link" />
+    <axis xyz="0 0 -1" />
+    <limit effort="2.77" lower="-1.0472" upper="0.34907" velocity="3.0" />
+    <dynamics damping="0.5" friction="1.0" />
+    <safety_controller k_position="20" k_velocity="20" soft_lower_limit="-0.9771999999999998" soft_upper_limit="0.27907" />
+  </joint>
+  <joint name="gripper_right_finger_joint" type="prismatic">
+    <origin rpy="0 0 0" xyz="-0.0178 0.0088 0.0" />
+    <parent link="gripper_right_base_finger_left_link" />
+    <child link="gripper_right_screw_left_link" />
+    <axis xyz="0 1 0" />
+    <limit effort="10.0" lower="-0.001" upper="0.07" velocity="2" />
+    <safety_controller k_position="20" k_velocity="20" soft_lower_limit="-0.001" soft_upper_limit="0.07" />
+    <dynamics damping="0.03" />
+  </joint>
 </robot>

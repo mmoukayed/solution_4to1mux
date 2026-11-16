@@ -7,6 +7,7 @@ import numpy as np
 from scipy.optimize import least_squares
 
 from .ros_topics import FRAMES
+from .joint_limits import JointLimits
 
 
 def wrap(angle):
@@ -128,8 +129,9 @@ class ArmKinematics:
     The caller must approach the shelf square-on and keep waypoints clear.
     """
 
-    def __init__(self, urdf, base=FRAMES['base'], tip=FRAMES['arm_tip']):
+    def __init__(self, urdf, base=FRAMES['base'], tip=FRAMES['arm_tip'], profile='simulation'):
         root = ET.fromstring(urdf)
+        self.limits = JointLimits(urdf, profile)
         by_child = {j.find('child').get('link'): j for j in root.findall('joint')}
         self.by_child = by_child
         self.base_link = base
@@ -142,6 +144,7 @@ class ArmKinematics:
             chain.append(joint)
             current = joint.find('parent').get('link')
         self.chain, self.names, self.lower, self.upper, self.velocity = [], [], [], [], []
+        self.hard_lower, self.hard_upper = [], []
         for j in reversed(chain):
             origin = _joint_origin(j)
             kind = j.get('type')
@@ -150,17 +153,15 @@ class ArmKinematics:
             if kind != 'fixed':
                 index = len(self.names)
                 self.names.append(j.get('name'))
-                limit = j.find('limit')
-                safety = j.find('safety_controller')
-                lo, hi = float(limit.get('lower')), float(limit.get('upper'))
-                if safety is not None:
-                    lo = max(lo, float(safety.get('soft_lower_limit', lo)))
-                    hi = min(hi, float(safety.get('soft_upper_limit', hi)))
-                self.lower.append(lo)
-                self.upper.append(hi)
-                self.velocity.append(float(limit.get('velocity')))
+                bound = self.limits.by_name[j.get('name')]
+                self.hard_lower.append(bound.hard_lower)
+                self.hard_upper.append(bound.hard_upper)
+                self.lower.append(bound.lower)
+                self.upper.append(bound.upper)
+                self.velocity.append(bound.velocity)
             self.chain.append((origin, kind, axis, index))
         self.lower, self.upper, self.velocity = map(np.array, (self.lower, self.upper, self.velocity))
+        self.hard_lower, self.hard_upper = map(np.array, (self.hard_lower, self.hard_upper))
 
     def fixed_transform(self, parent, child):
         """Get a fixed URDF transform between links outside the solved chain."""
@@ -190,7 +191,27 @@ class ArmKinematics:
                 result = result @ motion
         return result
 
-    def solve(self, xyz, orientation, seed, attempts=12, iterations=200, fixed=None):
+    def arm_points(self, joints, tip_transform=None):
+        """Return arm joint centres and the tip for conservative clearance checks."""
+        result = np.eye(4)
+        points = []
+        for origin, kind, axis, index in self.chain:
+            result = result @ origin
+            if index is not None:
+                motion = np.eye(4)
+                if kind == 'prismatic':
+                    motion[:3, 3] = axis*joints[index]
+                else:
+                    points.append(result[:3, 3].copy())
+                    motion[:3, :3] = rotation(axis, joints[index])
+                result = result @ motion
+        points.append(result[:3, 3].copy())
+        if tip_transform is not None:
+            points.append((result @ tip_transform)[:3, 3])
+        return np.vstack(points)
+
+    def solve(self, xyz, orientation, seed, attempts=12, iterations=200, fixed=None,
+              max_step=None):
         target = np.asarray(xyz, dtype=float)
         seed = np.clip(np.asarray(seed, dtype=float), self.lower, self.upper)
         fixed = {int(index): float(value) for index, value in (fixed or {}).items()}
@@ -203,6 +224,14 @@ class ArmKinematics:
         for index, value in fixed.items():
             anchor[index] = value
         free = np.array([index for index in range(len(seed)) if index not in fixed], dtype=int)
+        lower, upper = self.lower.copy(), self.upper.copy()
+        if max_step is not None:
+            step = np.broadcast_to(np.asarray(max_step, dtype=float), seed.shape)
+            if not np.isfinite(step).all() or np.min(step) <= 0:
+                raise ValueError('Local IK step bounds must be positive and finite.')
+            lower = np.maximum(lower, anchor-step)
+            upper = np.minimum(upper, anchor+step)
+            attempts = 1  # Never jump to a random global branch near a book.
         rng = np.random.default_rng(6)
         best = float('inf')
 
@@ -215,13 +244,16 @@ class ArmKinematics:
             q = expand(values)
             actual = self.fk(q)
             # Full matrix residual avoids a false zero at a 180-degree rotation.
-            return np.r_[actual[:3, 3]-target,
-                         0.3*(actual[:3, :3]-orientation).ravel()]
+            error = np.r_[actual[:3, 3]-target,
+                          0.3*(actual[:3, :3]-orientation).ravel()]
+            if max_step is not None:
+                error = np.r_[error, 0.001*(q[free]-anchor[free])/self.velocity[free]]
+            return error
 
         for attempt in range(attempts):
-            initial = anchor[free] if attempt == 0 else rng.uniform(self.lower[free], self.upper[free])
+            initial = anchor[free] if attempt == 0 else rng.uniform(lower[free], upper[free])
             result = least_squares(residual, initial,
-                                   bounds=(self.lower[free], self.upper[free]),
+                                   bounds=(lower[free], upper[free]),
                                    max_nfev=iterations, ftol=1e-7, xtol=1e-7, gtol=1e-7)
             solution = expand(result.x)
             actual = self.fk(solution)
@@ -230,6 +262,23 @@ class ArmKinematics:
             if pos_error < 0.008 and np.linalg.norm(actual[:3, :3]-orientation) < 0.06:
                 return solution
         raise ValueError(f'IK failed for {target.round(3).tolist()} (best position error {best:.3f} m)')
+
+    def cartesian_path(self, xyz, orientation, seed, fixed=None, spacing=0.01):
+        """Track a short straight tool path on the measured IK branch."""
+        if not math.isfinite(spacing) or spacing <= 0:
+            raise ValueError('Cartesian path spacing must be positive and finite.')
+        q = np.asarray(seed, dtype=float).copy()
+        origin = self.fk(q)[:3, 3]
+        target = np.asarray(xyz, dtype=float)
+        count = max(1, int(np.ceil(np.linalg.norm(target-origin)/spacing)))
+        path = []
+        step = np.r_[0.01, np.full(len(q)-1, 0.35)]
+        for fraction in np.linspace(0, 1, count+1)[1:]:
+            q = self.solve(origin+fraction*(target-origin), orientation, q,
+                           fixed=fixed, max_step=step, iterations=250)
+            path.append(q)
+        self.limits.validate(self.names, path)
+        return np.asarray(path)
 
     def duration(self, start, end, minimum=1.0):
         # Torso limit is only 0.035 m/s: 0.35 m cannot be commanded in 2 seconds.

@@ -1,6 +1,7 @@
 """Sensor-driven mecanum navigation with bounded searches and visible failures."""
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum, auto
 
 import numpy as np
@@ -17,14 +18,10 @@ from tf2_ros import Buffer, TransformListener, TransformException
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .ros_topics import configure_ros
+from .arm_stow import ArmStowPlanner
+from .joint_limits import JointLimits
 from .geometry import (body_velocity, forward_command, pose_xyz, row_for_height,
                        scan_points, transform_matrix, wrap, yaw)
-
-
-DOCK_STOW_POSES = {
-    'left': (0.0, 1.25, 0.0, -1.0, -0.4, 0.0, 0.0),
-    'right': (0.0, 1.25, 0.0, -1.0, 0.4, 0.0, 0.0),
-}
 
 
 class State(Enum):
@@ -92,7 +89,10 @@ class NavigationNode(Node):
             'lower_book_standoff': 0.92, 'lower_book_keepout_distance': 0.84,
             'top_book_marker_offset': 0.335, 'row_spacing': 0.33,
             'column_half_width': 0.43,
-            'arm_stow_timeout': 10.0, 'arm_stow_settle_time': 2.5,
+            'arm_stow_timeout': 30.0, 'arm_stow_settle_time': 0.3,
+            'arm_stow_joint_tolerance': 0.06,
+            'arm_stow_front_limit': 0.40, 'arm_stow_half_width': 0.55,
+            'arm_stow_link_radius': 0.06, 'arm_stow_clearance': 0.08,
             'scan_half_width': 2.6, 'scan_step': 0.65, 'scan_observe_time': 1.0,
             'docking_speed': 0.25, 'book_search_timeout': 8.0,
             'align_block_timeout': 3.0,
@@ -113,6 +113,11 @@ class NavigationNode(Node):
                     'shelf_alignment_strafe_speed'):
             if not 0 < self.p(key) <= 1.0:
                 raise ValueError(f'{key} must be >0 and <=1')
+        for key in ('arm_stow_timeout', 'arm_stow_settle_time', 'arm_stow_joint_tolerance',
+                    'arm_stow_front_limit', 'arm_stow_half_width',
+                    'arm_stow_link_radius', 'arm_stow_clearance'):
+            if not math.isfinite(self.p(key)) or self.p(key) <= 0:
+                raise ValueError(f'{key} must be finite and positive')
         self.tf = Buffer()
         self.listener = TransformListener(self.tf, self)
         self.pose = self.start = None
@@ -134,6 +139,15 @@ class NavigationNode(Node):
         self.actual_speed = 0.0
         self.arm_joints = {}
         self.arm_joint_stamp = None
+        self.arm_joint_stamps = {}
+        self.stow_planner = None
+        self.head_limits = None
+        self.stow_model_error = ''
+        self.stow_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='arm-stow')
+        self.arm_stow_future = None
+        self.arm_stow_plan = None
+        self.arm_stow_origin = None
+        self.arm_stow_confirmed_since = None
         self.arm_stow_last = None
         self.last_gate = 'clear'
         self.blocked_since = None
@@ -163,6 +177,8 @@ class NavigationNode(Node):
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_subscription(Odometry, topics['odom'], self.on_odom, qos_profile_sensor_data)
         self.create_subscription(JointState, topics['joint_states'], self.on_arm_joints, qos_profile_sensor_data)
+        self.create_subscription(String, topics['robot_description'], self.on_stow_description,
+                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         for name in ('shelf', 'shelf_unit', 'book', 'bin'):
             self.create_subscription(PoseStamped, topics[f'{name}_pose'], lambda m, n=name: self.on_pose(n, m), 10)
         for name in ('front', 'rear'):
@@ -181,7 +197,7 @@ class NavigationNode(Node):
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(0.05, self.tick)
         self.create_timer(5.0, self.wall_status, clock=self.wall_clock)
-        self.get_logger().info(f'Navigation BUILD 5.17 (pre-stow shelf-parallel alignment): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
+        self.get_logger().info(f'Navigation BUILD 5.25 (profile-aware joint limits): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
         self.transition(State.FIND_SHELF)
         self.look_for_shelf(0.0)
 
@@ -211,6 +227,20 @@ class NavigationNode(Node):
     def on_arm_joints(self, msg):
         self.arm_joints.update(zip(msg.name, msg.position))
         self.arm_joint_stamp = Time.from_msg(msg.header.stamp).nanoseconds/1e9
+        self.arm_joint_stamps.update({name: self.arm_joint_stamp
+                                      for name, _ in zip(msg.name, msg.position)})
+
+    def on_stow_description(self, msg):
+        if self.stow_planner is None:
+            try:
+                self.head_limits = JointLimits(msg.data, profile=self.ros.profile)
+                self.stow_planner = ArmStowPlanner(
+                    msg.data, self.ros.frames['base'], self.ros.frames['arm_tip'], profile=self.ros.profile)
+                self.stow_model_error = ''
+                self.get_logger().info('Loaded both URDF arm chains for dynamic dock stow.')
+            except (ValueError, AttributeError) as error:
+                self.stow_model_error = str(error)
+                self.get_logger().error(f'Cannot build arm stow model: {error}')
 
     def on_pose(self, name, msg):
         if msg.header.frame_id == self.ros.frames['odom'] and np.isfinite(pose_xyz(msg)).all():
@@ -485,6 +515,10 @@ class NavigationNode(Node):
             self.current_book_row = None
             self.book_row_pub.publish(Int32(data=-1))
         if state == State.STOW_ARMS_FOR_DOCK:
+            if self.arm_stow_future is not None:
+                self.arm_stow_future.cancel()
+            self.arm_stow_future = self.arm_stow_plan = None
+            self.arm_stow_confirmed_since = None
             self.arm_stow_last = None
         if state == State.RETURN_TO_START:
             self.return_detour_side = 0
@@ -539,46 +573,97 @@ class NavigationNode(Node):
         self.warn('book', f'Book reacquisition: {self.book_diagnostics}')
 
     def stow_arms_for_dock(self):
-        """Fold both parked arms before the base enters the shelf keepout.
-
-        These are the calibrated, full seven-joint trajectories rather than
-        partial-joint edits.  The controller receives exactly the same shape
-        of command used for live calibration, and docking starts only after
-        feedback confirms the complete pose.
-        """
-        names = {
-            'left': [f'arm_left_{i}_joint' for i in range(1, 8)],
-            'right': [f'arm_right_{i}_joint' for i in range(1, 8)],
-        }
-        if not self.fresh(self.arm_joint_stamp) or any(
-                name not in self.arm_joints for side in names.values() for name in side):
-            self.warn('arm_feedback', 'Waiting for fresh left/right arm joint feedback before shelf docking.')
+        """Plan from live joints and confirm both measured poses before docking."""
+        if self.stow_planner is None:
+            self.warn('stow_model', f'Waiting for both arm models on {self.ros.topics["robot_description"]}. {self.stow_model_error}')
             return False
-        if all(abs(self.arm_joints[name]-target) < 0.08
-               for side, joint_names in names.items()
-               for name, target in zip(joint_names, DOCK_STOW_POSES[side])):
-            return True
-        if self.arm_stow_last is not None:
-            # Gazebo can visibly complete a trajectory while its constrained
-            # joint feedback remains a little off the requested values.  The
-            # topic command already has a two-second duration; after one full
-            # settle window and still-fresh feedback, continue rather than
-            # re-publishing forever and blocking at the shelf.
-            if self.now()-self.arm_stow_last < self.p('arm_stow_settle_time'):
+        models = self.stow_planner.models
+        if any(name not in self.arm_joints or not self.fresh(self.arm_joint_stamps.get(name))
+               for model in models.values() for name in model.names):
+            self.arm_stow_confirmed_since = None
+            self.warn('arm_feedback', 'Waiting for fresh left/right arm and torso feedback before shelf docking.')
+            return False
+        if self.arm_stow_future is None:
+            reference = self.wall_reference()
+            if reference is None:
+                self.warn('stow_shelf', 'Waiting for the shelf plane before planning arm stow.')
                 return False
-            self.warn('arm_stow_settle',
-                      'Arm stow trajectory settled without exact joint feedback; continuing with the calibrated parked pose.')
-            return True
-        for side, publisher in (('left', self.left_arm_pub), ('right', self.right_arm_pub)):
-            msg = JointTrajectory()
-            msg.joint_names = names[side]
-            point = JointTrajectoryPoint()
-            point.positions = list(DOCK_STOW_POSES[side])
-            point.time_from_start.sec = 2
-            msg.points = [point]
-            publisher.publish(msg)
-        self.arm_stow_last = self.now()
-        self.get_logger().info('Stowing both arms to calibrated full poses before ALIGN_BOOK.')
+            point, normal = reference
+            c, s = math.cos(self.pose[2]), math.sin(self.pose[2])
+            normal_base = np.array([c*normal[0]+s*normal[1], -s*normal[0]+c*normal[1]])
+            wall_distance = float(-(self.pose[:2]-point) @ normal)
+            dock_distance = float(-(self.goal[:2]-point) @ normal)
+            self.arm_stow_origin = self.pose.copy()
+            self.arm_stow_start = self.arm_joints.copy()
+            self.arm_stow_future = self.stow_pool.submit(
+                self.stow_planner.plan, self.arm_stow_start, normal_base,
+                wall_distance, min(wall_distance, dock_distance),
+                front_limit=self.p('arm_stow_front_limit'),
+                half_width=self.p('arm_stow_half_width'),
+                link_radius=self.p('arm_stow_link_radius'),
+                clearance=self.p('arm_stow_clearance'))
+            self.get_logger().info('Planning compact arm poses from URDF geometry and current joint feedback.')
+            return False
+        if self.arm_stow_plan is None:
+            if not self.arm_stow_future.done():
+                return False
+            try:
+                self.arm_stow_plan = self.arm_stow_future.result()
+            except Exception as error:
+                self.fail(f'Cannot plan dock arm stow: {error}')
+                return False
+            if (np.linalg.norm(self.pose[:2]-self.arm_stow_origin[:2]) > 0.03 or
+                    abs(wrap(self.pose[2]-self.arm_stow_origin[2])) > 0.03 or
+                    any(abs(self.arm_joints[name]-self.arm_stow_start[name]) > 0.03
+                        for model in models.values() for name in model.names)):
+                self.fail('Robot moved during arm stow planning; refusing an outdated trajectory.')
+                return False
+            duration = self.arm_stow_plan.duration
+            try:
+                for side, model in models.items():
+                    names = model.names[1:]
+                    model.limits.validate(names, [[self.arm_joints[name] for name in names],
+                                                 self.arm_stow_plan.targets[side][1:]])
+                    safe_times = model.limits.times(
+                        names, [self.arm_joints[name] for name in names],
+                        self.arm_stow_plan.targets[side][1:], peak_factor=1.5)
+                    duration = max(duration, float(safe_times[-1]))
+            except ValueError as error:
+                self.fail(f'Robot joint limits rejected arm stow: {error}')
+                return False
+            for side, publisher in (('left', self.left_arm_pub), ('right', self.right_arm_pub)):
+                model = models[side]
+                target = self.arm_stow_plan.targets[side]
+                msg = JointTrajectory()
+                msg.joint_names = model.names[1:]
+                initial = JointTrajectoryPoint()
+                initial.positions = [float(self.arm_joints[name]) for name in msg.joint_names]
+                initial.velocities = [0.0]*len(msg.joint_names)
+                waypoint = JointTrajectoryPoint()
+                waypoint.positions = [float(value) for value in target[1:]]
+                # Endpoint velocities make the controller use a smooth monotonic
+                # interpolation along the joint path checked by the planner.
+                waypoint.velocities = [0.0]*len(msg.joint_names)
+                waypoint.time_from_start.sec = int(math.ceil(duration))
+                msg.points = [initial, waypoint]
+                publisher.publish(msg)
+            self.arm_stow_last = self.now()
+            self.get_logger().info(f'Executing computed arm stow ({math.ceil(duration):.0f} s); waiting for measured joints.')
+        if abs(self.arm_joints['torso_lift_joint']-self.arm_stow_start['torso_lift_joint']) > 0.02:
+            self.fail('Torso moved during dock arm stow; refusing to approach the shelf.')
+            return False
+        close = all(abs(self.arm_joints[name]-value) <= self.p('arm_stow_joint_tolerance')
+                    for side, model in models.items()
+                    for name, value in zip(model.names[1:], self.arm_stow_plan.targets[side][1:]))
+        post_command = all(self.arm_joint_stamps[name] > self.arm_stow_last
+                           for model in models.values() for name in model.names[1:])
+        if close and post_command:
+            if self.arm_stow_confirmed_since is None:
+                self.arm_stow_confirmed_since = self.now()
+            if self.now()-self.arm_stow_confirmed_since >= self.p('arm_stow_settle_time'):
+                return True
+        else:
+            self.arm_stow_confirmed_since = None
         return False
 
     def recover_book_view(self):
@@ -596,6 +681,24 @@ class NavigationNode(Node):
         self.transition(State.BACK_OUT_FOR_VIEW)
 
     def fail(self, reason):
+        if self.state == State.STOW_ARMS_FOR_DOCK and self.arm_stow_last is not None:
+            # Replace the active stow trajectory with a measured hold. A timeout
+            # must not leave the previous arm motion running after FAILED.
+            for side, publisher in (('left', self.left_arm_pub), ('right', self.right_arm_pub)):
+                names = self.stow_planner.models[side].names[1:]
+                if all(self.fresh(self.arm_joint_stamps.get(name)) for name in names):
+                    msg = JointTrajectory()
+                    msg.joint_names = names
+                    point = JointTrajectoryPoint()
+                    point.positions = [float(self.arm_joints[name]) for name in names]
+                    try:
+                        self.stow_planner.models[side].limits.validate(names, point.positions)
+                    except ValueError as error:
+                        self.get_logger().error(f'Cannot send an out-of-limit stow hold: {error}')
+                        continue
+                    point.time_from_start.sec = 1
+                    msg.points = [point]
+                    publisher.publish(msg)
         self.failure_reason = reason
         self.failure_pub.publish(String(data=reason))
         self.get_logger().error(reason)
@@ -617,16 +720,30 @@ class NavigationNode(Node):
             except TransformException:
                 pass
         tilt = float(np.clip(tilt, -0.9, 0.30))
+        names = ['head_1_joint', 'head_2_joint']
+        if self.head_limits is None:
+            return
+        if any(not self.fresh(self.arm_joint_stamps.get(name)) for name in names):
+            return
+        try:
+            positions = self.head_limits.clamp(names, [0.0, tilt])
+            duration = self.head_limits.times(
+                names, [self.arm_joints[name] for name in names], positions, minimum=1.0)[-1]
+        except (KeyError, ValueError) as error:
+            self.warn('head_limits', f'Head command rejected by robot limits: {error}')
+            return
+        tilt = positions[1]
         if self.last_head is not None and abs(self.last_head-tilt) < 0.04:
             return
         if self.head_pub.get_subscription_count() == 0:
             return
         self.last_head = tilt
         msg = JointTrajectory()
-        msg.joint_names = ['head_1_joint', 'head_2_joint']
+        msg.joint_names = names
         point = JointTrajectoryPoint()
-        point.positions = [0.0, tilt]
-        point.time_from_start.sec = 1
+        point.positions = positions
+        stamp = int(math.ceil(float(duration)*1e9))
+        point.time_from_start.sec, point.time_from_start.nanosec = divmod(stamp, 10**9)
         msg.points = [point]
         self.head_pub.publish(msg)
 
@@ -955,7 +1072,7 @@ class NavigationNode(Node):
             self.stop()
             if self.stow_arms_for_dock():
                 self.transition(State.ALIGN_BOOK)
-            elif elapsed > self.p('arm_stow_timeout'):
+            elif self.state == State.STOW_ARMS_FOR_DOCK and elapsed > self.p('arm_stow_timeout'):
                 self.fail(f'Arm stow timed out before shelf docking; inspect {self.ros.topics["joint_states"]} and both arm trajectory controllers.')
         elif self.state == State.BACK_OUT_FOR_VIEW:
             if self.drive_to(self.goal, keep_heading=True):
@@ -1013,7 +1130,7 @@ class NavigationNode(Node):
             arrived = self.drive_to(self.goal, keep_heading=True)
             if arrived or self.shelf_limited_return_arrived(self.goal):
                 if not arrived:
-                    self.get_logger().warn('Return-to-grab stopped by the shelf keepout at the safe boundary; starting the compensated arm close.')
+                    self.get_logger().warn('Return-to-grab stopped by the shelf keepout at the safe boundary; correcting the arm to the fresh book target before closing.')
                 self.result = None
                 if self.current_book_row == 1:
                     self.transition(State.WAIT_FOR_PREGRASP)
@@ -1127,5 +1244,6 @@ def main():
     finally:
         node.stop()
         node.cancel_pub.publish(Bool(data=True))
+        node.stow_pool.shutdown(wait=False, cancel_futures=True)
         node.destroy_node()
         rclpy.shutdown()

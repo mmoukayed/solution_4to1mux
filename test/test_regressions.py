@@ -17,7 +17,7 @@ from solution_4to1mux.geometry import (ArmKinematics, body_velocity, depth_media
                                       rotation, row_for_height, scan_points, wrap)
 from solution_4to1mux.digit_detector import DigitDetector
 from solution_4to1mux.navigation_node import NavigationNode, State
-from solution_4to1mux.manipulation_node import HIGH_CARRY_RIGHT_ARM, ManipulationNode
+from solution_4to1mux.manipulation_node import ManipulationNode
 from solution_4to1mux.perception_node import PerceptionNode
 restore_ros()
 # Retain the imported stand-in classes for these tests only; do not poison other imports.
@@ -47,7 +47,9 @@ def bare_nav():
                   bin_turn_backoff=.25, max_bin_turn_recoveries=2,
                   bin_turn_backoff_timeout=8.0, bin_standoff=.95,
                   bin_final_advance_max=.65, book_standoff=.68,
-                  book_lateral_offset=-.18)
+                  book_lateral_offset=-.18, book_view_backoff=.35,
+                  lower_book_standoff=.92, lower_book_keepout_distance=.84,
+                  top_book_marker_offset=.335, row_spacing=.33, column_half_width=.43)
     n.p = values.__getitem__
     n.now = lambda: 10.0
     n.pose = np.array([0., 0., 0.])
@@ -70,6 +72,9 @@ def bare_nav():
     n.log = Logger()
     n.get_logger = lambda: n.log
     n.observations = {}
+    n.current_book_row = None
+    n.book_row_pub = Pub()
+    n.arm_stow_future = None
     n.arm_joints = {f'arm_{side}_{index}_joint': 0.0
                     for side in ('left', 'right') for index in range(1, 8)}
     n.arm_joint_stamp = 10.0
@@ -162,6 +167,7 @@ def test_wrong_column_larger_colour_blob_is_rejected():
     n = PerceptionNode.__new__(PerceptionNode)
     n.ros = get_ros_config('simulation')
     n.target_colour = 'red'
+    n.target_text = ''
     n.image = np.zeros((160, 250, 3), np.uint8)
     n.image[40:100, 50:65] = (0, 0, 255)       # correct column
     n.image[30:150, 180:215] = (0, 0, 255)     # larger WRONG column
@@ -198,6 +204,7 @@ def shelf_perception(height):
     n = bare_perception_tracker()
     n.target_column = 2
     n.target_colour = 'red'
+    n.target_text = ''
     n.image = np.zeros((160, 250, 3), np.uint8)
     n.detector = NS(detect=lambda image: [(1, .9, (0, 0, 20, 30)),
                                          (2, .9, (50, 0, 20, 30))])
@@ -257,6 +264,8 @@ def test_grasp_waypoints_reach_all_four_rows_within_limits(model, height):
     n = ManipulationNode.__new__(ManipulationNode)
     n.ros = get_ros_config('simulation')
     n.model = model
+    # This solver regression deliberately targets the wrist endpoint directly.
+    n.base_to_grasp = None
     params = dict(grasp_insert_depth=.025, pregrasp_distance=.06, lift_distance=.025,
                   extract_distance=.10, bin_inset=.12, bin_release_height=.21)
     phases = n.plan('grab', np.array([.68, -.18, height]), np.array([1., 0., 0.]), np.zeros(8), params)
@@ -275,16 +284,19 @@ def test_torso_duration_respects_actual_urdf_limit(model):
     assert model.duration(start, end) >= .35/.035
 
 
-def test_high_carry_pose_moves_only_arm_and_preserves_torso(model):
+def test_carry_pose_is_solved_within_urdf_limits_and_preserves_torso(model):
     n = ManipulationNode.__new__(ManipulationNode)
     n.ros = get_ros_config('simulation')
     n.model = model
+    n.base_to_grasp = model.fixed_transform('gripper_right_base_link', 'gripper_right_grasping_link')
     current = np.zeros(8)
     current[0] = .12
     phase = n.plan_carry_raise(current)[0]
     target = phase[2]
     assert target[0] == pytest.approx(.12)
-    assert target[1:] == pytest.approx(HIGH_CARRY_RIGHT_ARM)
+    assert np.all(target >= model.lower) and np.all(target <= model.upper)
+    shoulder = model.arm_points(current)[0]
+    assert n.grasp_pose(target)[2, 3] > shoulder[2]+.20
 
 
 def test_unreachable_target_rejected_before_motion(model):
@@ -606,39 +618,31 @@ def test_missing_book_at_dock_enters_reacquisition_not_grab_or_failure():
     assert not n.failure_pub.messages
 
 
-def test_both_arms_fold_before_base_enters_align_book():
+def test_stow_stage_waits_for_computed_arm_pose_confirmation():
     n = bare_nav()
-    n.look = lambda *args, **kwargs: None
-    n.state = State.FIND_BOOK
-    n.observations['book'] = target(1., 0., .935)
+    n.state = State.STOW_ARMS_FOR_DOCK
+    n.stow_arms_for_dock = lambda: False
     n.tick()
     assert n.state == State.STOW_ARMS_FOR_DOCK
-    n.tick()
-    expected = ((n.left_arm_pub, [0.0, 1.25, 0.0, -1.0, -0.4, 0.0, 0.0]),
-                (n.right_arm_pub, [0.0, 1.25, 0.0, -1.0, 0.4, 0.0, 0.0]))
-    for publisher, pose in expected:
-        command = publisher.messages[-1]
-        assert len(command.joint_names) == 7
-        assert command.points[0].positions == pytest.approx(pose)
-    for side, pose in (('left', expected[0][1]), ('right', expected[1][1])):
-        for index, value in enumerate(pose, 1):
-            n.arm_joints[f'arm_{side}_{index}_joint'] = value
+    assert all(message.linear.x == message.linear.y == 0 for message in n.cmd_pub.messages)
+    n.stow_arms_for_dock = lambda: True
     n.tick()
     assert n.state == State.ALIGN_BOOK
 
 
-def test_calibrated_arm_stow_settle_does_not_wait_for_exact_gazebo_feedback():
+def test_stow_planning_failure_keeps_its_specific_cause():
     n = bare_nav()
-    n.look = lambda *args, **kwargs: None
-    n.state = State.FIND_BOOK
-    n.observations['book'] = target(1., 0., .935)
+    n.state = State.STOW_ARMS_FOR_DOCK
+    n.entered = -5.0  # Also past the mocked timeout; report one failure only.
+
+    def cannot_plan():
+        n.fail('No clear stow path.')
+        return False
+
+    n.stow_arms_for_dock = cannot_plan
     n.tick()
-    n.tick()  # Publish the two-second calibrated trajectories.
-    n.now = lambda: 12.6
-    n.odom_stamp = 12.6
-    n.arm_joint_stamp = 12.6
-    n.tick()
-    assert n.state == State.ALIGN_BOOK
+    assert n.state == State.FAILED
+    assert [message.data for message in n.failure_pub.messages] == ['No clear stow path.']
 
 
 def test_grasp_stages_retreat_prealign_and_base_advance_before_close():
@@ -670,7 +674,7 @@ def test_book_view_recovery_is_bounded_and_does_not_retry_a_grasp():
     n.tick()
     assert n.state == State.BACK_OUT_FOR_VIEW
     assert n.book_recoveries == 1
-    assert n.goal[0] == pytest.approx(-.2)
+    assert n.goal[0] == pytest.approx(-.35)
     n.state = State.REACQUIRE_BOOK
     n.entered = -20.
     n.tick()
@@ -758,6 +762,7 @@ def test_deep_colour_blob_inside_shelf_is_rejected():
     n = PerceptionNode.__new__(PerceptionNode)
     n.ros = get_ros_config('simulation')
     n.target_colour = 'red'
+    n.target_text = ''
     n.image = np.zeros((160, 250, 3), np.uint8)
     n.image[40:100, 50:65] = (0, 0, 255)
     n.column_pose = target(3., 0., 2.26)
