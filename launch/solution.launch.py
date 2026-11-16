@@ -47,6 +47,14 @@ def generate_launch_description():
         'top_book_clearance_height': ('0.16', float),
         'top_book_front_standoff': ('0.10', float),
         'top_book_arm_clearance': ('0.06', float),
+        'bin_inset': ('0.22', float),
+        'bin_release_height': ('0.31', float),
+        'place_clearance_height': ('0.10', float),
+        'place_torso_hover': ('0.35', float),
+        'place_position_tolerance': ('0.025', float),
+        'place_orientation_tolerance': ('0.10', float),
+        'place_correction_limit': ('0.12', float),
+        'delivery_contact_hold': ('0.5', float),
         'docking_speed': ('0.25', float),
         'book_search_timeout': ('8.0', float),
         'max_book_recoveries': ('2', int),
@@ -99,7 +107,11 @@ def generate_launch_description():
                                     'arm_stow_clearance']),
             node('manipulation_node', ['grasp_correction_limit', 'grasp_position_tolerance',
                                        'grasp_orientation_tolerance', 'top_book_clearance_height',
-                                       'top_book_front_standoff', 'top_book_arm_clearance']),
+                                       'top_book_front_standoff', 'top_book_arm_clearance',
+                                       'bin_inset', 'bin_release_height', 'place_clearance_height',
+                                       'place_torso_hover', 'place_position_tolerance',
+                                       'place_orientation_tolerance', 'place_correction_limit',
+                                       'delivery_contact_hold']),
         ]
 
     return LaunchDescription(declarations+[OpaqueFunction(function=launch_nodes)])
