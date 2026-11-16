@@ -197,7 +197,7 @@ class NavigationNode(Node):
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(0.05, self.tick)
         self.create_timer(5.0, self.wall_status, clock=self.wall_clock)
-        self.get_logger().info(f'Navigation BUILD 5.25 (profile-aware joint limits): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
+        self.get_logger().info(f'Navigation BUILD 5.26 (finite torso stow clearance): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
         self.transition(State.FIND_SHELF)
         self.look_for_shelf(0.0)
 
@@ -237,7 +237,13 @@ class NavigationNode(Node):
                 self.stow_planner = ArmStowPlanner(
                     msg.data, self.ros.frames['base'], self.ros.frames['arm_tip'], profile=self.ros.profile)
                 self.stow_model_error = ''
-                self.get_logger().info('Loaded both URDF arm chains for dynamic dock stow.')
+                self.get_logger().info(
+                    f'Loaded both URDF arm chains for dynamic dock stow; body checks use '
+                    f'{self.stow_planner.torso.source}.')
+                if self.stow_planner.torso.error:
+                    self.get_logger().warn(
+                        f'Cannot load torso collision geometry; using finite fallback: '
+                        f'{self.stow_planner.torso.error}')
             except (ValueError, AttributeError) as error:
                 self.stow_model_error = str(error)
                 self.get_logger().error(f'Cannot build arm stow model: {error}')

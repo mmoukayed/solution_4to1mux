@@ -210,6 +210,28 @@ class ArmKinematics:
             points.append((result @ tip_transform)[:3, 3])
         return np.vstack(points)
 
+    def frame_transform(self, joints, link):
+        """Transform a link on this kinematic chain into the base frame."""
+        chain = []
+        while link != self.base_link:
+            joint = self.by_child[link]
+            chain.append(joint)
+            link = joint.find('parent').get('link')
+        result = np.eye(4)
+        for joint in reversed(chain):
+            result = result @ _joint_origin(joint)
+            if joint.get('type') == 'fixed':
+                continue
+            value = joints[self.names.index(joint.get('name'))]
+            axis = np.fromstring(joint.find('axis').get('xyz'), sep=' ')
+            motion = np.eye(4)
+            if joint.get('type') == 'prismatic':
+                motion[:3, 3] = axis*value
+            else:
+                motion[:3, :3] = rotation(axis, value)
+            result = result @ motion
+        return result
+
     def solve(self, xyz, orientation, seed, attempts=12, iterations=200, fixed=None,
               max_step=None):
         target = np.asarray(xyz, dtype=float)

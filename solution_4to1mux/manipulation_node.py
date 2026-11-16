@@ -62,6 +62,7 @@ class ManipulationNode(Node):
             # above the target so the wrist does not sweep across the middle row.
             'top_book_clearance_height': 0.16,
             'top_book_front_standoff': 0.10,
+            'top_book_arm_clearance': 0.06,
             # Must match navigation.place_base_advance.  The high pre-place
             # target is compensated while the base is still before the table.
             'place_base_advance': 0.35, 'place_clearance_height': 0.20,
@@ -84,9 +85,12 @@ class ManipulationNode(Node):
         if self.p('gripper_open') == self.p('gripper_closed'):
             raise ValueError('gripper_open and gripper_closed must be different positions')
         for key in ('grasp_correction_limit', 'grasp_position_tolerance',
-                    'grasp_orientation_tolerance'):
+                    'grasp_orientation_tolerance', 'top_book_front_standoff',
+                    'top_book_arm_clearance'):
             if not math.isfinite(self.p(key)) or self.p(key) <= 0:
                 raise ValueError(f'{key} must be finite and positive')
+        if not math.isfinite(self.p('top_book_clearance_height')) or self.p('top_book_clearance_height') < 0:
+            raise ValueError('top_book_clearance_height must be finite and nonnegative')
         self.tf = Buffer()
         self.listener = TransformListener(self.tf, self)
         self.model = None
@@ -156,7 +160,7 @@ class ManipulationNode(Node):
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(0.1, self.tick, clock=self.wall_clock)
         self.get_logger().info(
-            f'Manipulation BUILD 5.25 (continuous IK + robot joint limits): {self.ros.profile} gripper positions '
+            f'Manipulation BUILD 5.27 (reachable top-row approach): {self.ros.profile} gripper positions '
             f'open={self.p("gripper_open"):.3f}, closed={self.p("gripper_closed"):.3f}.')
 
     def p(self, name):
@@ -302,7 +306,7 @@ class ManipulationNode(Node):
             self.close_target = None
             self.grasp_feedback_started = None
         current = np.array([self.joints[n] for n in self.model.names])
-        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'grasp_correction_limit', 'grasp_position_tolerance', 'grasp_orientation_tolerance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'top_book_clearance_height', 'top_book_front_standoff', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'bin_inset', 'bin_release_height')}
+        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'grasp_correction_limit', 'grasp_position_tolerance', 'grasp_orientation_tolerance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'top_book_clearance_height', 'top_book_front_standoff', 'top_book_arm_clearance', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'bin_inset', 'bin_release_height')}
         self.deferred_plan = None
         self.phases = []
         if sequence == 'prepare_grab' and self.book_row == 1:
@@ -374,6 +378,8 @@ class ManipulationNode(Node):
         # +y is robot-left in base_footprint. Keep the default target neutral;
         # a nonzero grasp_right_offset remains available for measured tuning.
         point = point+np.array([0.0, -params.get('grasp_right_offset', 0.0), 0.0]) if sequence in ('grab', 'prepare_grab', 'finish_grab') else point
+        if sequence == 'prepare_grab' and self.book_row == 1:
+            return self.plan_top_pregrasp(point, normal, current, params)
         if sequence == 'finish_place':
             if self.placement_hover_target is None:
                 raise ValueError('No staged crane pose is available; run prepare_place before finish_place.')
@@ -394,18 +400,9 @@ class ManipulationNode(Node):
             extracted = lifted-normal*params['extract_distance']
             targets = [('pregrasp', pre), ('insert', grasp), ('lift', lifted), ('extract', extracted)]
         elif sequence == 'prepare_grab':
-            if self.book_row == 1:
-                # The base has already returned to the dock for a top-row grab.
-                # Reach from outside and above, then descend to pregrasp.
-                grasp = point+normal*params['grasp_insert_depth']
-                pre = grasp-normal*params['pregrasp_distance']
-                above = pre+np.array([0.0, 0.0, params['top_book_clearance_height']])
-                front = above-normal*params['top_book_front_standoff']
-                targets = [('top_front_clearance', front), ('top_clearance', above),
-                           ('pregrasp', pre)]
-            else:
-                # At the backed-out base pose, solve for the eventual dock pose.
-                targets = [('prealign', point+normal*(params['grasp_insert_depth']-params['grasp_base_advance']))]
+            # Top-row preparation is handled by plan_top_pregrasp above.
+            # Lower rows compensate for the upcoming base advance.
+            targets = [('prealign', point+normal*(params['grasp_insert_depth']-params['grasp_base_advance']))]
         elif sequence == 'finish_grab':
             grasp = point+normal*params['grasp_insert_depth']
             actual_grasp = self.grasp_pose(current)
@@ -460,17 +457,10 @@ class ManipulationNode(Node):
             q = current.copy()
             if sequence == 'prepare_place':
                 q[0] = min(self.model.upper[0], params['place_torso_hover'])
-            elif sequence == 'prepare_grab' and self.book_row == 1:
-                # Top-row IK needs the torso at its upper travel limit. Solve
-                # with that value fixed; the torso is raised in its own phase
-                # before any arm waypoint begins.
-                q[0] = self.model.upper[0]
             candidate = []
             try:
                 for name, xyz in targets:
-                    fixed_torso = (sequence == 'prepare_place' or
-                                   sequence == 'finish_grab' and (self.book_row == 1 or name == 'insert') or
-                                   sequence == 'prepare_grab' and self.book_row == 1)
+                    fixed_torso = sequence == 'prepare_place'
                     fixed = {0: q[0]} if fixed_torso else None
                     tip_xyz = xyz if offset is None else xyz-orientation @ offset
                     if sequence == 'finish_grab':
@@ -520,10 +510,6 @@ class ManipulationNode(Node):
                     confirmation, ('close_gripper', 'close', None, 1.0), motions[2], motions[3],
                     ('verify_book_held', 'verify', None, 0.8)]
         if sequence == 'prepare_grab':
-            if self.book_row == 1:
-                # Keep the solved pregrasp as the safe retreat if insertion fails.
-                self.retreat_target = motions[-1][2]
-                return [('open_gripper', 'open', None, 1.0)]+motions
             return [('open_gripper', 'open', None, 1.0), motions[0]]
         if sequence == 'finish_grab':
             if self.book_row == 1 and self.retreat_target is None:
@@ -542,6 +528,94 @@ class ManipulationNode(Node):
                             ('verify_delivery', 'delivery', None, 3.0)]
         return motions+[('release_book', 'open', None, 1.0),
                         ('verify_delivery', 'delivery', None, 3.0)]
+
+    def top_path_margin(self, start, path, point, normal, arm_clearance):
+        """Keep the sampled arm/wrist path in front of the book's shelf plane.
+
+        The grasp frame may approach the spine; the thicker arm and wrist need
+        full clearance. This plane check does not replace mesh collision checks.
+        """
+        distance = float(point @ normal)
+        margin = float('inf')
+        before = start
+        for target in np.atleast_2d(path):
+            count = max(3, int(np.ceil(np.max(np.abs(target-before))/0.04))+1)
+            for fraction in np.linspace(0., 1., count):
+                q = before+fraction*(target-before)
+                points = self.model.arm_points(q, self.base_to_grasp)
+                margin = min(margin, distance-arm_clearance-float(np.max(points[:-1] @ normal)),
+                             distance-float(points[-1] @ normal))
+            before = target
+        return margin
+
+    def plan_top_pregrasp(self, point, normal, current, params):
+        """Find the highest reachable complete approach at the safe torso limit."""
+        height = params['top_book_clearance_height']
+        standoff = params['top_book_front_standoff']
+        arm_clearance = params.get('top_book_arm_clearance', .06)
+        if (not np.isfinite([height, standoff, arm_clearance]).all() or height < 0 or
+                min(standoff, arm_clearance) <= 0):
+            raise ValueError('Top-row geometry needs nonnegative height and positive clearances.')
+        grasp = point+normal*params['grasp_insert_depth']
+        pre = grasp-normal*params['pregrasp_distance']
+        facing = rotation([0, 0, 1], math.atan2(normal[1], normal[0]))
+        errors = []
+        for extra_height in np.linspace(height, 0., 5) if height > 0 else [0.]:
+            above = pre+np.array([0., 0., extra_height])
+            front = above-normal*standoff
+            targets = ([('top_front_clearance', front), ('top_clearance', above), ('pregrasp', pre)]
+                       if extra_height > 0 else [('top_front_clearance', front), ('pregrasp', pre)])
+            candidates = []
+            for roll in (math.pi, 0.):
+                grasp_orientation = facing @ rotation([1, 0, 0], roll)
+                orientation = (grasp_orientation if self.base_to_grasp is None else
+                               grasp_orientation @ self.base_to_grasp[:3, :3].T)
+                offset = np.zeros(3) if self.base_to_grasp is None else orientation @ self.base_to_grasp[:3, 3]
+                seed = current.copy()
+                seed[0] = self.model.upper[0]
+                candidate, before = [], current.copy()
+                try:
+                    for index, (name, xyz) in enumerate(targets):
+                        if index == 0:
+                            try:
+                                target = self.model.solve(xyz-offset, orientation, seed, fixed={0: seed[0]})
+                                path = np.atleast_2d(target)
+                            except ValueError as error:
+                                path, first_error = None, str(error)
+                            if path is None or self.top_path_margin(before, path, point, normal, arm_clearance) < -0.003:
+                                # IK seeds are not commanded poses. Try two
+                                # other bounded solutions before discarding a
+                                # reachable target with an unsafe first branch.
+                                for initial in (np.clip(np.zeros_like(seed), self.model.lower, self.model.upper),
+                                                (self.model.lower+self.model.upper)/2):
+                                    initial[0] = seed[0]
+                                    try:
+                                        target = self.model.solve(xyz-offset, orientation, initial,
+                                                                  fixed={0: seed[0]}, attempts=2)
+                                    except ValueError:
+                                        continue
+                                    alternative = np.atleast_2d(target)
+                                    if self.top_path_margin(before, alternative, point, normal, arm_clearance) >= -0.003:
+                                        path = alternative
+                                        break
+                            if path is None:
+                                raise ValueError(first_error)
+                        else:
+                            path = self.model.cartesian_path(xyz-offset, orientation, seed, fixed={0: seed[0]})
+                        if self.top_path_margin(before, path, point, normal, arm_clearance) < -0.003:
+                            raise ValueError('sampled arm path enters the shelf-front plane')
+                        times = self.model.limits.times(self.model.names, before, path, minimum=1.)
+                        candidate.append((name, 'motion', path if len(path) > 1 else path[0], float(times[-1])))
+                        seed, before = path[-1], path[-1]
+                    candidates.append((sum(phase[3] for phase in candidate), candidate))
+                except ValueError as error:
+                    errors.append(f'{extra_height:.3f} m hover, roll {roll:.2f}, {name}: {error}')
+            if candidates:
+                motions = min(candidates, key=lambda item: item[0])[1]
+                self.retreat_target = np.atleast_2d(motions[-1][2])[-1].copy()
+                self.top_pregrasp_height = float(extra_height)
+                return [('open_gripper', 'open', None, 1.)]+motions
+        raise ValueError('No reachable shelf-clear top-row pregrasp. '+'; '.join(errors))
 
     def plan_carry_raise(self, current):
         """Solve a raised carry pose beside the shoulder within this robot's limits.
@@ -757,6 +831,10 @@ class ManipulationNode(Node):
             if self.plan_future.done():
                 try:
                     self.phases = self.plan_future.result()
+                    if self.active == 'prepare_grab' and self.book_row == 1:
+                        self.get_logger().info(
+                            f'Top-row approach planned with {self.top_pregrasp_height:.3f} m extra hover; '
+                            'torso remains at its loaded safe upper limit.')
                     if self.active == 'prepare_place':
                         hover = next((phase[2] for phase in self.phases
                                       if phase[1] == 'motion'), None)

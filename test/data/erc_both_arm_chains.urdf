@@ -205,4 +205,22 @@
     <safety_controller k_position="20" k_velocity="20" soft_lower_limit="-0.001" soft_upper_limit="0.07" />
     <dynamics damping="0.03" />
   </joint>
+<!-- Torso STL bounding boxes extracted from the supplied URDF meshes. -->
+<link name="torso_base_link"><collision>
+      <origin rpy="0 0 0" xyz="0.06799732148647308 -0.00010978430509567261 0.25994873046875" />
+      <geometry>
+        <box size="0.3982024 0.33878094 0.51989746" /></geometry>
+    </collision>
+  </link>
+<link name="torso_lift_link"><collision>
+      <origin rpy="0 0 0" xyz="-0.05602341145277023 0.0 -0.15171079337596893" />
+      <geometry>
+        <box size="0.37192047 0.40434423 0.4658216" /></geometry>
+    </collision>
+    <collision>
+      <origin rpy="0 0 -1.5707963267949" xyz="-0.2523225644345464 3.1279738581037065e-05 0.008240381082843862" />
+      <geometry>
+        <box size="0.3 0.24 0.006" /></geometry>
+    </collision>
+  </link>
 </robot>

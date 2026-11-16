@@ -1,6 +1,6 @@
 """Compute compact arm poses from URDF geometry and measured joint positions.
 
-Clearance checks use joint-to-joint capsules and a torso-side envelope, not
+Clearance checks use joint-to-joint capsules and finite torso bounds, not
 mesh collision checking. Planning fails if no checked straight joint path exists.
 """
 from dataclasses import dataclass
@@ -9,6 +9,7 @@ import numpy as np
 from scipy.optimize import least_squares
 
 from .geometry import ArmKinematics
+from .torso_clearance import TorsoClearance
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,7 @@ class ArmStowPlanner:
     """Find nearby compact poses for both arms while keeping the torso fixed."""
 
     def __init__(self, urdf, base, right_tip, profile='simulation'):
+        self.torso = TorsoClearance(urdf)
         self.models = {}
         for side in ('left', 'right'):
             tip = right_tip.replace('right', side)
@@ -60,6 +62,7 @@ class ArmStowPlanner:
             # it lies outside the live checking layer's command-margin band.
             seed[0] = current[0]
             shoulder = self.points(model, seed)[0]
+            torso_boxes = self.torso.bounds(model, current)
             sign = 1.0 if shoulder[1] >= 0 else -1.0
             # Geometric intent: tuck the hand beside and below its own shoulder.
             # The optimizer determines every joint angle from the actual model.
@@ -74,11 +77,10 @@ class ArmStowPlanner:
                     points[:, 2]-link_radius-clearance])
 
             def posture_margins(points):
-                return np.concatenate([
-                    # Shoulder joints attach at the torso side; the elbow and
-                    # hand need the full capsule separation when stowed.
-                    sign*points[1:3, 1]-(abs(shoulder[1])-link_radius),
-                    sign*points[3:, 1]-(abs(shoulder[1])+link_radius)])
+                # A hand in front of the torso may safely cross the centreline.
+                # Check finite elbow/forearm/hand segments against the body,
+                # not a side plane that extends all the way to the shelf.
+                return self.torso.segment_margins(points[3:], torso_boxes, link_radius)
 
             def margins(q, compact=False, points=None):
                 if points is None:
@@ -106,14 +108,14 @@ class ArmStowPlanner:
                                  'back away or reposition it first.')
             start_posture = posture_margins(start_points)
             if np.min(start_posture) < -0.015:
-                raise ValueError(f'{side} arm has insufficient torso-side clearance '
+                raise ValueError(f'{side} arm has insufficient finite torso clearance '
                                  f'at the starting pose ({np.min(start_posture):.3f} m margin); '
                                  'reposition it before stowing.')
             # An extended arm need not already satisfy the transport envelope:
             # the default low-torso pose has fingertips below the transport
             # height. Check actual ground clearance throughout the path instead.
-            # Small overlap with the conservative torso-side capsule may exist
-            # at the shoulder; do not worsen it while retracting, and require
+            # Small overlap with conservative torso bounding boxes may exist;
+            # do not worsen it while retracting, and require
             # the endpoint to clear the entire compact envelope. Shelf/ground
             # margins are never relaxed to the starting posture.
             baseline = np.r_[np.zeros_like(start_obstacles),
