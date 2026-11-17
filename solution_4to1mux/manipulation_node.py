@@ -1,0 +1,1108 @@
+
+"""One-arm RGB-D grasp waypoints, controller results and contact verification.
+
+Gripper commands use the trajectory topic; the simulation clamp is topic-only.
+The live profile also lists the hardware's gripper action endpoints.
+This local IK/waypoint controller does not provide whole-body collision planning.
+"""
+import math
+import json
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+import rclpy
+from action_msgs.msg import GoalStatus
+from control_msgs.action import FollowJointTrajectory
+from geometry_msgs.msg import PointStamped, PoseStamped
+from rclpy.action import ActionClient
+from rclpy.clock import Clock, ClockType
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, qos_profile_sensor_data
+from rclpy.time import Time
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool, Int32, String
+from tf2_ros import Buffer, TransformListener, TransformException
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+from .ros_topics import configure_ros
+from .runtime_health import current_transform, is_controller_deactivation, sample_age
+from .geometry import ArmKinematics, pose_xyz, rotation, transform_matrix, yaw
+
+GRIPPER_JOINT = 'gripper_right_finger_joint'
+GRIPPER_GRASP_FRAME = 'gripper_right_grasping_link'
+ARM_JOINTS = [f'arm_right_{i}_joint' for i in range(1, 8)]
+# User-calibrated high carry pose.  This is arm-only: torso_lift_joint remains
+# at its measured current value.
+HIGH_CARRY_RIGHT_ARM = np.array([0.0, 1.25, 0.0, -1.0, 0.2, 1.7, 0.0])
+
+
+def entity_name(value):
+    return value if isinstance(value, str) else getattr(value, 'name', '')
+
+
+
+class ManipulationNode(Node):
+    controller_fault = ''
+
+    def __init__(self):
+        super().__init__('manipulation_node')
+        self.ros = configure_ros(self)
+        topics = self.ros.topics
+        simulation = self.ros.profile == 'simulation'
+        for name, value in {
+            # The sim clamp's joint convention is opposite to the live robot:
+            # sim 0.0 is closed and 0.069 is fully open; live 0.0 is open.
+            'gripper_open': 0.066 if simulation else 0.0,
+            'gripper_closed': 0.0 if simulation else 0.79,
+            # Insert past the measured spine rather than asking the base to
+            # violate its shelf keepout. Keep the lateral target centred on
+            # perception; the former 1.5 cm right bias led to left-only contact.
+            'grasp_insert_depth': 0.085, 'grasp_right_offset': 0.0,
+            'pregrasp_distance': 0.10,
+            'lift_distance': 0.025, 'extract_distance': 0.10,
+            # Must match navigation.grasp_base_return_advance.  This offsets
+            # the prealignment target while the base is backed out.
+            'grasp_base_advance': 0.28,
+            # Top-row pickup stays folded during base return, then approaches
+            # above the target so the wrist does not sweep across the middle row.
+            'top_book_clearance_height': 0.12,
+            'top_book_front_standoff': 0.10,
+            # Must match navigation.place_base_advance.  The high pre-place
+            # target is compensated while the base is still before the table.
+            'place_base_advance': 0.35, 'place_clearance_height': 0.20,
+            'place_torso_hover': 0.35, 'place_torso_drop': 0.0,
+            'target_max_age': 2.0, 'finish_grab_target_max_age': 120.0, 'gripper_timeout': 8.0,  # finish_grab reuses the book pose frozen at prepare_grab
+            'placement_target_max_age': 30.0,
+            'grip_contact_hold': 1.0,
+            'motion_timeout_margin': 8.0, 'planning_timeout': 60.0,
+            'motion_speed_scale': 0.60,
+            'tf_max_age': 1.0,
+            # The measured bin point is near the far half of its opening;
+            # release 22 cm back toward the robot for a centred drop.
+            'bin_release_x': 0.78,  # base frame, with the base stopped by the table edge; <= 0 to use the bin pose
+            'bin_release_z': 1.08,  # the grasp point's height at release: the book hangs ~7 cm under it, the rim is at 0.95
+            'bin_inset': 0.20,  # aim this far short of the measured bin point (it reads ~0.12 m past the bin's centre)
+             'bin_release_height': 0.21,
+        }.items():
+            self.declare_parameter(name, value)
+        gripper_limit = 0.069 if simulation else 0.803
+        for key in ('gripper_open', 'gripper_closed'):
+            if not 0 <= self.p(key) <= gripper_limit:
+                raise ValueError(
+                    f'{key} must lie in the {self.ros.profile} gripper interval '
+                    f'[0, {gripper_limit:.3f}]')
+        if self.p('gripper_open') == self.p('gripper_closed'):
+            raise ValueError('gripper_open and gripper_closed must be different positions')
+        if not 0 < self.p('motion_speed_scale') <= 0.80:
+            raise ValueError('motion_speed_scale must be >0 and <=0.80')
+        if not math.isfinite(self.p('tf_max_age')) or self.p('tf_max_age') <= 0:
+            raise ValueError('tf_max_age must be finite and >0')
+        self.tf = Buffer()
+        self.listener = TransformListener(self.tf, self)
+        self.model = None
+        self.model_error = ''
+        self.base_to_grasp = None
+        self.joints = {}
+        self.joint_stamp = None
+        self.targets = {}
+        self.selected_grasp_target = None
+        self.prepared_at = None
+        self.grasp_prepared = False
+        self.book_row = None
+        self.contacts = {}
+        self.grip_history = []   # (time, gripper position): the grasp check where no contact topic exists
+        self.holding_book = None
+        self.controller_fault = ''
+        self.bin_contact_stamp = None
+        self.arm = ActionClient(self, FollowJointTrajectory, self.ros.actions['right_arm_trajectory'])
+        self.torso = ActionClient(self, FollowJointTrajectory, self.ros.actions['torso_trajectory'])
+        self.gripper_pub = self.create_publisher(JointTrajectory, topics['right_gripper_command'], 10)
+        self.ready_pub = self.create_publisher(Bool, topics['manipulation_ready'], 10)
+        self.holding_pub = self.create_publisher(Bool, topics['holding_book'], 10)
+        self.failure_pub = self.create_publisher(String, topics['manipulation_failure'], QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.robot_fault_pub = self.create_publisher(String, topics['robot_fault'],
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(String, topics['robot_fault'], self.on_robot_fault,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.grab_pub = self.create_publisher(Bool, topics['grab_complete'], 10)
+        self.prepared_pub = self.create_publisher(Bool, topics['grab_prepared'], 10)
+        self.place_pub = self.create_publisher(Bool, topics['place_complete'], 10)
+        self.place_prepared_pub = self.create_publisher(Bool, topics['place_prepared'], 10)
+        self.carry_raised_pub = self.create_publisher(Bool, topics['carry_raised'], 10)
+        self.create_subscription(String, topics['robot_description'], self.on_description,
+                                   QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(Int32, topics['book_row'], self.on_book_row,
+                                   QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(JointState, topics['joint_states'], self.on_joints, qos_profile_sensor_data)
+        self.create_subscription(PoseStamped, topics['grasp_target_pose'],
+            lambda msg: setattr(self, 'selected_grasp_target', msg),
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        for name in ('book', 'bin'):
+            self.create_subscription(PoseStamped, topics[f'{name}_pose'], lambda m, n=name: self.targets.update({n: m}), 10)
+        self.measure_pub = self.create_publisher(Bool, topics['measure_hand'], 10)
+        self.check_held_pub = self.create_publisher(Bool, topics['check_held'], 10)
+        self.seen_held = None           # (held?, when) from perception's grasp check
+        self.create_subscription(Bool, topics['book_held'], lambda m: setattr(self, 'seen_held', (m.data, self.now())), 10)
+        # the robot's right finger position is dead (read 0 all session, 6 Nov): no position feedback there
+        self.finger_feedback = self.ros.profile != 'real'
+        self.hand_corr = None           # (correction in base_footprint, when) from the hand measurement
+        self.create_subscription(PointStamped, topics['hand_offset'], self.on_hand_offset, 10)
+        self.create_subscription(Bool, topics['request_grab'], lambda m: self.request('grab') if m.data else None, 10)
+        self.create_subscription(Bool, topics['request_prepare_grab'], lambda m: self.request('prepare_grab') if m.data else None, 10)
+        self.create_subscription(Bool, topics['request_finish_grab'], lambda m: self.request('finish_grab') if m.data else None, 10)
+        self.create_subscription(Bool, topics['request_place'], lambda m: self.request('place') if m.data else None, 10)
+        self.create_subscription(Bool, topics['request_prepare_place'], lambda m: self.request('prepare_place') if m.data else None, 10)
+        self.create_subscription(Bool, topics['request_finish_place'], lambda m: self.request('finish_place') if m.data else None, 10)
+        self.create_subscription(Bool, topics['request_raise_carry'], lambda m: self.request('raise_carry') if m.data else None, 10)
+        self.create_subscription(Bool, topics['cancel_manipulation'], lambda m: self.abort('Cancelled by navigation', allow_retract=False) if m.data and self.active else None, 10)
+        if topics['contacts'] is not None or topics['bin_contacts'] is not None:
+            from ros_gz_interfaces.msg import Contacts
+            if topics['contacts'] is not None:
+                self.create_subscription(Contacts, topics['contacts'], self.on_contacts, qos_profile_sensor_data)
+            if topics['bin_contacts'] is not None:
+                self.create_subscription(Contacts, topics['bin_contacts'], self.on_bin_contacts, qos_profile_sensor_data)
+        if topics['contacts'] is None or topics['bin_contacts'] is None:
+            self.get_logger().info(
+                'Live verification uses the camera for grasp confirmation. '
+                'There is no bin sensor: placement reports release, not independently verified delivery.')
+        self.pool = ThreadPoolExecutor(max_workers=1)
+        self.plan_future = None
+        self.arm_in_shelf = False
+        self.retreat_target = None
+        self.placement_hover_target = None
+        self.active = None
+        self.phase = None
+        self.phases = []
+        self.deferred_plan = None
+        self.handles = []
+        self.pending = 0
+        self.token = 0
+        self.deadline = 0.0
+        self.warned_at = -100.0
+        # Publish readiness on wall time, even while Gazebo sim time is paused.
+        # Motion deadlines still use the simulator clock in tick().
+        self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
+        self.create_timer(0.1, self.tick, clock=self.wall_clock)
+        self.get_logger().info(
+            f'Manipulation BUILD 8.0: {self.ros.profile} gripper positions '
+            f'open={self.p("gripper_open"):.3f}, closed={self.p("gripper_closed"):.3f}.')
+
+    def p(self, name):
+        return self.get_parameter(name).value
+
+    def now(self):
+        return self.get_clock().now().nanoseconds/1e9
+
+    def fresh(self, stamp, age=1.0):
+        return stamp is not None and 0 <= self.now()-stamp <= age
+
+    def on_description(self, msg):
+        if self.model is None:
+            try:
+                self.model = ArmKinematics(msg.data, base=self.ros.frames['base'],
+                                           tip=self.ros.frames['arm_tip'])
+                self.model.speed_scale = self.p('motion_speed_scale')
+                self.link_models = []
+                for link in ('arm_right_3_link', 'arm_right_4_link', 'arm_right_5_link', 'arm_right_6_link'):
+                    try:
+                        self.link_models.append(ArmKinematics(msg.data, base=self.ros.frames['base'], tip=link))
+                    except Exception:
+                        pass
+                self.get_logger().info(f'Loaded right-arm/torso kinematics and limits from {self.ros.topics["robot_description"]}.')
+                try:
+                    self.base_to_grasp = self.model.fixed_transform(
+                        self.ros.frames['arm_tip'], GRIPPER_GRASP_FRAME)
+                    self.get_logger().info(
+                        f'Loaded fixed grasp-frame transform from '
+                        f'{self.ros.frames["arm_tip"]} to {GRIPPER_GRASP_FRAME}.')
+                except ValueError as error:
+                    # The live TIAGo Pro URDF has no grasping link: use the simulator's
+                    # fixed gripper_right_grasping_frame_joint (xyz 0 0 0.157157, rpy 0 -1.57 0).
+                    c, s = np.cos(-1.57), np.sin(-1.57)
+                    self.base_to_grasp = np.array([[c, 0., s, 0.], [0., 1., 0., 0.],
+                                                   [-s, 0., c, 0.157157], [0., 0., 0., 1.]])
+                    self.get_logger().warn(f'{error}; using the simulator grasp-frame offset.')
+            except (ValueError, AttributeError) as error:
+                self.model_error = str(error)
+                self.get_logger().error(f'Cannot load arm model: {error}')
+
+    def on_joints(self, msg):
+        if not np.isfinite(msg.position).all():
+            return
+        self.joints.update(zip(msg.name, msg.position))
+        self.joint_stamp = Time.from_msg(msg.header.stamp).nanoseconds/1e9
+        if GRIPPER_JOINT in msg.name:
+            self.grip_history.append((self.joint_stamp, self.joints[GRIPPER_JOINT]))
+            self.grip_history = [h for h in self.grip_history if h[0] > self.joint_stamp-0.6]
+
+    def on_book_row(self, msg):
+        self.book_row = int(msg.data) if 1 <= msg.data <= 4 else None
+
+    def on_contacts(self, msg):
+        for contact in msg.contacts:
+            a, b = entity_name(contact.collision1), entity_name(contact.collision2)
+            for gripper, book in ((a, b), (b, a)):
+                if 'gripper_right_' not in gripper or 'book' not in book:
+                    continue
+                side = 'left' if 'left' in gripper else 'right' if 'right' in gripper else None
+                if side:
+                    self.contacts[(book, side)] = self.now()
+
+    def on_hand_offset(self, msg):
+        # the height comes from the book itself (camera: within 1-4 cm of the true centre on every twin run); the
+        # hand's vertical reading is biased when the head looks steeply down at the gripper (lower rows: -2 to
+        # -6.5 cm, the grasp ended below the book centre and the wrist met the board under it, twin m7 s37)
+        self.hand_corr = (np.array([msg.point.x, msg.point.y, 0.0]), self.now())
+
+    def held_book(self):
+        if not self.finger_feedback:
+            return self.holding_book          # decided by the timed close and the visual check
+        if self.ros.topics['contacts'] is None:
+            # The live robot has no contact topic: the fingers held still for 0.5 s, stopped
+            # clearly short of fully shut (0.79) and clearly closed from open (0.0), is a book.
+            if not self.fresh(self.joint_stamp, 0.5) or len(self.grip_history) < 5:
+                return None
+            span = self.grip_history[-1][0]-self.grip_history[0][0]
+            qs = [q for _, q in self.grip_history]
+            if span >= 0.5 and max(qs)-min(qs) < 0.004 and 0.35 <= qs[-1] <= 0.75:
+                return 'book_by_gripper_position'
+            return None
+        books = {book for book, _ in self.contacts}
+        for book in books:
+            if all(self.fresh(self.contacts.get((book, side)), 0.5) for side in ('left', 'right')):
+                return book
+        return None
+
+    def on_bin_contacts(self, msg):
+        # A collision with the robot itself is not evidence that the book was delivered.
+        if not self.holding_book:
+            return
+        for contact in msg.contacts:
+            names = [entity_name(contact.collision1), entity_name(contact.collision2)]
+            if self.holding_book in names and any('collection_bin' in n for n in names):
+                self.bin_contact_stamp = self.now()
+
+    def readiness_issues(self):
+        issues = []
+        if self.controller_fault:
+            issues.append(f'Robot fault latched: {self.controller_fault}')
+        if self.model is None:
+            detail = f'URDF model not loaded from {self.ros.topics["robot_description"]}'
+            if self.model_error:
+                detail += f' ({self.model_error})'
+            issues.append(detail)
+        elif self.base_to_grasp is None:
+            issues.append(
+                f'URDF has no fixed transform from {self.ros.frames["arm_tip"]} '
+                f'to {GRIPPER_GRASP_FRAME}')
+        if not self.fresh(self.joint_stamp):
+            issues.append(f'no fresh joint feedback on {self.ros.topics["joint_states"]}')
+        elif self.model is not None:
+            missing = [name for name in self.model.names+[GRIPPER_JOINT]
+                       if name not in self.joints]
+            if missing:
+                issues.append(f'{self.ros.topics["joint_states"]} is missing {missing}')
+        if not self.arm.server_is_ready():
+            issues.append(f'arm action unavailable: {self.ros.actions["right_arm_trajectory"]}')
+        if not self.torso.server_is_ready():
+            issues.append(f'torso action unavailable: {self.ros.actions["torso_trajectory"]}')
+        if self.gripper_pub.get_subscription_count() == 0:
+            issues.append(f'no subscriber on gripper topic {self.ros.topics["right_gripper_command"]}')
+        return issues
+
+    def ready(self):
+        return not self.readiness_issues()
+
+    def request(self, sequence):
+        if self.controller_fault:
+            self.report(sequence, False, f'Robot fault latched: {self.controller_fault}; operator recovery and a fresh launch are required.')
+            return
+        if self.active:
+            return
+        if self.plan_future is not None and not self.plan_future.done():
+            self.report(sequence, False, 'Previous IK worker is still finishing; wait before retrying.')
+            return
+        self.pending_request = None
+        issues = self.readiness_issues()
+        if issues:
+            self.report(sequence, False, 'Readiness blocked: '+'; '.join(issues)+'.')
+            return
+        if sequence in ('place', 'prepare_place', 'finish_place', 'raise_carry') and not self.holding_book:
+            self.report(sequence, False, 'Cannot place: no verified grasp.')
+            return
+        if sequence == 'raise_carry':
+            self.active = sequence
+            self.token += 1
+            self.arm_in_shelf = False
+            self.retreat_target = None
+            self.phase = 'planning'
+            self.deadline = self.now()+self.p('planning_timeout')
+            current = np.array([self.joints[n] for n in self.model.names])
+            self.plan_future = self.pool.submit(self.plan_carry_raise, current)
+            self.get_logger().info('raise_carry: moving the held book to the predefined high right-arm carry pose.')
+            return
+        if sequence == 'prepare_place':
+            self.placement_hover_target = None
+        target = self.targets.get('book' if sequence in ('grab', 'prepare_grab', 'finish_grab') else 'bin')
+        # the book as measured before the arm came up: once the hand is in front of it, perception sees only
+        # the part the hand leaves visible and its "centre" drifts (twin: 9 cm up, the fingers closed above it)
+        if sequence == 'prepare_grab':
+            target = self.selected_grasp_target or target
+            self.grasp_prepared = False
+            self.grab_target = target
+        elif sequence == 'finish_grab':
+            if not self.grasp_prepared or not self.fresh(self.prepared_at, 30.0):
+                self.report(sequence, False, 'Missing or expired completed prepare_grab.')
+                return
+            target = self.grab_target
+        # finish_grab: the hand at the pregrasp hides the book from the head camera; the book and
+        # the parked base have not moved, so its last pose (in odom) is still good
+        target_age = (self.p('placement_target_max_age') if sequence in ('place', 'prepare_place', 'finish_place')
+                      else self.p('finish_grab_target_max_age') if sequence == 'finish_grab'
+                      else 20.0 if sequence == 'prepare_grab' and self.selected_grasp_target is not None
+                      else self.p('target_max_age'))
+        if sequence == 'finish_place' and self.p('place_torso_drop') < 0.01:
+            # the release is only "open the gripper": the hand may hide the bin from the camera by now
+            self.active = sequence
+            self.token += 1
+            self.phases = [('release_book', 'open', None, 1.0), ('verify_delivery', 'delivery', None, 3.0)]
+            self.next_phase()
+            return
+        stale = (target is None or target.header.frame_id != self.ros.frames['odom'] or
+                 not self.fresh(Time.from_msg(target.header.stamp).nanoseconds/1e9, target_age))
+        if stale and sequence == 'prepare_grab':
+            # robot_worst: depth stalls at 0.3 Hz for a minute and the camera drops to 1/4 rate, so the book pose
+            # can be a few s old at the moment of asking (twin m2 s13). Wait for a fresh one; the base is parked,
+            # so a pose up to 8 s old is still the book.
+            first = getattr(self, 'target_wait_since', None) or self.now()
+            self.target_wait_since = first
+            waited = self.now()-first
+            old_ok = (target is not None and target.header.frame_id == self.ros.frames['odom'] and
+                      self.fresh(Time.from_msg(target.header.stamp).nanoseconds/1e9, 8.0))
+            if waited < 12.0 and not (waited > 6.0 and old_ok):
+                self.pending_request = sequence
+                return
+            stale = not old_ok
+            if not stale:
+                self.grab_target = target
+        self.target_wait_since = None
+        if stale:
+            self.report(sequence, False, f'No fresh target pose in {self.ros.frames["odom"]}; inspect RGB-D perception.')
+            return
+        try:
+            tf = self.tf.lookup_transform(self.ros.frames['base'], self.ros.frames['odom'], Time())
+        except TransformException as error:
+            self.report(sequence, False, f'Cannot transform target to robot base: {error}')
+            return
+        tf_stamp = Time.from_msg(tf.header.stamp).nanoseconds/1e9
+        if not current_transform(self.now(), tf_stamp, self.p('tf_max_age')):
+            self.latch_robot_fault(f'Base/odom TF is stale or clock-skewed (age {self.now()-tf_stamp:+.2f} s); refusing manipulation.')
+            self.report(sequence, False, self.controller_fault)
+            return
+        matrix = transform_matrix(tf.transform)
+        point = (matrix @ np.r_[pose_xyz(target), 1])[:3]
+        if sequence in ('grab', 'finish_grab') and self.hand_corr is not None and self.now()-self.hand_corr[1] < 120.0:
+            # the auto-calibrated grasp: aim where the camera says the book is, shifted by the
+            # difference between where the arm's kinematics and the camera put the hand
+            point = point+self.hand_corr[0]
+            self.get_logger().info(f'{sequence}: grasp target corrected by the hand measurement {self.hand_corr[0].round(3)} m')
+        normal_world = np.array([math.cos(yaw(target.pose.orientation)), math.sin(yaw(target.pose.orientation)), 0])
+        normal = matrix[:3, :3] @ normal_world
+        normal[2] = 0
+        if not np.isfinite(normal).all() or np.linalg.norm(normal) < 1e-6:
+            self.report(sequence, False, 'Invalid shelf normal in target pose.')
+            return
+        normal /= np.linalg.norm(normal)
+        self.active = sequence
+        self.token += 1
+        self.arm_in_shelf = False
+        if sequence != 'finish_grab':
+            self.retreat_target = None
+        current = np.array([self.joints[n] for n in self.model.names])
+        params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'top_book_clearance_height', 'top_book_front_standoff', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'place_torso_drop', 'bin_inset', 'bin_release_height', 'bin_release_z', 'bin_release_x')}
+        self.deferred_plan = None
+        self.phases = []
+        if sequence == 'prepare_grab':
+            self.hand_applied = False
+            self.prepare_args = (point.copy(), normal.copy(), params)
+        if sequence == 'prepare_grab' and self.book_row == 1:
+            # Raise first, before IK is attempted, so an unreachable seed can
+            # never prevent the torso from moving to the top-row reach height.
+            self.deferred_plan = (sequence, point, normal, params)
+            torso_target = current.copy()
+            torso_target[0] = self.model.upper[0]
+            try:
+                self.check_shelf_clear(current, [torso_target], point, normal)
+            except ValueError as error:
+                self.abort(f'Top-row clearance refused before torso lift: {error}')
+                return
+            if abs(torso_target[0]-current[0]) > 0.005:
+                duration = self.model.duration(current, torso_target, 1.0)
+                self.phases = [('raise_torso_for_top_book', 'torso',
+                                torso_target, duration)]
+            self.next_phase()
+            return
+        if sequence == 'prepare_grab':
+            self.hand_applied = False
+            self.prepare_args = (point.copy(), normal.copy(), params)
+        if sequence == 'finish_grab':
+            self.finish_args = (point.copy(), normal.copy(), params)
+            self.grasp_retries = 0
+        self.phase = 'planning'
+        self.deadline = self.now()+self.p('planning_timeout')
+        self.plan_future = self.pool.submit(self.plan, sequence, point, normal, current, params)
+        self.get_logger().info(f'{sequence}: planning for camera target in base frame {point.round(3)}')
+
+    def plan(self, sequence, point, normal, current, params):
+        """The top row's clearance waypoint sits at the arm's reach limit with the torso up (twin: 2.6 cm
+        short at +0.16 m over a 1.55 m pregrasp): lower it step by step before giving up."""
+        if sequence != 'prepare_grab' or self.book_row != 1:
+            return self._plan(sequence, point, normal, current, params)
+        errors = []
+        for clearance in (params['top_book_clearance_height'], 0.10, 0.06, 0.03):
+            try:
+                return self._plan(sequence, point, normal, current, dict(params, top_book_clearance_height=clearance))
+            except ValueError as error:
+                errors.append(f'clearance {clearance:.2f}: {error}')
+        raise ValueError('; '.join(errors))
+
+    def _plan(self, sequence, point, normal, current, params):
+        """Compute all waypoints before any actuator moves; never guess joint angles."""
+        if not np.isfinite(point).all() or point[0] < 0.2:
+            raise ValueError(f'Target is not in front of the arm at reachable distance: {point}')
+        reach_distance = point[0]
+        if sequence == 'prepare_grab' and self.book_row != 1:
+            # This phase runs after the base has backed out. Validate the
+            # compensated arm target that will be reached after the planned
+            # base advance, rather than rejecting the intentionally larger
+            # book-to-base distance at the staging pose.
+            reach_distance += normal[0]*(params['grasp_insert_depth']-
+                                         params['grasp_base_advance'])
+        if sequence in ('grab', 'prepare_grab', 'finish_grab') and not 0.45 <= reach_distance <= 1.05:
+            # A grasp target closer than ~0.45 m means the base ended up jammed
+            # against the shelf; swinging the arm from there hits shelf boards.
+            raise ValueError(f'{sequence} reach target is {reach_distance:.2f} m in base frame, need 0.45-1.05 m; redock.')
+        # +y is robot-left in base_footprint. Keep the default target neutral;
+        # a nonzero grasp_right_offset remains available for measured tuning.
+        point = point+np.array([0.0, -params.get('grasp_right_offset', 0.0), 0.0]) if sequence in ('grab', 'prepare_grab', 'finish_grab') else point
+        if sequence == 'finish_place':
+            if self.placement_hover_target is None:
+                raise ValueError('No staged crane pose is available; run prepare_place before finish_place.')
+            if params['place_torso_drop'] < 0.01:
+                # release from the hover: lowering the torso put the upper arm on the table edge
+                return [('release_book', 'open', None, 1.0),
+                        ('verify_delivery', 'delivery', None, 3.0)]
+            lowered = self.placement_hover_target.copy()
+            lowered[0] = max(self.model.lower[0],
+                             lowered[0]-params['place_torso_drop'])
+            if self.placement_hover_target[0]-lowered[0] < 0.05:
+                raise ValueError('Torso has less than 5 cm of safe downward travel from the bin hover pose.')
+            duration = self.model.duration(current, lowered, 1.0)
+            motions = [('lower_to_bin', 'motion', lowered, duration)]
+            return motions+[('release_book', 'open', None, 1.0),
+                            ('verify_delivery', 'delivery', None, 3.0)]
+        facing = rotation([0, 0, 1], math.atan2(normal[1], normal[0]))
+        if sequence == 'grab':
+            grasp = point+normal*params['grasp_insert_depth']
+            pre = grasp-normal*params['pregrasp_distance']
+            lifted = grasp+np.array([0, 0, params['lift_distance']])
+            extracted = lifted-normal*params['extract_distance']
+            targets = [('pregrasp', pre), ('insert', grasp), ('lift', lifted), ('extract', extracted)]
+        elif sequence == 'prepare_grab':
+            if self.book_row == 1:
+                # The base has already returned to the dock for a top-row grab.
+                # Reach from outside and above, then descend to pregrasp.
+                grasp = point+normal*params['grasp_insert_depth']
+                pre = grasp-normal*params['pregrasp_distance']
+                above = pre+np.array([0.0, 0.0, params['top_book_clearance_height']])
+                front = above-normal*params['top_book_front_standoff']
+                targets = [('top_front_clearance', front), ('top_clearance', above),
+                           ('pregrasp', pre)]
+            else:
+                # At the backed-out base pose, solve for the eventual dock pose.
+                targets = [('prealign', point+normal*(params['grasp_insert_depth']-params['grasp_base_advance']))]
+        elif sequence == 'finish_grab':
+            grasp = point+normal*params['grasp_insert_depth']
+            lifted = grasp+np.array([0, 0, params['lift_distance']])
+            extracted = lifted-normal*params['extract_distance']
+            # every row inserts with the arm: the base's return advance can stop short at the shelf keep-out
+            # (twin: 0.22 of 0.28 m), leaving the fingers only 2.5 cm past the spine if the base alone inserts
+            targets = [('insert', grasp), ('lift', lifted), ('extract', extracted)]
+        elif sequence == 'prepare_place':
+            # Perception's bin normal points from the camera/robot toward the
+            # bin. Move against it to centre the book in the opening. The base
+            # has already reached its calibrated standoff; the torso supplies
+            # the final straight down motion after this hover pose is reached.
+            # A reliable drop, not an elegant one: fingers straight down, the book hanging under the hand
+            # (where it falls no longer depends on how it was gripped), the grasp point a fixed height
+            # above the floor and short of the measured bin point (the red blob's depth reads ~12 cm
+            # past the bin's centre; its 0.56 m opening runs along the approach), then let go.
+            release = point-normal*params['bin_inset']
+            if params['bin_release_x'] > 0:
+                # the base stops 0.10 m short of the bin table's front legs (LiDAR), so the bin's centre sits at
+                # a fixed ~0.86 m: release there, 8 cm short of it. The red blob's range is not usable for this
+                # (under the camera faults it read 0.85 in one run and 1.05 in the next); its bearing is.
+                normal = np.array([1.0, 0.0, 0.0])
+                release = np.array([params['bin_release_x'], point[1], 0.0])
+            release[2] = params['bin_release_z']
+            # solved and reached before the base drives in (the table out of reach); fixed in the base frame, so
+            # wherever the table-edge stop halts the base the hand ends 0.78 m ahead of it
+            targets = [('crane_high', release-normal*0.12+np.array([0, 0, 0.10])), ('crane_hover', release)]
+        elif sequence == 'finish_place':
+            release = point-normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
+            targets = [('lower_to_bin', release)]
+        else:
+            release = point-normal*params['bin_inset']+np.array([0, 0, params['bin_release_height']])
+            targets = [('over_bin', release+np.array([0, 0, 0.06])), ('lower_to_bin', release)]
+        errors = []
+        candidates = []
+        # Parallel fingers can grasp with either 0 or 180 degree wrist roll.
+        # A bin release may also require the wrist sideways while lowering from
+        # the calibrated upright carry pose, so try quarter turns as well.
+        placing = sequence in ('place', 'prepare_place', 'finish_place')
+        rolls = (0.0, math.pi, math.pi/2, -math.pi/2) if placing else (math.pi, 0.0)
+        top_grasp = sequence in ('prepare_grab', 'finish_grab') and self.book_row == 1
+        # top row, torso up: the IK branch reaches in elbow-down and the elbow and forearm cross the shelf face at
+        # the board below the target bay (twin m2 s21: arm 4/5/6 on boards 5 and 6 on every insert). No elbow-up
+        # path from the dock stow was found offline, so such a plan is refused (fail without touching the shelf).
+        for roll in rolls:
+            grasp_sequence = sequence in ('grab', 'prepare_grab', 'finish_grab')
+            # placing: the approach axis straight down (rolls 0/pi lay the book's long side along the approach)
+            grasp_orientation = (facing @ rotation([0, 1, 0], math.pi/2) @ rotation([1, 0, 0], roll)
+                                 if placing else facing @ rotation([1, 0, 0], roll))
+            if (grasp_sequence or placing) and self.base_to_grasp is not None:
+                # `targets` are expressed at the URDF grasp frame. Convert
+                # them back to the configured arm-tip link so IK places the
+                # fingers and their approach axis at the book, not the wrist
+                # base (whose fixed grasp-frame joint is translated/rotated).
+                orientation = grasp_orientation @ self.base_to_grasp[:3, :3].T
+                offset = self.base_to_grasp[:3, 3]
+            else:
+                orientation = grasp_orientation
+                offset = None
+            q = current.copy()
+            if sequence == 'prepare_place':
+                q[0] = min(self.model.upper[0], params['place_torso_hover'])
+            elif sequence == 'prepare_grab' and self.book_row == 1:
+                # Top-row IK needs the torso at its upper travel limit. Solve
+                # with that value fixed; the torso is raised in its own phase
+                # before any arm waypoint begins.
+                q[0] = self.model.upper[0]
+            candidate = []
+            try:
+                for name, xyz in targets:
+                    fixed_torso = (sequence == 'prepare_place' or
+                                   sequence == 'finish_grab' and self.book_row == 1 or
+                                   sequence == 'prepare_grab' and self.book_row == 1)
+                    fixed = {0: q[0]} if fixed_torso else None
+                    tip_xyz = xyz if offset is None else xyz-orientation @ offset
+                    accept = None
+                    if top_grasp:
+                        origin = q.copy()
+                        def validate_candidate(candidate, origin=origin):
+                            if len(candidate) and len(targets) > 1 and name != targets[0][0] and np.max(np.abs(candidate[1:]-origin[1:])) > 1.4:
+                                return False
+                            try:
+                                self.check_shelf_clear(origin, [candidate], point, normal)
+                                return True
+                            except ValueError:
+                                return False
+                        accept = validate_candidate
+                    solved = self.model.solve(tip_xyz, orientation, q, fixed=fixed, accept=accept)
+                    if candidate and np.max(np.abs(solved[1:]-q[1:])) > 1.4:
+                        raise ValueError(f'{name}: IK branch jump; adjust docking pose before retrying.')
+                    candidate.append((name, 'motion', solved, self.model.duration(q, solved, 1.0)))
+                    q = solved
+                # Both parallel-jaw rolls can grasp the same book. Keep the
+                # wrist nearer its current orientation by selecting the valid
+                # complete path with the least estimated joint travel time,
+                # rather than accepting the first roll that happens to solve.
+                # placing: prefer the rolls that keep the book's long side along the bin's long axis
+                if top_grasp:
+                    self.check_shelf_clear(current, [step[2] for step in candidate], point, normal)
+                penalty = 100.0 if placing and abs(math.sin(roll)) > 0.5 else 0.0
+                candidates.append((sum(step[3] for step in candidate)+penalty, candidate))
+            except ValueError as error:
+                errors.append(str(error))
+        motions = min(candidates, key=lambda item: item[0])[1] if candidates else None
+        if motions is None:
+            raise ValueError('; '.join(errors))
+        if sequence == 'grab':
+            # Remember the pregrasp joints: they are the known-collision-free
+            # retreat if anything fails while the fingers are inside the shelf.
+            return [('retain_retreat', 'metadata', motions[0][2], 0.0), ('open_gripper', 'open', None, 1.0), motions[0], motions[1],
+                    ('close_gripper', 'close', None, 1.0), motions[2], motions[3],
+                    ('verify_book_held', 'verify', None, 0.8)]
+        if sequence == 'prepare_grab':
+            if self.book_row == 1:
+                # Keep the solved pregrasp as the safe retreat if insertion fails.
+                measure = [] if getattr(self, 'hand_applied', False) else [('measure_hand', 'measure', None, 5.0)]
+                return [('retain_retreat', 'metadata', motions[-1][2], 0.0),
+                        ('open_gripper', 'open', None, 1.0)]+motions+measure
+            measure = [] if getattr(self, 'hand_applied', False) else [('measure_hand', 'measure', None, 5.0)]
+            return [('open_gripper', 'open', None, 1.0), motions[0]]+measure
+        if sequence == 'finish_grab':
+            if self.book_row == 1:
+                if self.retreat_target is None:
+                    raise ValueError('Top-row pregrasp joints were not retained; prepare_grab must complete before finish_grab.')
+                return [motions[0], ('close_gripper', 'close', None, 1.0),
+                        motions[1], motions[2], ('verify_book_held', 'verify', None, 0.8)]
+            inserted = self.model.fk(motions[0][2])
+            retreat = self.model.solve(inserted[:3, 3]-normal*params['pregrasp_distance'],
+                                       inserted[:3, :3], motions[0][2])
+            return [('retain_retreat', 'metadata', retreat, 0.0), motions[0], ('close_gripper', 'close', None, 1.0), motions[1], motions[2],
+                    ('verify_book_held', 'verify', None, 0.8)]
+        if sequence == 'prepare_place':
+            return motions
+        if sequence == 'finish_place':
+            return motions+[('release_book', 'open', None, 1.0),
+                            ('verify_delivery', 'delivery', None, 3.0)]
+        return motions+[('release_book', 'open', None, 1.0),
+                        ('verify_delivery', 'delivery', None, 3.0)]
+
+    def plan_carry_raise(self, current):
+        """Move the held book to the fixed top-shelf carry pose, without torso motion."""
+        target = current.copy()
+        target[0] = current[0]
+        target[1:] = HIGH_CARRY_RIGHT_ARM
+        # the live arm's joint 2 stops at 1.134 rad (the simulator allowed 1.25): stay inside its limits
+        target = np.clip(target, self.model.lower, self.model.upper)
+        if np.max(np.abs(target-current)) <= 0.005:
+            return []
+        return [('raise_carried_book', 'motion', target, self.model.duration(current, target, 1.0))]
+
+    def trajectory(self, names, positions, duration):
+        msg = JointTrajectory()
+        msg.joint_names = list(names)
+        point = JointTrajectoryPoint()
+        point.positions = [float(p) for p in positions]
+        point.time_from_start.sec = int(duration)
+        point.time_from_start.nanosec = int(round((duration-int(duration))*1e9))
+        if point.time_from_start.nanosec >= 1000000000:
+            point.time_from_start.sec += 1
+            point.time_from_start.nanosec = 0
+        msg.points = [point]
+        return msg
+
+    def next_phase(self):
+        self.phase_started = self.now()
+        self.handles = []
+        if not self.phases:
+            if self.deferred_plan is not None:
+                if not self.fresh(self.joint_stamp):
+                    self.latch_robot_fault('Joint feedback went stale after the top-row torso lift; refusing arm motion.')
+                    return
+                sequence, point, normal, params = self.deferred_plan
+                self.deferred_plan = None
+                current = np.array([self.joints[n] for n in self.model.names])
+                self.phase = 'planning'
+                self.phase_name = 'planning_after_torso_lift'
+                self.deadline = self.now()+self.p('planning_timeout')
+                self.plan_future = self.pool.submit(
+                    self.plan, sequence, point, normal, current, params)
+                self.get_logger().info(
+                    f'{sequence}: torso lift complete; planning the top-row pregrasp '
+                    f'from joint feedback {current[0]:.3f} m.')
+                return
+            sequence = self.active
+            self.active = self.phase = None
+            if sequence == 'prepare_grab':
+                self.grasp_prepared = True
+                self.prepared_at = self.now()
+            elif sequence in ('grab', 'finish_grab'):
+                self.grasp_prepared = False
+                self.selected_grasp_target = None
+            reason = ('Release sequence complete; bin delivery is unverified without a bin sensor.'
+                      if sequence in ('place', 'finish_place') and self.ros.topics['bin_contacts'] is None
+                      else 'Confirmed sequence complete.')
+            self.report(sequence, True, reason)
+            if sequence in ('grab', 'finish_grab'):
+                self.retreat_target = None
+            return
+        self.phase_name, self.phase, self.phase_target, duration = self.phases.pop(0)
+        if self.phase == 'metadata':
+            self.retreat_target = self.phase_target.copy()
+            self.next_phase()
+            return
+        # Fingers cross the shelf front at 'insert' and are clear again once
+        # 'extract' has succeeded (i.e. when 'verify_book_held' starts).
+        if self.active in ('grab', 'finish_grab'):
+            if self.phase_name == 'insert':
+                self.arm_in_shelf = True
+            elif self.phase_name == 'close_gripper' and self.active == 'finish_grab':
+                self.arm_in_shelf = True
+            elif self.phase_name == 'verify_book_held':
+                self.arm_in_shelf = False
+        self.get_logger().info(f'{self.active}: {self.phase_name}')
+        if self.phase in ('motion', 'torso'):
+            if not self.fresh(self.joint_stamp):
+                self.latch_robot_fault('Joint feedback went stale before motion; no autonomous recovery will be attempted.')
+                return
+            q = self.phase_target
+            # Recalculate timing from actual joint feedback; respect slow torso travel.
+            start = np.array([self.joints[n] for n in self.model.names])
+            duration = max(duration, self.model.duration(start, q))
+            self.deadline = self.now()+duration+self.p('motion_timeout_margin')
+            clients = (((self.torso, ['torso_lift_joint'], q[:1]),)
+                       if self.phase == 'torso' else
+                       ((self.torso, ['torso_lift_joint'], q[:1]),
+                        (self.arm, ARM_JOINTS, q[1:])))
+            self.pending = len(clients)
+            token = self.token
+            for client, names, values in clients:
+                goal = FollowJointTrajectory.Goal()
+                goal.trajectory = self.trajectory(names, values, duration)
+                future = client.send_goal_async(goal)
+                future.add_done_callback(lambda f, t=token: self.goal_response(f, t))
+        elif self.phase in ('open', 'close'):
+            value = self.p('gripper_open' if self.phase == 'open' else 'gripper_closed')
+            if self.phase == 'close':
+                # Do not let contact from a previous approach/attempt count as
+                # proof of a grasp. The close phase needs fresh bilateral data.
+                self.contacts.clear()
+            self.gripper_pub.publish(self.trajectory([GRIPPER_JOINT], [value], duration))
+            self.deadline = self.now()+self.p('gripper_timeout')
+            self.contact_since = None
+        elif self.phase == 'verify' and not self.finger_feedback:
+            self.deadline = self.now()+18.0     # the visual grasp check answers within ~5 s, longer in a depth stall
+        elif self.phase == 'measure':
+            self.hand_corr = None
+            self.measure_pub.publish(Bool(data=True))
+            self.deadline = self.now()+duration+5.0
+        else:
+            self.deadline = self.now()+duration+3.0
+
+    def goal_response(self, future, token):
+        try:
+            handle = future.result()
+            if token != self.token or self.active is None:
+                if handle.accepted:
+                    handle.cancel_goal_async()
+                return
+            if not handle.accepted:
+                self.latch_robot_fault(f'{self.phase_name}: controller rejected trajectory; activation/robot state must be checked.')
+                return
+            self.handles.append(handle)
+            handle.get_result_async().add_done_callback(lambda f, t=token: self.motion_result(f, t))
+        except Exception as error:
+            if token == self.token:
+                self.latch_robot_fault(f'Action response unavailable: {error}')
+
+    def motion_result(self, future, token):
+        if token != self.token or self.active is None:
+            return
+        try:
+            response = future.result()
+            if is_controller_deactivation(response.result.error_string):
+                self.latch_robot_fault(f'{self.phase_name}: controller deactivated; status={response.status}, error={response.result.error_code}: {response.result.error_string}')
+                return
+            if response.status != GoalStatus.STATUS_SUCCEEDED or response.result.error_code != 0:
+                self.latch_robot_fault(f'{self.phase_name}: controller action failed; status={response.status}, error={response.result.error_code}: {response.result.error_string}')
+                return
+            self.pending -= 1
+            if self.pending == 0:
+                if self.phase == 'torso':
+                    actual = self.joints.get('torso_lift_joint')
+                    target = float(self.phase_target[0])
+                    if (not self.fresh(self.joint_stamp) or actual is None or
+                            abs(actual-target) > 0.02):
+                        # The action result may arrive just before the next
+                        # joint-state sample. Wait briefly for measured lift;
+                        # never start the arm using only the planned height.
+                        self.phase = 'torso_feedback'
+                        self.phase_name = 'confirm_torso_lift'
+                        self.deadline = self.now()+3.0
+                        return
+                    self.get_logger().info(
+                        f'Top-row torso lift confirmed at {actual:.3f} m; starting arm approach.')
+                self.next_phase()
+        except Exception as error:
+            self.latch_robot_fault(f'Action result unavailable: {error}')
+
+    def tick(self):
+        self.ready_pub.publish(Bool(data=self.ready()))
+        self.holding_pub.publish(Bool(data=bool(not self.controller_fault and self.holding_book and self.held_book() == self.holding_book)))
+        if self.controller_fault:
+            return
+        if self.active is not None and not self.fresh(self.joint_stamp):
+            self.latch_robot_fault('Joint feedback disappeared during manipulation; stopping without blind gripper or arm recovery.')
+            return
+        if self.active is None and getattr(self, 'pending_request', None):
+            self.request(self.pending_request)
+        if self.active is None:
+            if not self.ready() and self.now()-self.warned_at > 5.0:
+                self.warned_at = self.now()
+                self.get_logger().warn(f'Waiting for robot/controllers: model={self.model is not None}, joints={self.fresh(self.joint_stamp)}, arm={self.arm.server_is_ready()}, torso={self.torso.server_is_ready()}, gripper_subscribers={self.gripper_pub.get_subscription_count()}')
+            return
+        if self.phase == 'measure':
+            if self.hand_corr is not None and self.hand_corr[1] >= self.phase_started:
+                if self.active == 'prepare_grab' and not getattr(self, 'hand_applied', True) \
+                        and np.linalg.norm(self.hand_corr[0]) > 0.005:
+                    # the hand's sideways position is set HERE (the base then drives it onto the book):
+                    # move the arm to the corrected pre-alignment before reporting the prepare done
+                    self.hand_applied = True
+                    point, normal, params = self.prepare_args
+                    current = np.array([self.joints[n] for n in self.model.names])
+                    self.get_logger().info(f'prepare_grab: re-aiming the pregrasp by the hand measurement {self.hand_corr[0].round(3)} m')
+                    self.phase = 'planning'
+                    self.phases = []
+                    self.deadline = self.now()+self.p('planning_timeout')
+                    self.plan_future = self.pool.submit(self.plan, 'prepare_grab', point+self.hand_corr[0], normal, current, params)
+                    return
+                self.next_phase()
+            elif self.now()-self.phase_started > 5.0:
+                self.get_logger().warn('No hand measurement within 5 s: grasping on the camera estimate alone.')
+                self.next_phase()
+            return
+        if self.now() > self.deadline:
+            if self.phase in ('motion', 'torso', 'torso_feedback'):
+                self.latch_robot_fault(f'{self.phase_name}: controller motion/feedback deadline expired; operator inspection required.')
+                return
+            detail = ''
+            if self.phase == 'close':
+                seen = {f'{book.split("::")[0]}:{side}': f'{self.now()-stamp:.1f}s ago'
+                        for (book, side), stamp in self.contacts.items()}
+                finger_position = self.joints.get(GRIPPER_JOINT)
+                position_text = ('unknown' if finger_position is None else
+                                 f'{finger_position:.4f} m')
+                detail = (f' Gripper joint at timeout: {position_text}; last fresh-phase '
+                          f'finger/book contacts: {seen or "none"}. If the joint reached 0.0 m '
+                          'without bilateral contact, the fingers closed beside/in front of the '
+                          'book; if it stayed open, inspect the gripper trajectory controller '
+                          f'and {self.ros.topics["joint_states"]}.')
+            closed = self.joints.get(GRIPPER_JOINT)
+            if (self.phase == 'close' and self.finger_feedback and closed is not None
+                    and abs(closed-self.p('gripper_closed')) < 0.05
+                    and self.retry_grasp('the fingers closed on nothing')):
+                return
+            self.abort(f'{self.phase}: timed out.{detail} Check controller feedback, contacts, target pose and Gazebo.')
+            return
+        if self.phase == 'planning':
+            if self.plan_future.done():
+                try:
+                    self.phases = self.plan_future.result()
+                    if getattr(self, 'retry_open', False):
+                        self.retry_open = False
+                        self.phases = [('open_gripper', 'open', None, 1.0)]+self.phases
+                    if self.active == 'prepare_place':
+                        hover = next((phase[2] for phase in reversed(self.phases)
+                                      if phase[1] == 'motion'), None)
+                        if hover is None:
+                            raise ValueError('The bin hover plan did not contain a joint waypoint.')
+                        self.placement_hover_target = hover.copy()
+                    self.next_phase()
+                except Exception as error:
+                    self.abort(f'No valid grasp/placement plan: {error}')
+        elif self.phase == 'torso_feedback':
+            actual = self.joints.get('torso_lift_joint')
+            target = float(self.phase_target[0])
+            if (self.fresh(self.joint_stamp) and actual is not None and
+                    abs(actual-target) <= 0.02):
+                self.get_logger().info(
+                    f'Top-row torso lift confirmed at {actual:.3f} m; starting arm approach.')
+                self.next_phase()
+        elif self.phase == 'open':
+            if self.fresh(self.joint_stamp) and abs(self.joints.get(GRIPPER_JOINT, -1)-self.p('gripper_open')) < 0.006 and self.now()-self.phase_started > 0.8:
+                self.next_phase()
+        elif self.phase == 'close' and not self.finger_feedback:
+            if self.now()-self.phase_started > 2.5:
+                self.holding_book = 'assumed_by_timed_close'
+                self.next_phase()
+        elif self.phase == 'close':
+            # This is a position trajectory. Once the one close trajectory
+            # finishes, the controller holds its target; republishing a shorter
+            # trajectory here can repeatedly restart/preempt the close motion.
+            book = self.held_book()
+            if book:
+                if self.contact_since is None:
+                    self.contact_since = self.now()
+                if self.now()-self.contact_since >= self.p('grip_contact_hold'):
+                    self.holding_book = book
+                    self.next_phase()
+            else:
+                self.contact_since = None
+        elif self.phase == 'verify' and not self.finger_feedback:
+            if self.now()-self.phase_started < 0.3:
+                self.seen_held = None
+                self.check_held_pub.publish(Bool(data=True))
+            elif self.seen_held is not None and self.seen_held[1] >= self.phase_started:
+                if self.seen_held[0]:
+                    self.holding_book = 'book_by_visual_confirmation'
+                    self.next_phase()
+                elif not self.retry_grasp('the book is not at the hand after the lift'):
+                    self.abort('Book not at the hand after the lift and the side retries; grasp not confirmed.')
+            elif self.now()-self.phase_started > 15.0:
+                self.abort('No fresh visual grasp verification after 15 s; refusing to carry an unverified book.')
+            elif int(self.now()-self.phase_started) % 4 == 3 and getattr(self, 'held_asked', -1) != int(self.now()-self.phase_started):
+                # depth stalls (robot_worst: 0.3 Hz for a minute) leave the check unanswered: ask again
+                self.held_asked = int(self.now()-self.phase_started)
+                self.check_held_pub.publish(Bool(data=True))
+        elif self.phase == 'verify':
+            if self.now()-self.phase_started > 0.5:
+                if self.held_book() == self.holding_book:
+                    self.next_phase()
+                else:
+                    self.abort('Book contact lost after lift/extraction; grasp not confirmed.')
+        elif self.phase == 'delivery':
+            if self.ros.topics['bin_contacts'] is None:
+                # nothing on the live robot reports the book in the bin: released is done
+                if self.now()-self.phase_started > 1.0:
+                    self.holding_book = None
+                    self.next_phase()
+            elif self.bin_contact_stamp is not None and self.bin_contact_stamp >= self.phase_started-1.5:
+                self.holding_book = None
+                self.next_phase()
+
+    def check_shelf_clear(self, start, path, point, normal=None):
+        """Top row: no arm link (shoulder to wrist) may cross the shelf face outside the target's bay, at the
+        waypoints or along the joint-space moves between them. `point` is the book's front in the base frame."""
+        if len(getattr(self, 'link_models', [])) < 4:
+            raise ValueError('Top-row safety check needs all four arm link models from the URDF.')
+        normal = np.array([1., 0., 0.]) if normal is None else np.asarray(normal, float)
+        face = float(np.asarray(point[:2]) @ normal[:2])-0.06
+        low, high = float(point[2])-0.13, float(point[2])+0.14
+        prev = np.asarray(start, float)
+        for q in path:
+            for t in np.linspace(0.0, 1.0, 9):
+                qq = prev+(q-prev)*t
+                for m in getattr(self, 'link_models', []):
+                    p = m.fk(qq[:len(m.names)])[:3, 3]
+                    if p[:2] @ normal[:2] > face and not low < p[2] < high:
+                        raise ValueError(f'top-row path puts {getattr(m, "tip_link", "an arm link")} at '
+                                         f'{p.round(2).tolist()} through the shelf face (x {face+0.06:.2f})')
+            prev = q
+
+    def retry_grasp(self, why):
+        """A missed grasp leaves the book standing a centimetre or two to the side (what is left of the
+        camera's colour-vs-depth error): reopen and reach again a little to each side. False when spent."""
+        if self.controller_fault or not self.fresh(self.joint_stamp):
+            return False
+        offsets = (0.012, -0.012, 0.024, -0.024)
+        if self.active != 'finish_grab' or getattr(self, 'finish_args', None) is None or self.grasp_retries >= len(offsets):
+            return False
+        point, normal, params = self.finish_args
+        offset = offsets[self.grasp_retries]
+        self.grasp_retries += 1
+        side = np.array([-normal[1], normal[0], 0.0])
+        current = np.array([self.joints[n] for n in self.model.names])
+        self.get_logger().warn(f'finish_grab: {why}; retry {self.grasp_retries}/{len(offsets)} {offset*100:+.1f} cm to the side.')
+        self.holding_book = None
+        self.gripper_pub.publish(self.trajectory([GRIPPER_JOINT], [self.p('gripper_open')], 1.0))
+        self.retry_open = True
+        self.phase = 'planning'
+        self.phases = []
+        self.deadline = self.now()+self.p('planning_timeout')+2.0
+        self.plan_future = self.pool.submit(self.plan, 'finish_grab', point+side*offset, normal, current, params)
+        return True
+
+    def on_robot_fault(self, msg):
+        if self.controller_fault:
+            return
+        try:
+            reason = json.loads(msg.data)['reason']
+        except (ValueError, KeyError, TypeError):
+            reason = msg.data
+        self.latch_robot_fault(reason)
+
+    def latch_robot_fault(self, reason):
+        """Stop this attempt; never restart controllers or auto-release the gripper."""
+        if self.controller_fault:
+            return
+        self.controller_fault = reason
+        snapshot = {
+            'reason': reason, 'sequence': self.active,
+            'phase': self.phase, 'joint_age_s': sample_age(self.now(), self.joint_stamp),
+            'arm_inside_shelf': self.arm_in_shelf,
+            'book_state_before_fault': self.holding_book,
+        }
+        self.robot_fault_pub.publish(String(data=json.dumps(snapshot)))
+        self.abort(reason, allow_retract=False)
+
+    def abort(self, reason, allow_retract=True):
+        sequence = self.active
+        self.token += 1
+        for handle in self.handles:
+            try:
+                handle.cancel_goal_async()
+            except Exception as error:
+                self.get_logger().warn(f'Controller cancellation unavailable: {error}')
+        if self.plan_future:
+            self.plan_future.cancel()
+        self.phases = []
+        self.deferred_plan = None
+        self.pending_request = None
+        self.grasp_prepared = False
+        self.selected_grasp_target = None
+        self.active = self.phase = None
+        if allow_retract and not self.controller_fault:
+            self.retract_if_in_shelf()
+        else:
+            self.get_logger().error(
+                'Robot fault: autonomous recovery is inhibited; no new gripper/arm/torso '
+                'trajectory is being sent. Inspect robot safety/controller state and feedback '
+                'before operator recovery and restarting the solution.')
+        if sequence:
+            self.report(sequence, False, reason)
+
+    def retract_if_in_shelf(self):
+        """After a failed grasp, never leave the fingers wedged between shelf boards.
+
+        The pregrasp joints were solved on the straight approach line, so going
+        back to them is a straight pull-out, not a new sideways swing.
+        """
+        if self.controller_fault:
+            return
+        retreat = getattr(self, 'retreat_target', None)
+        if not getattr(self, 'arm_in_shelf', False) or retreat is None:
+            return
+        self.arm_in_shelf = False
+        if self.model is None or not self.fresh(self.joint_stamp):
+            self.get_logger().error('Cannot retract from shelf: no model or stale joint feedback.')
+            return
+        self.get_logger().warn('Grasp ended inside the shelf; requesting retreat to pregrasp with fresh joint feedback.')
+        try:
+            if not self.holding_book:
+                self.gripper_pub.publish(self.trajectory([GRIPPER_JOINT], [self.p('gripper_open')], 1.0))
+            start = np.array([self.joints[n] for n in self.model.names])
+            duration = self.model.duration(start, retreat)
+            for client, names, values in ((self.torso, ['torso_lift_joint'], retreat[:1]),
+                                          (self.arm, ARM_JOINTS, retreat[1:])):
+                goal = FollowJointTrajectory.Goal()
+                goal.trajectory = self.trajectory(names, values, duration)
+                client.send_goal_async(goal)
+        except Exception as error:
+            self.get_logger().error(f'Retract after failed grasp could not be sent: {error}')
+        self.holding_book = None
+
+    def report(self, sequence, success, reason):
+        if not success:
+            self.failure_pub.publish(String(data=f'{sequence}: {reason}'))
+        publisher = (self.carry_raised_pub if sequence == 'raise_carry' else
+                     self.prepared_pub if sequence == 'prepare_grab' else
+                     self.place_prepared_pub if sequence == 'prepare_place' else
+                     self.grab_pub if sequence in ('grab', 'finish_grab') else self.place_pub)
+        publisher.publish(Bool(data=success))
+        try:
+            (self.get_logger().info if success else self.get_logger().error)(f'{sequence}: {reason}')
+        except ValueError as error:
+            # rcutils can reject a severity change while a callback is already
+            # unwinding an exception. The failure has already been published;
+            # never let diagnostic logging kill the manipulation node.
+            if 'severity' not in str(error).lower():
+                raise
+
+
+def main():
+    rclpy.init()
+    node = ManipulationNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if node.active and rclpy.ok():
+            node.abort('Node shutting down', allow_retract=False)
+        node.pool.shutdown(wait=False, cancel_futures=True)
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()

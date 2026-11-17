@@ -1,0 +1,102 @@
+<robot name="erc_right_arm_test_fixture">
+  <joint name="base_footprint_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0.0762" />
+    <child link="base_link" />
+    <parent link="base_footprint" />
+  </joint>
+  <joint name="torso_fixed_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="-0.0245 0 0.215" />
+    <parent link="base_link" />
+    <child link="torso_base_link" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="torso_lift_joint" type="prismatic">
+    <origin rpy="0 0 0" xyz="0 0 0.5545" />
+    <parent link="torso_base_link" />
+    <child link="torso_lift_link" />
+    <axis xyz="0 0 1" />
+    <limit effort="2000" lower="-0.001" upper="0.35" velocity="0.035" />
+    <calibration rising="0.0" />
+    <dynamics damping="1000" />
+    <safety_controller k_position="20" k_velocity="20" soft_lower_limit="0.0" soft_upper_limit="0.35" />
+  </joint>
+  <joint name="arm_right_1_joint" type="revolute">
+    <origin rpy="-2.0679 -0.0 -1.9198899999999999" xyz="0.08976 -0.15918 -0.092008" />
+    <parent link="torso_lift_link" />
+    <child link="arm_right_1_link" />
+    <axis xyz="0 0 1" />
+    <limit effort="43.0" lower="-4.71238898038469" upper="0.5235987755982988" velocity="1.95" />
+    <safety_controller k_position="20" k_velocity="20" soft_lower_limit="-4.642388980384689" soft_upper_limit="0.4535987755982988" />
+    <dynamics damping="1.0" friction="1.0" />
+  </joint>
+  <joint name="arm_right_2_joint" type="revolute">
+    <origin rpy="-1.57079632679489 0 -1.5707963267949" xyz="0.0371099999999995 0.02 0.18" />
+    <parent link="arm_right_1_link" />
+    <child link="arm_right_2_link" />
+    <axis xyz="0 0 1" />
+    <limit effort="43.0" lower="-2.443460952792061" upper="1.1344640137963142" velocity="1.95" />
+    <dynamics damping="1.0" friction="1.0" />
+    <safety_controller k_position="20" k_velocity="20" soft_lower_limit="-2.3734609527920614" soft_upper_limit="1.0644640137963142" />
+  </joint>
+  <joint name="arm_right_3_joint" type="revolute">
+    <origin rpy="1.5707963267949 0 0" xyz="0.019999999999999 -0.17011 -0.037110000000001" />
+    <parent link="arm_right_2_link" />
+    <child link="arm_right_3_link" />
+    <axis xyz="0 0 1" />
+    <limit effort="26" lower="-2.6179938779914944" upper="2.6179938779914944" velocity="3.95" />
+    <safety_controller k_position="20" k_velocity="20" soft_lower_limit="-2.5479938779914946" soft_upper_limit="2.5479938779914946" />
+    <dynamics damping="1.0" friction="1.0" />
+  </joint>
+  <joint name="arm_right_4_joint" type="revolute">
+    <origin rpy="1.57079632679489 0 0" xyz="0.0199999999999993 -0.0371100000000008 0.15989" />
+    <parent link="arm_right_3_link" />
+    <child link="arm_right_4_link" />
+    <axis xyz="0 0 1" />
+    <limit effort="26" lower="-2.443460952792061" upper="1.1344640137963142" velocity="3.95" />
+    <dynamics damping="1.0" friction="1.0" />
+    <safety_controller k_position="20" k_velocity="20" soft_lower_limit="-2.3734609527920614" soft_upper_limit="1.0644640137963142" />
+  </joint>
+  <joint name="arm_right_5_joint" type="revolute">
+    <origin rpy="-1.5707963267949 3.14 0" xyz="-0.0199999999999971 0.17011 -0.037110000000002" />
+    <parent link="arm_right_4_link" />
+    <child link="arm_right_5_link" />
+    <axis xyz="0 0 1" />
+    <limit effort="26" lower="-1.5707963267948966" upper="3.6651914291880923" velocity="3.95" />
+    <safety_controller k_position="20" k_velocity="20" soft_lower_limit="-1.5007963267948965" soft_upper_limit="3.5951914291880924" />
+    <dynamics damping="1.0" friction="1.0" />
+  </joint>
+  <joint name="arm_right_6_joint" type="revolute">
+    <origin rpy="-1.5708 0 3.14" xyz="0 -0.0422 0.1654" />
+    <parent link="arm_right_5_link" />
+    <child link="arm_right_6_link" />
+    <axis xyz="0 0 -1" />
+    <limit effort="26" lower="-1.8849555921538759" upper="3.001966313430247" velocity="3.95" />
+    <dynamics damping="1.0" friction="1.0" />
+    <safety_controller k_position="20" k_velocity="20" soft_lower_limit="-1.8149555921538758" soft_upper_limit="2.931966313430247" />
+  </joint>
+  <joint name="arm_right_7_joint" type="revolute">
+    <origin rpy="1.5708 0 0" xyz="0.07 -0.0534 -0.0422" />
+    <parent link="arm_right_6_link" />
+    <child link="arm_right_7_link" />
+    <axis xyz="0 0 1" />
+    <limit effort="26" lower="-2.443460952792061" upper="2.443460952792061" velocity="3.95" />
+    <dynamics damping="1.0" friction="1.0" />
+    <safety_controller k_position="20" k_velocity="20" soft_lower_limit="-2.3734609527920614" soft_upper_limit="2.3734609527920614" />
+  </joint>
+  <joint name="arm_right_tool_joint" type="fixed">
+    <parent link="arm_right_7_link" />
+    <child link="arm_right_tool_link" />
+    <origin rpy="0 0 0" xyz="0 0 0.017" />
+  </joint>
+  <joint name="gripper_right_base_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0.0 0.0 0.0" />
+    <parent link="arm_right_tool_link" />
+    <child link="gripper_right_base_link" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <joint name="gripper_right_grasping_frame_joint" type="fixed">
+    <parent link="gripper_right_base_link" />
+    <child link="gripper_right_grasping_link" />
+    <origin rpy="0 -1.57 0" xyz="0.0 0.0 0.157157" />
+  </joint>
+</robot>

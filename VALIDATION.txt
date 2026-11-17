@@ -1,0 +1,34 @@
+Build 8.0 / version 0.8.0 — validated 2026-11-17
+
+Environment: Python 3.12; offline ROS message/action stubs. No ROS installation,
+DDS session, physical robot, controller lifecycle or rosbag playback available.
+
+Command:
+OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider test --tb=short
+Result: 139 passed, 3 skipped, 22 subtests passed in 7.28 s.
+Skipped: optional ROS ament copyright/flake8/pep257 integrations absent.
+Warning: external anyio pytest plugin uses a deprecated pytest API.
+
+Coverage includes marker/shelf geometry, joint-limit and tuck constraints,
+perception timestamps/depth, guarded grasp paths, navigation/return state
+transitions, deactivation error replay, late action callbacks, frozen feedback,
+failed cancellation, bounded sensor-loss faults, no automatic release/retract
+on robot fault, source/install mismatch and read-only controller-state checks.
+
+Python AST parsing passed for 21 source, launch, script and test files.
+Pyflakes passed for all solution modules, launch, preflight/verify scripts and
+alignment/runtime regression files. Bash syntax checks passed for both scripts.
+Source identity self-check passed with PYTHONPATH=. (this is an offline source
+self-check, NOT validation of a ROS-installed overlay).
+Versioned wheel built successfully; archive/module/assets checks accompany
+packaging. Optional ROS ament lint checks have not been claimed as passed.
+
+All nodes print the same Build 8 identity and source fingerprint. The underlying
+controller deactivation in the supplied log remains unexplained. No physical
+speed, calibration, collision safety or grasp/delivery success is certified by
+these offline tests. Perform the documented installed-code/preflight checks and
+supervised robot validation before operation.
+
+Git staged whitespace check passed after formatting cleanup. Original 49 image/
+template assets are byte-identical to the supplied archive. Wheel contents and
+ZIP CRC/module/AST checks passed.
