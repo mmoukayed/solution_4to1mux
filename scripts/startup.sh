@@ -31,7 +31,6 @@ shift 1
 else
 source install/setup.bash
 source tiago_dds_connect/tiago_env.sh
-shift 1
 fi
 
 if [ "$selcommand" = "simulation" ]; then
