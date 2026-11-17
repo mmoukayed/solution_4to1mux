@@ -9,6 +9,13 @@ from scipy.optimize import least_squares
 from .ros_topics import FRAMES
 
 
+def plausible_bin_range(point, origin):
+    """Reject background depth during the local bin search near the return pose."""
+    point, origin = np.asarray(point), np.asarray(origin)
+    return bool(np.isfinite(point).all() and np.isfinite(origin).all()
+                and 0.15 < np.linalg.norm(point[:2]-origin[:2]) <= 3.0)
+
+
 def wrap(angle):
     return math.atan2(math.sin(angle), math.cos(angle))
 

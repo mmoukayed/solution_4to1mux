@@ -27,7 +27,7 @@ from tf2_ros import Buffer, TransformListener, TransformException
 from .digit_detector import DigitDetector
 from .ros_topics import configure_ros
 from .alignment import angle_delta, fit_shelf_line
-from .geometry import depth_median, pose_xyz, row_for_height, transform_matrix, yaw
+from .geometry import depth_median, plausible_bin_range, pose_xyz, row_for_height, transform_matrix, yaw
 
 SENSOR_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
 
@@ -116,36 +116,16 @@ def read_text_label_boxes(crop, target):
     return matches
 
 
-# Hue/saturation bands measured on 60 labelled real-robot frames (slots 1-2, MBR library): the old
-# wide bands found every book but also 970 false boxes (wood panelling and floor read red, the
-# library's book wall blue). STRICT is the measured band with a margin; RELAXED is for a dark frame
-# after a camera restart flips the exposure preset (books read dull: saturation 56-90, red ~orange).
-STRICT = {'red': [((0, 100, 80), (8, 255, 255)), ((172, 100, 80), (180, 255, 255))],
-          'green': [((58, 80, 50), (80, 255, 255))], 'yellow': [((16, 100, 110), (28, 255, 255))],
-          'blue': [((93, 140, 80), (108, 255, 255))]}
+# Bands apply to the unmodified camera feed. The November live frames include
+# olive green (H=41..43) and pale blue (S=90), which the previous bands excluded.
+# Shelf context, spine shape and the confirmed 3D bay constrain book candidates;
+# bins use their own stricter mask below and never these relaxed book bands.
+STRICT = {'red': [((0, 80, 70), (10, 255, 255)), ((170, 80, 70), (180, 255, 255))],
+          'green': [((35, 45, 45), (85, 255, 255))], 'yellow': [((16, 70, 90), (32, 255, 255))],
+          'blue': [((90, 60, 60), (120, 255, 255))]}
 RELAXED = {'red': [((0, 45, 45), (16, 255, 255)), ((168, 45, 45), (180, 255, 255))],
-           'green': [((48, 45, 40), (85, 255, 255))], 'yellow': [((16, 45, 70), (36, 255, 255))],
-           'blue': [((90, 50, 40), (112, 255, 255))]}
-
-
-def normalise_exposure(image, mean_lo=110, sd_lo=40):
-    """A dark or flat frame (the robot's exposure preset after a camera restart): grey-world white
-    balance on the brightest unsaturated pixels (the white shelf), then stretch the shelf to white.
-    A normal frame is returned unchanged."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    if gray.mean() >= mean_lo and gray.std() >= sd_lo:
-        return image
-    f = image.astype(np.float32)
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    ref = (hsv[..., 1] < 90) & (gray > np.percentile(gray, 60))
-    if ref.sum() < 500:
-        ref = gray > np.percentile(gray, 80)
-    if ref.sum() < 50:
-        return image                    # a near-uniform frame: nothing to balance against
-    m = f[ref].mean(axis=0)
-    f = f*(m.mean()/np.maximum(m, 1))
-    f = f*(235.0/max(np.percentile(f[ref].mean(axis=1), 90), 1))
-    return np.clip(f, 0, 255).astype(np.uint8)
+           'green': [((35, 35, 40), (85, 255, 255))], 'yellow': [((16, 45, 70), (32, 255, 255))],
+           'blue': [((90, 45, 40), (120, 255, 255))]}
 
 
 def _raw_boxes(image, bands, minimum_area):
@@ -157,9 +137,8 @@ def _raw_boxes(image, bands, minimum_area):
     return [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) >= minimum_area], hsv
 
 
-def _in_white_bay(hsv, boxes, need=0.55, max_saturation=60, min_side=7):
-    """A competition book stands in a white bay: most of a ring around it is unsaturated. Wood,
-    people and the library's own book wall are not (real frames: 546 -> 16 false red boxes)."""
+def _in_white_bay(hsv, boxes, need=0.55, max_saturation=90, min_side=4):
+    """Require a mostly neutral shelf surround, allowing the live feed's pink cast."""
     h_img, w_img = hsv.shape[:2]
     kept = []
     for (x, y, w, h) in boxes:
@@ -178,10 +157,12 @@ def _in_white_bay(hsv, boxes, need=0.55, max_saturation=60, min_side=7):
 
 
 def colour_boxes(image, colour, minimum_area=60, books=True):
-    """Boxes of `colour`. Books: the strict band, kept only inside a white bay; on a dark frame
-    with nothing found, the relaxed band (stricter ring). The bin (books=False): the strict band."""
+    """Detect original camera colours without white balance or brightness stretching.
+
+    Books require a white bay; dark frames may use relaxed thresholds on the
+    same unmodified pixels. books=False is also used for the held-book check.
+    """
     dark = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).mean() < 110
-    image = normalise_exposure(image)
     boxes, hsv = _raw_boxes(image, STRICT[colour], minimum_area)
     if not books:
         return boxes
@@ -190,6 +171,52 @@ def colour_boxes(image, colour, minimum_area=60, books=True):
         boxes, hsv = _raw_boxes(image, RELAXED[colour], minimum_area)
         kept = _in_white_bay(hsv, boxes, need=0.65)
     return kept
+
+
+def bin_colour_candidates(image, minimum_area):
+    """Require a broad, mostly saturated red surface instead of a red contour alone."""
+    bands = [((0, 150, 70), (8, 255, 255)), ((172, 150, 70), (180, 255, 255))]
+    boxes, hsv = _raw_boxes(image, bands, minimum_area)
+    mask = np.zeros(image.shape[:2], np.uint8)
+    for lower, upper in bands:
+        mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
+    kept = []
+    for x, y, w, h in boxes:
+        if w < 1.15*h:
+            continue
+        if np.count_nonzero(mask[y:y+h, x:x+w]) / float(w*h) < 0.60:
+            continue
+        kept.append((x, y, w, h))
+    return kept, mask
+
+
+def bin_surface_point(box, mask, depth, camera_to_odom, info):
+    """Use depth supported by red pixels, excluding holes and background at the box centre."""
+    x, y, w, h = box
+    # register() produces depth at the RGB resolution. Do not guess a mapping.
+    if depth.shape != mask.shape:
+        return None
+    red = cv2.erode(mask[y:y+h, x:x+w], np.ones((3, 3), np.uint8)) > 0
+    roi = depth[y:y+h, x:x+w]
+    valid = red & np.isfinite(roi) & (roi > 0.15) & (roi <= 3.0)
+    if valid.sum() < max(20, 0.20*red.sum()):
+        return None
+    z = float(np.median(roi[valid]))
+    surface = valid & (np.abs(roi-z) <= 0.15)
+    if surface.sum() < 0.60*valid.sum():
+        return None
+    height, width = mask.shape
+    fx = info.k[0]*width/(info.width or width)
+    fy = info.k[4]*height/(info.height or height)
+    cx = info.k[2]*width/(info.width or width)
+    cy = info.k[5]*height/(info.height or height)
+    if fx <= 0 or fy <= 0 or not (0.15 <= w*z/fx <= 1.0 and 0.08 <= h*z/fy <= 0.60):
+        return None
+    rows, cols = np.nonzero(surface)
+    values = roi[surface]
+    camera_point = np.array([np.median((cols+x-cx)*values/fx),
+                             np.median((rows+y-cy)*values/fy), np.median(values), 1.])
+    return (camera_to_odom @ camera_point)[:3]
 
 
 class PerceptionNode(Node):
@@ -263,6 +290,9 @@ class PerceptionNode(Node):
         self.tilt_samples = 0
         self.processed = None
         self.mode = 'shelf'
+        self.bin_candidate = None
+        self.bin_hits = 0
+        self.bin_candidate_stamp = None
         self.column_pose = None
         self.candidate_column_pose = None
         self.candidate_column_hits = 0
@@ -485,7 +515,12 @@ class PerceptionNode(Node):
         return False
 
     def on_mode(self, msg):
-        self.mode = 'bin' if msg.data else 'shelf'
+        mode = 'bin' if msg.data else 'shelf'
+        if mode != self.mode:
+            self.bin_candidate = None
+            self.bin_hits = 0
+            self.bin_candidate_stamp = None
+        self.mode = mode
 
     def warn(self, text):
         now = self.get_clock().now().nanoseconds / 1e9
@@ -939,16 +974,33 @@ class PerceptionNode(Node):
     def process_bin(self):
         frame_area = self.image.shape[0]*self.image.shape[1]
         candidates = []
-        for box in colour_boxes(self.image, 'red', frame_area*self.get_parameter('bin_min_area_fraction').value, books=False):
-            x, y, w, h = box
-            if w < 1.15*h:
-                continue
-            p = self.point(x+w/2, y+h/2)
-            if p is not None and 0.60 < p[2] < 1.20:
-                candidates.append((w*h, box, p))
-        if not candidates:
+        boxes, mask = bin_colour_candidates(
+            self.image, frame_area*self.get_parameter('bin_min_area_fraction').value)
+        for box in boxes:
+            p = bin_surface_point(box, mask, self.depth_image, self.camera_to_odom, self.info)
+            if (p is not None and 0.60 < p[2] < 1.20
+                    and plausible_bin_range(p, self.camera_to_odom[:3, 3])):
+                candidates.append((box, p))
+        # Two plausible red objects are ambiguous; keep searching instead of
+        # choosing a person/object solely because its contour is larger.
+        if len(candidates) != 1:
+            self.bin_candidate = None
+            self.bin_hits = 0
+            self.bin_candidate_stamp = None
             return
-        _, box, p = max(candidates, key=lambda c: c[0])
+        box, p = candidates[0]
+        stamp = Time.from_msg(self.observation_stamp).nanoseconds/1e9
+        previous_stamp = self.bin_candidate_stamp
+        if previous_stamp is not None and stamp <= previous_stamp:
+            return
+        consistent = (self.bin_candidate is not None and previous_stamp is not None
+                      and stamp-previous_stamp <= 0.8
+                      and np.linalg.norm(p-self.bin_candidate) < 0.15)
+        self.bin_hits = self.bin_hits+1 if consistent else 1
+        self.bin_candidate = p.copy()
+        self.bin_candidate_stamp = stamp
+        if self.bin_hits < 3:
+            return
         d = p[:2]-self.camera_to_odom[:2, 3]
         self.bin_pub.publish(self.make_pose(p, math.atan2(d[1], d[0])))
         if 'bin' not in self.reported:

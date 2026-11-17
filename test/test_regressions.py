@@ -29,6 +29,26 @@ for module in ('navigation_node', 'manipulation_node', 'perception_node'):
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize('point,valid', [
+    ([8.431, .277, .666], False),
+    ([.9, -.07, .85], True),
+    ([float('nan'), 0., .85], False),
+    ([.9, 0., float('inf')], False),
+])
+def test_local_bin_range_rejects_recorded_background_target(point, valid):
+    from solution_4to1mux.geometry import plausible_bin_range
+    assert plausible_bin_range(point, np.zeros(3)) is valid
+    # Range must be relative to the observer, independent of odom origin.
+    offset = np.array([12., -4., 0.])
+    assert plausible_bin_range(np.array(point)+offset, offset) is valid
+
+
+def test_navigation_ignores_fresh_but_implausible_bin():
+    n = bare_nav()
+    n.observations['bin'] = target(8.431, .277, .666)
+    assert n.observation('bin') is None
+
+
 @pytest.fixture(scope='module')
 def model():
     return ArmKinematics((ROOT/'test/data/erc_right_arm_chain.urdf').read_text())

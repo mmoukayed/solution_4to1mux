@@ -32,3 +32,23 @@ supervised robot validation before operation.
 Git staged whitespace check passed after formatting cleanup. Original 49 image/
 template assets are byte-identical to the supplied archive. Wheel contents and
 ZIP CRC/module/AST checks passed.
+
+Perception follow-up, 2026-11-17:
+Removed colour white balance/brightness stretching, adjusted raw book thresholds
+and shelf-context checks, and added red-surface bin depth/confirmation checks.
+No navigation or manipulation behavior was changed in this follow-up; the
+previous local range guards remain in place.
+
+Full-suite command (isolated Python 3.12 environment):
+OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider test --tb=short
+Result: 172 passed, 3 skipped, 22 subtests passed in 8.96 s.
+Environment packages: NumPy 2.5.5, OpenCV headless 5.0.0.93, SciPy 1.18.1,
+pytest 9.2.0. The robot's ROS runtime has not been exercised here.
+
+The 28 new perception cases cover the three supplied annotated camera frames,
+an existing positive bin frame, unchanged colour pixels in bright/dark flat
+frames, red-surface depth instead of background in an opening, missing/far or
+incoherent depth, measured size limits, distinct-frame confirmation, target
+loss, mode changes and ambiguous candidates. See test/data/PERCEPTION_FIXTURES.md
+for annotation limitations. AST checks passed for 19 package/test Python files;
+git diff --check passed. No physical detection or placement trial was performed.

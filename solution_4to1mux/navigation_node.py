@@ -20,7 +20,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .ros_topics import configure_ros
 from .alignment import MOTION_DEFAULTS, angle_delta, read_joint_limits
-from .geometry import (body_velocity, forward_command, pose_xyz, row_for_height,
+from .geometry import (body_velocity, forward_command, plausible_bin_range, pose_xyz, row_for_height,
                        scan_points, transform_matrix, wrap, yaw)
 
 
@@ -775,6 +775,8 @@ class NavigationNode(Node):
     def observation(self, name, maximum_age=2.0):
         msg = self.observations.get(name)
         if msg is None or not self.fresh(Time.from_msg(msg.header.stamp).nanoseconds/1e9, maximum_age):
+            return None
+        if name == 'bin' and not plausible_bin_range(pose_xyz(msg), self.pose):
             return None
         return msg
 

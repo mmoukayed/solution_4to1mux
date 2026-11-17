@@ -26,7 +26,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .ros_topics import configure_ros
 from .runtime_health import current_transform, is_controller_deactivation, sample_age
-from .geometry import ArmKinematics, pose_xyz, rotation, transform_matrix, yaw
+from .geometry import ArmKinematics, plausible_bin_range, pose_xyz, rotation, transform_matrix, yaw
 
 GRIPPER_JOINT = 'gripper_right_finger_joint'
 GRIPPER_GRASP_FRAME = 'gripper_right_grasping_link'
@@ -401,6 +401,11 @@ class ManipulationNode(Node):
             return
         matrix = transform_matrix(tf.transform)
         point = (matrix @ np.r_[pose_xyz(target), 1])[:3]
+        if sequence in ('place', 'prepare_place') and not plausible_bin_range(point, np.zeros(3)):
+            self.report(sequence, False,
+                        f'Implausible bin target in base frame {point.round(3)}; '
+                        'refusing fixed-distance placement. Inspect bin RGB-D detection.')
+            return
         if sequence in ('grab', 'finish_grab') and self.hand_corr is not None and self.now()-self.hand_corr[1] < 120.0:
             # the auto-calibrated grasp: aim where the camera says the book is, shifted by the
             # difference between where the arm's kinematics and the camera put the hand
