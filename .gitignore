@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+install/
+log/
+logs/
+dist/
+*.egg-info/
+bags/
