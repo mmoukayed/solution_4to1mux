@@ -1,0 +1,1509 @@
+"""Sensor-driven mecanum navigation with bounded searches and visible failures."""
+import math
+import json
+from copy import deepcopy
+import time
+from enum import Enum, auto
+
+import numpy as np
+import rclpy
+from geometry_msgs.msg import PoseStamped, Twist
+from nav_msgs.msg import Odometry
+from rclpy.clock import Clock, ClockType
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy
+from rclpy.time import Time
+from sensor_msgs.msg import JointState, LaserScan
+from std_msgs.msg import Bool, Int32, String
+from tf2_ros import Buffer, TransformListener, TransformException
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+from .ros_topics import configure_ros
+from .target_geometry import plausible_bin
+from .alignment import MOTION_DEFAULTS, angle_delta, read_joint_limits
+from .geometry import (body_velocity, forward_command, pose_xyz, row_for_height,
+                       scan_points, transform_matrix, wrap, yaw)
+
+
+# The live robot's resting tuck (measured on the robot), inside the base footprint.
+# The simulators start with both arms held out to the sides instead.
+TUCK_POSES = {
+    'left': (0.3595, -1.8291, 0.4695, -2.3492, 0.0, -1.2008, 0.0),
+    'right': (-0.3595, -1.8291, -0.4695, -2.3492, 0.0, -1.2008, 0.0),
+}
+DOCK_STOW_POSES = {
+    # joint 2 stops at 1.134 rad on the live arm and /erc wants 0.05 of margin (was 1.25)
+    # the left arm is never used: it stays in the resting tuck. Stowed out to the side it
+    # swept the bin when the base turned beside the bin table.
+    'left': TUCK_POSES['left'],
+    'right': (0.0, 1.07, 0.0, -1.0, 0.4, 0.0, 0.0),
+}
+
+
+class State(Enum):
+    FIND_SHELF = auto()
+    SCAN_COLUMNS = auto()
+    APPROACH_COLUMN = auto()
+    FIND_BOOK = auto()
+    ALIGN_SHELF_FOR_DOCK = auto()
+    STOW_ARMS_FOR_DOCK = auto()
+    ALIGN_BOOK = auto()
+    BACK_OUT_FOR_GRASP = auto()
+    WAIT_FOR_PREGRASP = auto()
+    RETURN_FOR_GRAB = auto()
+    REACQUIRE_BOOK = auto()
+    BACK_OUT_FOR_VIEW = auto()
+    WAIT_FOR_GRAB = auto()
+    RETREAT_FROM_SHELF = auto()
+    WAIT_FOR_CARRY_RAISE = auto()
+    RETURN_TO_START = auto()
+    FIND_BIN = auto()
+    APPROACH_BIN = auto()
+    BACK_OUT_FOR_BIN_TURN = auto()
+    WAIT_FOR_PLACE_PREP = auto()
+    APPROACH_BIN_FOR_PLACE = auto()
+    WAIT_FOR_PLACE = auto()
+    DONE = auto()
+    FAILED = auto()
+
+
+class NavigationNode(Node):
+    # Class-level default so offline tests on bare instances see the field too.
+    blocked_since = None
+    robot_fault = ''
+    sensor_wait_since = None
+
+    def __init__(self):
+        super().__init__('navigation_node')
+        self.ros = configure_ros(self)
+        topics = self.ros.topics
+        defaults = {
+            'shelf_column_number': 1, 'search_direction': 'right',
+            # The fixed bin is normally behind the west-facing start pose;
+            # begin its complete sweep counterclockwise.
+            'bin_search_direction': 'left',
+            'phase_timeout': 240.0, 'grab_timeout': 120.0, 'place_timeout': 90.0,
+            'reading_max_age': 1.0,
+            'book_standoff': 0.68, 'book_lateral_offset': -0.18,
+            'table_gap': 0.10,    # the base's front stops this far from the bin table's front legs
+            'bin_lateral_offset': -0.18, 'bin_standoff': 0.60, 'bin_final_advance_max': 0.65, 'bin_min_distance': 0.70,  # the table edge (table_gap) decides; these are backstops
+            'bin_turn_backoff': 0.25, 'max_bin_turn_recoveries': 2, 'carry_turn_clearance': 0.85,
+            'bin_turn_backoff_timeout': 8.0,
+            'place_base_advance': 0.35,
+            'obstacle_margin': 0.12,
+            # Minimum base-centre distance from the shelf-front plane while
+            # docking.  This deliberately leaves more than the footprint
+            # margin: a depth-biased book point must not put the bumper (or
+            # the parked arm) against the shelf before the grasp starts.
+            'shelf_keepout_distance': 0.62,
+            # Before folding the arms, square the mobile base to the shelf and
+            # correct its lateral position at low speed while still staged.
+            'shelf_alignment_standoff': 1.35,
+            'shelf_alignment_timeout': 40.0,
+            # Low-row arm links sweep close to the shelf even in the dock
+            # stow pose. Keep the base farther back while ALIGN_BOOK runs.
+            'lower_book_standoff': 0.92, 'lower_book_keepout_distance': 0.84,
+            'top_book_marker_offset': 0.335, 'row_spacing': 0.33,
+            'column_half_width': 0.43,
+            'arm_stow_timeout': 20.0, 'arm_stow_settle_time': 9.0,
+            'scan_half_width': 1.3, 'swing_table_gap': 0.45, 'scan_step': 0.65, 'scan_observe_time': 1.0,
+            'book_search_timeout': 20.0,
+            'align_block_timeout': 3.0,
+            'grasp_base_retreat': 0.25,
+            # Keep a 3 cm buffer above the shelf keepout while returning to
+            # the book. Manipulation uses the same 0.28 m compensation.
+            'grasp_base_return_advance': 0.28,
+            # The arm's calibrated high-carry pose sweeps a large arc.  A
+            # bottom-row grasp needs this full straight withdrawal before that
+            # pose is commanded, otherwise its elbow can still hit the shelf.
+            'carry_raise_retreat': 0.80,
+            'max_book_recoveries': 2, 'head_scan_dwell': 3.0,
+            'book_view_backoff': 0.35,
+            'sensor_loss_timeout': 3.0,
+            **MOTION_DEFAULTS,
+        }
+        for key, value in defaults.items():
+            self.declare_parameter(key, value)
+        for key in ('linear_speed', 'strafe_speed', 'rotate_speed', 'search_rotate_speed', 'docking_speed',
+                    'shelf_alignment_strafe_speed'):
+            if not 0 < self.p(key) <= 1.0:
+                raise ValueError(f'{key} must be >0 and <=1')
+        for key in (*MOTION_DEFAULTS, 'sensor_loss_timeout'):
+            if not np.isfinite(self.p(key)) or self.p(key) <= 0:
+                raise ValueError(f'{key} must be finite and positive')
+        self.tf = Buffer()
+        self.listener = TransformListener(self.tf, self)
+        self.pose = self.start = None
+        self.odom_stamp = None
+        self.observations = {}
+        self.dock_reference = None
+        self.selected_book = None
+        self.scans = {}
+        self.result = None
+        self.holding_stamp = None
+        self.state = State.FIND_SHELF
+        self.entered = self.now()
+        self.last_head = None
+        self.warned = {}
+        self.goal = None
+        self.book_recoveries = 0
+        self.return_detour_side = 0
+        self.bin_turn_recoveries = 0
+        self.bin_turn_retreat_total = 0.0
+        self.swing_backed = False
+        self.last_command = (0.0, 0.0, 0.0)
+        self.actual_speed = 0.0
+        self.arm_joints = {}
+        self.arm_limits = {}
+        self.arm_confirmed_since = None
+        self.arm_stow_secs = 2.0
+        self.arm_joint_stamp = None
+        self.arm_stow_last = None
+        self.arms_tucked = False
+        self.arm_tuck_last = None
+        self.arm_tuck_secs = 2.0
+        self.last_gate = 'clear'
+        self.blocked_since = None
+        self.robot_fault = ''
+        self.sensor_wait_since = None
+        self.active_shelf_keepout_distance = self.p('shelf_keepout_distance')
+        self.book_dock_minimum = self.p('shelf_keepout_distance')
+        self.current_book_row = None
+        self.failure_reason = ''
+        self.manip_failure = ''
+        self.book_diagnostics = 'No book diagnostics received yet.'
+        self.cmd_pub = self.create_publisher(Twist, topics['cmd_vel'], 10)
+        self.head_pub = self.create_publisher(JointTrajectory, topics['head_command'], 10)
+        self.left_arm_pub = self.create_publisher(JointTrajectory, topics['left_arm_command'], 10)
+        self.right_arm_pub = self.create_publisher(JointTrajectory, topics['right_arm_command'], 10)
+        self.bin_mode_pub = self.create_publisher(Bool, topics['looking_for_bin'], 10)
+        self.grab_pub = self.create_publisher(Bool, topics['request_grab'], 10)
+        self.prepare_grab_pub = self.create_publisher(Bool, topics['request_prepare_grab'], 10)
+        self.finish_grab_pub = self.create_publisher(Bool, topics['request_finish_grab'], 10)
+        self.raise_carry_pub = self.create_publisher(Bool, topics['request_raise_carry'], 10)
+        self.place_pub = self.create_publisher(Bool, topics['request_place'], 10)
+        self.prepare_place_pub = self.create_publisher(Bool, topics['request_prepare_place'], 10)
+        self.finish_place_pub = self.create_publisher(Bool, topics['request_finish_place'], 10)
+        self.cancel_pub = self.create_publisher(Bool, topics['cancel_manipulation'], 10)
+        self.failure_pub = self.create_publisher(String, topics['solution_failure'], QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.robot_fault_pub = self.create_publisher(String, topics['robot_fault'],
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(String, topics['robot_fault'], self.on_robot_fault,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.state_pub = self.create_publisher(String, topics['solution_state'], QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.book_row_pub = self.create_publisher(
+            Int32, topics['book_row'],
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(Odometry, topics['odom'], self.on_odom, qos_profile_sensor_data)
+        self.create_subscription(JointState, topics['joint_states'], self.on_arm_joints, qos_profile_sensor_data)
+        self.create_subscription(String, topics['robot_description'], self.on_description,
+                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.place_target_pub = self.create_publisher(PoseStamped, topics['place_target_pose'],
+                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.grasp_target_pub = self.create_publisher(PoseStamped, topics['grasp_target_pose'],
+                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        for name in ('shelf', 'shelf_unit', 'book', 'bin'):
+            self.create_subscription(PoseStamped, topics[f'{name}_pose'], lambda m, n=name: self.on_pose(n, m), 10)
+        for name in ('front', 'rear'):
+            self.create_subscription(LaserScan, topics[f'scan_{name}'], lambda m, n=name: self.on_scan(n, m), qos_profile_sensor_data)
+        self.create_subscription(Bool, topics['holding_book'], self.on_holding, 10)
+        self.create_subscription(String, topics['manipulation_failure'], self.on_manip_failure, QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(String, topics['book_diagnostics'], self.on_book_diagnostics, 10)
+        if topics['controller_rejections'] is not None:
+            self.create_subscription(String, topics['controller_rejections'], self.on_controller_rejection, 10)
+        self.create_subscription(Bool, topics['grab_complete'], lambda m: self.on_result(m, State.WAIT_FOR_GRAB), 10)
+        self.create_subscription(Bool, topics['grab_prepared'], lambda m: self.on_result(m, State.WAIT_FOR_PREGRASP), 10)
+        self.create_subscription(Bool, topics['carry_raised'], lambda m: self.on_result(m, State.WAIT_FOR_CARRY_RAISE), 10)
+        self.create_subscription(Bool, topics['place_complete'], lambda m: self.on_result(m, State.WAIT_FOR_PLACE), 10)
+        self.create_subscription(Bool, topics['place_prepared'], lambda m: self.on_result(m, State.WAIT_FOR_PLACE_PREP), 10)
+        self.wall_sample, self.sim_sample = time.monotonic(), self.now()
+        self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
+        self.create_timer(0.05, self.tick)
+        self.create_timer(5.0, self.wall_status, clock=self.wall_clock)
+        self.get_logger().info(f'Navigation BUILD 9.0 (tracked shelf alignment): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
+        self.transition(State.FIND_SHELF)
+        self.look_for_shelf(0.0)
+
+    def p(self, name):
+        return self.get_parameter(name).value
+
+    def now(self):
+        return self.get_clock().now().nanoseconds/1e9
+
+    def fresh(self, stamp, age=None):
+        return stamp is not None and 0 <= self.now()-stamp <= (self.p('reading_max_age') if age is None else age)
+
+    def on_odom(self, msg):
+        p = msg.pose.pose.position
+        if not np.isfinite([p.x, p.y, yaw(msg.pose.pose.orientation)]).all():
+            return
+        self.pose = np.array([p.x, p.y, yaw(msg.pose.pose.orientation)])
+        self.actual_speed = math.hypot(msg.twist.twist.linear.x, msg.twist.twist.linear.y)
+        self.odom_stamp = Time.from_msg(msg.header.stamp).nanoseconds/1e9
+        if self.start is None:
+            self.start = self.pose.copy()
+            if self.state == State.FIND_SHELF and self.search_origin is None:
+                # Startup already entered FIND_SHELF. Anchor its sweep to the
+                # first measured heading, and its timeout to the running clock
+                # so a first /clock jump from zero cannot expire the search.
+                self.search_origin = self.pose[2]
+                self.entered = self.search_pause = self.now()
+
+    def on_description(self, msg):
+        try:
+            self.arm_limits = read_joint_limits(msg.data)
+        except Exception as error:
+            self.arm_limits = {}
+            self.get_logger().error(f'Cannot load arm limits: {error}')
+
+    def on_arm_joints(self, msg):
+        if not np.isfinite(msg.position).all():
+            return
+        self.arm_joints.update(zip(msg.name, msg.position))
+        self.arm_joint_stamp = Time.from_msg(msg.header.stamp).nanoseconds/1e9
+
+    def on_pose(self, name, msg):
+        if msg.header.frame_id == self.ros.frames['odom'] and np.isfinite(pose_xyz(msg)).all():
+            self.observations[name] = msg
+
+    def on_holding(self, msg):
+        if msg.data:
+            self.holding_stamp = self.now()
+
+    def on_manip_failure(self, msg):
+        self.manip_failure = msg.data
+
+    def on_book_diagnostics(self, msg):
+        self.book_diagnostics = msg.data
+
+    def on_controller_rejection(self, msg):
+        # Topic trajectory rejections have no action result. Surface the
+        # organiser's reason without attributing another client's rejection
+        # to our current action or triggering an unrelated state transition.
+        self.get_logger().error(
+            f'Controller rejection on {self.ros.topics["controller_rejections"]}: {msg.data}')
+        if ('arm_' in msg.data and 'REJECTED' in msg.data and
+                (not self.arms_tucked or self.state == State.STOW_ARMS_FOR_DOCK)):
+            self.fail(f'Arm pose rejected by the controller: {msg.data}')
+
+    def on_result(self, msg, expected):
+        if self.state == expected:
+            self.result = msg.data
+
+    def on_scan(self, name, msg):
+        try:
+            tf = self.tf.lookup_transform(self.ros.frames['base'], msg.header.frame_id, Time.from_msg(msg.header.stamp))
+        except TransformException:
+            return
+        values = np.asarray(msg.ranges, dtype=float)
+        if not np.any((np.isfinite(values) & (values >= msg.range_min)) | np.isposinf(values)):
+            return  # All-NaN scan is a sensor failure, not an empty arena.
+        points = scan_points(msg.ranges, msg.angle_min, msg.angle_increment,
+                             msg.range_min, msg.range_max, transform_matrix(tf.transform))
+        # Ignore returns from the robot's own body. The real rear laser sees the base's rear edge at
+        # x = -0.36 m (slot 3: it held a turn for minutes), so the box needs a margin over the footprint.
+        points = points[(np.abs(points[:, 0]) > 0.41) | (np.abs(points[:, 1]) > 0.36)]
+        self.scans[name] = (Time.from_msg(msg.header.stamp).nanoseconds/1e9, points)
+
+    def warn(self, key, text):
+        if self.now()-self.warned.get(key, -100) > 3:
+            self.get_logger().warn(text)
+            self.warned[key] = self.now()
+
+    def wall_status(self):
+        wall, sim = time.monotonic(), self.now()
+        rtf = (sim-self.sim_sample)/max(wall-self.wall_sample, 1e-6)
+        self.wall_sample, self.sim_sample = wall, sim
+        cmd_speed = math.hypot(*self.last_command[:2])
+        book = self.observations.get('book')
+        book_age = 'none' if book is None else f'{self.now()-Time.from_msg(book.header.stamp).nanoseconds/1e9:.1f}s'
+        remaining = 'none' if self.goal is None or self.pose is None else f'{np.linalg.norm(self.goal[:2]-self.pose[:2]):.2f}m'
+        heading_error = ('none' if self.goal is None or self.pose is None else
+                         f'{math.degrees(wrap(self.goal[2]-self.pose[2])):+.1f}deg')
+        self.get_logger().info(
+            f'State={self.state.name}; clock/wall={rtf:.2f}; command={cmd_speed:.2f}m/s; '
+            f'turn={self.last_command[2]:+.2f}rad/s; odom={self.actual_speed:.2f}m/s; '
+            f'remaining={remaining}; heading_error={heading_error}; book_age={book_age}; gate={self.last_gate}')
+        if self.state == State.FAILED:
+            self.get_logger().error(f'Failure retained on {self.ros.topics["solution_failure"]}: {self.failure_reason}')
+        if self.ros.use_sim_time and rtf < 0.5:
+            self.get_logger().warn('Gazebo is paused or slower than real time. Increasing /cmd_vel cannot speed up physics; check GPU/rendering.')
+
+    def stop(self):
+        self.last_command = (0.0, 0.0, 0.0)
+        self.cmd_pub.publish(Twist())
+
+    def wall_reference(self):
+        """(point, into-shelf normal) of the shelf-front plane, or None.
+
+        Marker plates are flush with the shelf front and book spines sit on it.
+        The shelf is static in odom, so a stale observation is still a valid
+        plane. Only the confirmed book/column poses are used: the shelf_unit
+        centroid's heading can be a mere line-of-sight bearing, and a tilted
+        wall through a distant centroid can cut across a valid docking path.
+        The dock goal and the wall must come from the same plane family so the
+        goal always stays reachable on the robot side of the wall.
+        """
+        # A bin sits on a table whose top edge can be invisible to the base
+        # LiDAR. During placement use its observed front plane as the virtual
+        # wall; otherwise use the confirmed shelf marker.
+        if self.state in (State.FIND_BIN, State.APPROACH_BIN,
+                          State.BACK_OUT_FOR_BIN_TURN,
+                          State.WAIT_FOR_PLACE_PREP, State.APPROACH_BIN_FOR_PLACE,
+                          State.WAIT_FOR_PLACE):
+            msg = self.observations.get('bin')
+            if msg is not None:
+                heading = yaw(msg.pose.orientation)
+                return pose_xyz(msg)[:2], np.array([math.cos(heading), math.sin(heading)])
+        # The confirmed overhead marker is flush with the shelf front and is
+        # a more stable wall reference than a colour/depth book point.  Keep
+        # the book as a fallback for the close-up case where the marker has
+        # left the camera view; this does not change perception itself.
+        if self.dock_reference is not None and self.state in (
+                State.ALIGN_SHELF_FOR_DOCK, State.STOW_ARMS_FOR_DOCK, State.ALIGN_BOOK,
+                State.BACK_OUT_FOR_GRASP, State.WAIT_FOR_PREGRASP, State.RETURN_FOR_GRAB,
+                State.WAIT_FOR_GRAB, State.RETREAT_FROM_SHELF):
+            msg = self.dock_reference
+            heading = yaw(msg.pose.orientation)
+            return pose_xyz(msg)[:2], np.array([math.cos(heading), math.sin(heading)])
+        for name in ('shelf', 'book'):
+            msg = self.observations.get(name)
+            if msg is not None:
+                heading = yaw(msg.pose.orientation)
+                return pose_xyz(msg)[:2], np.array([math.cos(heading), math.sin(heading)])
+        return None
+
+    def shelf_wall_points(self, reference):
+        """Synthetic base-frame obstacle points along the shelf-front plane.
+
+        The ERC shelf is nearly invisible to the base LiDAR: at its 0.13 m scan
+        plane an aisle presents only the top edge of the bottom board, so the
+        clearance gate reports 'clear' while the bumper is about to hit the
+        shelf. These virtual returns make the existing clearance/turn gates see
+        the shelf like a wall.
+        """
+        if reference is None or self.pose is None:
+            return np.empty((0, 2))
+        p, normal = reference
+        tangent = np.array([-normal[1], normal[0]])
+        world = p[None, :]+np.linspace(-2.7, 2.7, 55)[:, None]*tangent[None, :]+0.03*normal[None, :]
+        c, s = math.cos(self.pose[2]), math.sin(self.pose[2])
+        rel = world-self.pose[:2]
+        return np.c_[c*rel[:, 0]+s*rel[:, 1], -s*rel[:, 0]+c*rel[:, 1]]
+
+    def clamped_dock_goal(self, goal):
+        """Never accept a docking goal closer to the shelf plane than the standoff allows.
+
+        A colour blob seen deep inside a shelf gap can otherwise produce a dock
+        goal at or beyond the shelf front, which the LiDAR cannot veto.
+        """
+        reference = self.wall_reference()
+        if reference is None:
+            return goal
+        p, normal = reference
+        minimum = max(self.p('book_standoff')-0.10,
+                      self.p('shelf_keepout_distance'),
+                      getattr(self, 'active_shelf_keepout_distance',
+                              self.p('shelf_keepout_distance')),
+                      getattr(self, 'book_dock_minimum',
+                              self.p('shelf_keepout_distance')))
+        depth = (goal[:2]-p) @ normal   # negative = robot side of the plane
+        if depth > -minimum:
+            goal = goal.copy()
+            goal[:2] -= (depth+minimum)*normal
+            self.warn('deep_goal', f'Dock goal was {depth:+.2f} m of the shelf plane; clamped to {minimum:.2f} m in front. Book depth estimate is suspect.')
+        return goal
+
+    def dock_constraints_for_book(self, book):
+        """Increase low-row clearance and estimate a safe base centre in-column."""
+        shelf = self.observations.get('shelf')
+        row = None
+        if shelf is not None:
+            row = row_for_height(
+                shelf.pose.position.z, book.pose.position.z,
+                self.p('top_book_marker_offset'), self.p('row_spacing'))
+        standoff = self.p('book_standoff')
+        keepout = self.p('shelf_keepout_distance')
+        if row is not None and row >= 3:
+            standoff = max(standoff, self.p('lower_book_standoff'))
+            keepout = max(keepout, self.p('lower_book_keepout_distance'))
+        self.current_book_row = row
+        self.active_shelf_keepout_distance = keepout
+        self.book_dock_minimum = max(standoff-0.10, keepout)
+        if row is not None:
+            self.book_row_pub.publish(Int32(data=row))
+        return standoff
+
+    def constrain_goal_to_column(self, goal):
+        """Keep the robot footprint within the target aisle while the arm reaches sideways."""
+        shelf = self.dock_reference or self.observations.get('shelf')
+        if shelf is None:
+            return goal
+        heading = yaw(shelf.pose.orientation)
+        tangent = np.array([-math.sin(heading), math.cos(heading)])
+        relative = goal[:2]-pose_xyz(shelf)[:2]
+        lateral = float(relative @ tangent)
+        robot_half_width = (0.36*abs(math.sin(goal[2]-heading))
+                            + 0.32*abs(math.cos(goal[2]-heading)))
+        safe_lateral = max(0.02, self.p('column_half_width')-robot_half_width-0.03)
+        bounded = float(np.clip(lateral, -safe_lateral, safe_lateral))
+        if abs(bounded-lateral) > 1e-3:
+            goal = goal.copy()
+            goal[:2] += (bounded-lateral)*tangent
+            self.warn('column_lateral_clamp',
+                      f'Base alignment shifted {abs(bounded-lateral):.2f} m toward the column centre to clear its divider.')
+        return goal
+
+    def move(self, vx=0.0, vy=0.0, omega=0.0, allow_turn_recovery=True):
+        if not np.isfinite([vx, vy, omega]).all():
+            self.stop()
+            self.last_gate = 'invalid_command'
+            return
+        elapsed = self.now()-getattr(self, 'command_stamp', self.now()-0.05)
+        dt = min(0.1, elapsed if elapsed > 0 else 0.05)
+        previous = np.asarray(self.last_command[:2], dtype=float)
+        desired = np.array([vx, vy], dtype=float)
+        carrying = self.state in (State.RETREAT_FROM_SHELF, State.RETURN_TO_START, State.FIND_BIN,
+                                 State.APPROACH_BIN, State.BACK_OUT_FOR_BIN_TURN, State.APPROACH_BIN_FOR_PLACE)
+        cap = self.p('carry_speed') if carrying else self.p('linear_speed')
+        norm = np.linalg.norm(desired)
+        if norm > cap:
+            desired *= cap/norm
+            norm = cap
+        change = desired-previous
+        cross = previous[0]*desired[1]-previous[1]*desired[0]
+        if norm > np.linalg.norm(previous) or previous @ desired < 0 or abs(cross) > 1e-5:
+            step = self.p('linear_acceleration')*dt
+            desired = previous+change*min(1., step/max(np.linalg.norm(change), 1e-9))
+        vx, vy = desired
+        omega = float(np.clip(omega, -self.p('rotate_speed'), self.p('rotate_speed')))
+        if abs(omega) > abs(self.last_command[2]) or omega*self.last_command[2] < 0:
+            step = self.p('angular_acceleration')*dt
+            omega = float(np.clip(omega, self.last_command[2]-step, self.last_command[2]+step))
+        self.command_stamp = self.now()
+        # Require fresh front AND rear scans for holonomic translation/rotation.
+        if len(self.scans) < 2 or not all(self.fresh(v[0]) for v in self.scans.values()):
+            self.stop()
+            self.last_gate = 'stale_or_missing_lidar'
+            self.warn('scan', f'Waiting for fresh front/rear LiDAR in {self.ros.frames["base"]}; no blind creep.')
+            return
+        points = np.concatenate([v[1] for v in self.scans.values()])
+        scan_count = len(points)
+        reference = self.wall_reference()
+        self.last_gate = 'clear'
+        hard_shelf_blocked = False
+        # A sampled virtual wall protects the footprint, but a position-only
+        # docking goal can still overshoot it by one controller tick.  Guard
+        # the shelf normal directly as well: once at the conservative dock
+        # distance, no command may have a component into the shelf.
+        if reference is not None and self.pose is not None:
+            wall_point, normal = reference
+            c, s = math.cos(self.pose[2]), math.sin(self.pose[2])
+            world_velocity = np.array([c*vx-s*vy, s*vx+c*vy])
+            distance = float(-(self.pose[:2]-wall_point) @ normal)
+            keepout = getattr(self, 'active_shelf_keepout_distance',
+                              self.p('shelf_keepout_distance'))
+            if world_velocity @ normal > 1e-6 and distance <= keepout:
+                vx = vy = 0.0
+                hard_shelf_blocked = True
+                self.last_gate = f'shelf_keepout_hard_{distance:.2f}m'
+                if self.blocked_since is None:
+                    self.blocked_since = self.now()
+                self.warn('hard_shelf_gate',
+                          f'Shelf keepout reached at {distance:.2f} m (minimum {keepout:.2f} m); suppressing inward docking motion.')
+        wall = self.shelf_wall_points(reference)
+        if len(wall):
+            points = np.concatenate([points, wall]) if scan_count else wall
+        speed = math.hypot(vx, vy)
+        if speed > 0 and len(points):
+            direction = np.array([vx, vy])/speed
+            side = np.array([-direction[1], direction[0]])
+            extent = abs(direction[0])*0.36+abs(direction[1])*0.32
+            width = abs(direction[1])*0.36+abs(direction[0])*0.32+0.03
+            along, across = points @ direction, points @ side
+            in_path = (along > 0) & (np.abs(across) < width)
+            if in_path.any():
+                indices = np.where(in_path)[0]
+                nearest = indices[int(np.argmin(along[in_path]))]
+                source = 'shelf_keepout' if nearest >= scan_count else 'obstacle_clearance'
+                clearance = float(along[in_path].min()-extent)
+                if clearance < self.p('obstacle_margin'):
+                    self.stop()
+                    self.last_gate = f'{source}_{clearance:.2f}m'
+                    if self.blocked_since is None:
+                        self.blocked_since = self.now()
+                    self.warn('blocked', f'Path blocked ({source}): {clearance:.2f} m from footprint; state {self.state.name}. This is not successful docking.')
+                    return
+                # Limit absolute speed by clearance. Multiplying an already
+                # tapered docking command caused an unnecessary second slowdown.
+                free = max(0.0, clearance-self.p('obstacle_margin'))
+                latency = max(self.now()-scan[0] for scan in self.scans.values())+0.10
+                decel = 0.60
+                clearance_cap = min(1.5*free, math.sqrt((decel*latency)**2+2*decel*free)-decel*latency)
+                scale = min(1.0, clearance_cap/speed)
+                vx, vy = vx*scale, vy*scale
+                if scale < 1.0:
+                    self.last_gate = f'clearance_speed_limit_{clearance_cap:.2f}m/s'
+        # While the book is carried the arm sweeps well outside the base, and the bin
+        # table's top overhangs between legs the LiDAR plane cannot see: turn only with
+        # every LiDAR return outside the swept radius.
+        carrying = self.state in (State.RETREAT_FROM_SHELF, State.WAIT_FOR_CARRY_RAISE, State.RETURN_TO_START,
+                                  State.FIND_BIN, State.APPROACH_BIN, State.BACK_OUT_FOR_BIN_TURN)
+        turn_radius = self.p('carry_turn_clearance') if carrying else 0.49
+        if abs(omega) > 0 and len(points) and np.linalg.norm(points, axis=1).min() < turn_radius:
+            omega = 0.0
+            self.last_gate = 'turning_envelope_blocked'
+            self.warn('turn', 'Obstacle inside turning envelope; rotation stopped.')
+            if allow_turn_recovery and vx == 0.0 and vy == 0.0:
+                # Rotation needed but blocked, and no translation commanded either:
+                # slide slowly straight away from the nearest return, if that path is clear.
+                nearest = points[int(np.argmin(np.linalg.norm(points, axis=1)))]
+                away = -nearest/max(float(np.linalg.norm(nearest)), 1e-6)
+                side = np.array([-away[1], away[0]])
+                along, across = points @ away, points @ side
+                ahead = along[(along > 0) & (np.abs(across) < 0.35)]
+                clearance = float(ahead.min())-0.36 if len(ahead) else 10.0
+                if clearance > self.p('obstacle_margin')+0.05:
+                    vx, vy = 0.08*float(away[0]), 0.08*float(away[1])
+                    self.last_gate = 'turn_blocked_moving_away'
+                    self.warn('turn_back', 'Rotation blocked; sliding away from the nearest obstacle to regain turning room.')
+        msg = Twist()
+        msg.linear.x, msg.linear.y, msg.angular.z = float(vx), float(vy), float(omega)
+        if not hard_shelf_blocked and any(abs(v) > 1e-6 for v in (vx, vy, omega)):
+            self.blocked_since = None
+        self.last_command = (msg.linear.x, msg.linear.y, msg.angular.z)
+        self.cmd_pub.publish(msg)
+
+    def transition(self, state):
+        self.stop()
+        self.blocked_since = None
+        self.state, self.entered = state, self.now()
+        if state == State.FIND_SHELF:
+            self.dock_reference = None
+            self.selected_book = None
+            self.active_shelf_keepout_distance = self.p('shelf_keepout_distance')
+            self.book_dock_minimum = self.p('shelf_keepout_distance')
+            self.current_book_row = None
+            self.book_row_pub.publish(Int32(data=-1))
+        if state == State.STOW_ARMS_FOR_DOCK:
+            self.arm_stow_last = None
+            self.arm_confirmed_since = None
+        if state == State.RETURN_TO_START:
+            self.return_detour_side = 0
+            self.return_progress_at = self.now()
+            self.return_best_distance = float(np.linalg.norm(self.pose[:2]-self.start[:2]))
+            # the lower-row dock raised the shelf keep-out to 0.84 m; left in force it blocks the bin approach
+            # wherever the table stands within that of the shelf's line (twin m6 s37: held 0.81 m for 240 s)
+            self.active_shelf_keepout_distance = self.p('shelf_keepout_distance')
+        self.state_pub.publish(String(data=state.name))
+        self.get_logger().info(f'-> {state.name}')
+        if state in (State.FIND_SHELF, State.FIND_BIN):
+            self.search_origin = self.pose[2] if self.pose is not None else None
+            search_direction = self.p('bin_search_direction') if state == State.FIND_BIN else self.p('search_direction')
+            direction = -1 if search_direction == 'right' else 1
+            self.search_angles = [direction*math.radians(a) for a in (70, -70, 155, -155)]
+            self.search_index = 0
+            self.search_pause = self.now()+(0.5 if state == State.FIND_BIN else 0.0)
+        if state == State.SCAN_COLUMNS:
+            shelf_unit = self.observations['shelf_unit']
+            self.scan_heading = yaw(shelf_unit.pose.orientation)
+            shelf_normal = np.array([math.cos(self.scan_heading), math.sin(self.scan_heading)])
+            # Center the sweep on the measured marker cluster, not wherever the
+            # robot happened to be when the first non-target sign was spotted.
+            # The marker normal points into the shelf, so stand 1.8 m in front.
+            self.scan_origin = pose_xyz(shelf_unit)[:2]-1.8*shelf_normal
+            self.scan_direction = -1 if self.p('search_direction') == 'right' else 1
+            self.scan_offset = 0.0
+            self.scan_pause_until = None
+            self.scan_observe_started = None
+            # First stop in front of the marker cluster and observe; only then
+            # begin the lateral column sweep.
+            self.scan_goal = np.r_[self.scan_origin, self.scan_heading]
+
+    def advance_scan_waypoint(self):
+        limit = self.p('scan_half_width')
+        if self.scan_direction*self.scan_offset >= limit-1e-6:
+            self.scan_direction *= -1
+        self.scan_offset = float(np.clip(self.scan_offset+self.scan_direction*self.p('scan_step'), -limit, limit))
+        left = np.array([-math.sin(self.scan_heading), math.cos(self.scan_heading)])
+        # Fixed waypoint. Do not shift it sideways on every timer tick.
+        self.scan_goal = np.r_[self.scan_origin+self.scan_offset*left, self.scan_heading]
+        self.scan_pause_until = None
+        self.scan_observe_started = None
+
+    def scan_for_book(self, elapsed):
+        self.stop()
+        self.last_gate = 'waiting_for_fresh_book_pose'
+        cached = self.observations.get('book')
+        dwell = self.p('head_scan_dwell')
+        # Spend the first four settled views on the known book, and revisit
+        # it between broad scans. A close spine otherwise vanishes while the
+        # old five-pitch sweep spends most of its time on unrelated rows.
+        index = int(elapsed/dwell)
+        if cached is not None and (index < 4 or index % 2 == 0):
+            self.look(cached)
+        else:
+            tilts = (0.28, 0.05, -0.25, -0.50, -0.78)
+            self.look(tilt=tilts[(max(0, index-4)//2 if cached is not None else index) % len(tilts)])
+        self.warn('book', f'Book reacquisition: {self.book_diagnostics}')
+
+    def bin_observation(self):
+        target = self.observation('bin', maximum_age=1.5)
+        if target is None:
+            return None
+        if not plausible_bin(pose_xyz(target), self.pose[:2]):
+            self.warn('bin_range', 'Ignoring implausible red drop-box pose; waiting for a fresh surface-supported target within 4 m.')
+            return None
+        return target
+
+    def command_arm_pose(self, targets, stamp_name):
+        """Send one checked trajectory; require measured completion, not a timer."""
+        names = {side: [f'arm_{side}_{i}_joint' for i in range(1, 8)] for side in ('left', 'right')}
+        if not self.fresh(self.arm_joint_stamp) or any(
+                name not in self.arm_joints or name not in self.arm_limits
+                for side in names.values() for name in side):
+            self.warn('arm_feedback', 'Waiting for fresh arm feedback and URDF joint limits.')
+            return False
+        bounded = {side: [float(np.clip(q, *self.arm_limits[name][:2]))
+                          for name, q in zip(joints, targets[side])]
+                   for side, joints in names.items()}
+        matched = all(abs(self.arm_joints[name]-q) <= self.p('arm_feedback_tolerance')
+                      for side, joints in names.items() for name, q in zip(joints, bounded[side]))
+        if matched:
+            if self.arm_confirmed_since is None:
+                self.arm_confirmed_since = self.now()
+            return self.now()-self.arm_confirmed_since >= self.p('arm_feedback_settle')
+        self.arm_confirmed_since = None
+        if getattr(self, stamp_name) is not None:
+            self.warn('arm_moving', 'Arm target not confirmed yet; keeping the base stopped.')
+            return False
+        secs = max(1.0, max(abs(self.arm_joints[name]-q)/min(self.p('arm_motion_speed'),
+                        0.8*self.arm_limits[name][2])
+                        for side, joints in names.items() for name, q in zip(joints, bounded[side])))
+        for side, publisher in (('left', self.left_arm_pub), ('right', self.right_arm_pub)):
+            msg = JointTrajectory()
+            msg.joint_names = names[side]
+            point = JointTrajectoryPoint()
+            point.positions = bounded[side]
+            point.time_from_start.sec = int(secs)
+            point.time_from_start.nanosec = int((secs-int(secs))*1e9)
+            msg.points = [point]
+            publisher.publish(msg)
+        setattr(self, stamp_name, self.now())
+        self.get_logger().info(f'Commanded checked arm pose ({secs:.1f} s); waiting for measured completion.')
+        return False
+
+    def tuck_arms_at_start(self):
+        return self.command_arm_pose(TUCK_POSES, 'arm_tuck_last')
+
+    def stow_arms_for_dock(self):
+        return self.command_arm_pose(DOCK_STOW_POSES, 'arm_stow_last')
+
+    def update_column_goal(self):
+        """Follow close, coherent shelf updates instead of the first search heading."""
+        shelf = self.observation('shelf', maximum_age=1.2)
+        if shelf is None:
+            return
+        proposed = self.target_goal(shelf, self.p('shelf_alignment_standoff'))
+        if np.linalg.norm(proposed[:2]-self.goal[:2]) <= 0.5:
+            self.goal[:2] += 0.25*(proposed[:2]-self.goal[:2])
+            self.goal[2] += 0.25*angle_delta(proposed[2], self.goal[2])
+
+    def update_dock_reference(self):
+        """Refresh the alignment plane only while the arm remains tucked."""
+        shelf = self.observation('shelf', maximum_age=1.2)
+        if shelf is not None and self.dock_reference is not None:
+            old = self.dock_reference
+            if (np.linalg.norm(pose_xyz(shelf)-pose_xyz(old)) <= 0.35
+                    and abs(angle_delta(yaw(shelf.pose.orientation), yaw(old.pose.orientation))) <= 0.35):
+                self.dock_reference = deepcopy(shelf)
+        book = self.observation('book', maximum_age=1.2)
+        if book is not None and self.selected_book is not None:
+            if np.linalg.norm(pose_xyz(book)-pose_xyz(self.selected_book)) <= 0.12:
+                self.selected_book = deepcopy(book)
+        if self.selected_book is None:
+            return
+        self.selected_book.pose.orientation = deepcopy(self.dock_reference.pose.orientation)
+        standoff = self.p('lower_book_standoff') if self.current_book_row in (3, 4) else self.p('book_standoff')
+        self.goal = self.target_goal(self.selected_book, standoff, self.p('book_lateral_offset'))
+        self.goal = self.clamped_dock_goal(self.constrain_goal_to_column(self.goal))
+
+    def recover_book_view(self):
+        # Only before a grasp: never move away after a partially executed arm motion.
+        if self.book_recoveries >= self.p('max_book_recoveries'):
+            self.fail(f'Book could not be reacquired after a bounded head scan and back-off. {self.book_diagnostics}')
+            return
+        self.book_recoveries += 1
+        heading = self.pose[2]
+        retreat = self.p('book_view_backoff')
+        self.goal = np.r_[self.pose[:2]-retreat*np.array([math.cos(heading), math.sin(heading)]), heading]
+        self.get_logger().warn(
+            f'Book scan found no stable target; backing straight out {retreat:.2f} m '
+            f'for a wider view ({self.book_recoveries}/{self.p("max_book_recoveries")}).')
+        self.transition(State.BACK_OUT_FOR_VIEW)
+
+    def on_robot_fault(self, msg):
+        if self.robot_fault or self.state in (State.DONE, State.FAILED):
+            return
+        try:
+            reason = json.loads(msg.data)['reason']
+        except (ValueError, KeyError, TypeError):
+            reason = msg.data
+        self.robot_fault = reason
+        self.fail(f'Robot fault: {reason}', cancel_manipulation=False)
+
+    def check_feedback(self):
+        missing = []
+        if not self.fresh(self.odom_stamp):
+            missing.append('odometry')
+        moving = self.state not in (State.WAIT_FOR_PREGRASP, State.WAIT_FOR_GRAB,
+            State.WAIT_FOR_CARRY_RAISE, State.WAIT_FOR_PLACE_PREP, State.WAIT_FOR_PLACE,
+            State.STOW_ARMS_FOR_DOCK)
+        if moving and (len(self.scans) < 2 or not all(self.fresh(v[0]) for v in self.scans.values())):
+            missing.append('front/rear LiDAR')
+        if not missing:
+            self.sensor_wait_since = None
+            return True
+        self.stop()
+        self.last_gate = ('stale_or_missing_odometry' if missing == ['odometry'] else
+                          'stale_or_missing_lidar' if missing == ['front/rear LiDAR'] else
+                          'stale_or_missing_odometry_and_lidar')
+        if self.sensor_wait_since is None:
+            self.sensor_wait_since = self.now()
+        self.warn('feedback', f'Waiting for fresh {", ".join(missing)}; base commands are stopped.')
+        if self.now()-self.sensor_wait_since >= self.p('sensor_loss_timeout'):
+            reason = 'Robot feedback lost: '+', '.join(missing)+'. Check robot/controller/DDS state before restarting.'
+            self.robot_fault = reason
+            self.robot_fault_pub.publish(String(data=json.dumps({'reason': reason, 'source': 'navigation'})))
+            self.fail(reason, cancel_manipulation=False)
+        return False
+
+    def fail(self, reason, cancel_manipulation=True):
+        self.failure_reason = reason
+        self.failure_pub.publish(String(data=reason))
+        self.get_logger().error(reason)
+        if cancel_manipulation:
+            self.cancel_pub.publish(Bool(data=True))
+        self.transition(State.FAILED)
+
+    def observation(self, name, maximum_age=2.0):
+        msg = self.observations.get(name)
+        if msg is None or not self.fresh(Time.from_msg(msg.header.stamp).nanoseconds/1e9, maximum_age):
+            return None
+        return msg
+
+    def look(self, target=None, tilt=0.15):
+        if target is not None:
+            try:
+                tf = self.tf.lookup_transform(self.ros.frames['head'], self.ros.frames['odom'], Time())
+                p = (transform_matrix(tf.transform) @ np.r_[pose_xyz(target), 1])[:3]
+                tilt = math.atan2(p[2]-0.25, max(math.hypot(p[0], p[1]), 0.1))
+            except TransformException:
+                pass
+        # /erc rejects a head_2 goal within 0.05 of its 0.3491 limit: 0.30 was rejected (twin, 4 runs)
+        tilt = float(np.clip(tilt, -0.9, 0.29))
+        if self.last_head is not None and abs(self.last_head-tilt) < 0.04:
+            return
+        if self.head_pub.get_subscription_count() == 0:
+            return
+        # the /erc checker rejects head_2 faster than 0.5 rad/s: size the move at 0.35 rad/s
+        travel = abs(tilt-self.last_head) if self.last_head is not None else 1.2
+        # the pan returns to 0 in the same goal: size by the measured travel of both joints (a pan swing alone
+        # went 0.53 rad/s against the 0.5 cap, twin m1)
+        pan, cur_tilt = self.arm_joints.get('head_1_joint'), self.arm_joints.get('head_2_joint')
+        if pan is not None and cur_tilt is not None:
+            travel = max(travel, abs(pan), abs(tilt-cur_tilt))
+        duration = max(1.0, travel/0.35)
+        self.last_head = tilt
+        msg = JointTrajectory()
+        msg.joint_names = ['head_1_joint', 'head_2_joint']
+        point = JointTrajectoryPoint()
+        point.positions = [0.0, tilt]
+        point.time_from_start.sec = int(duration)
+        point.time_from_start.nanosec = int((duration-int(duration))*1e9)
+        msg.points = [point]
+        self.head_pub.publish(msg)
+
+    def look_for_shelf(self, elapsed):
+        # The shelf numbers sit above the book rows. Sweep the camera pitch as
+        # the base scans so acquisition still works when the initial head pose
+        # puts the overhead markers outside the camera's vertical field of view.
+        tilts = (0.28, 0.12, -0.08)
+        tilt = tilts[int(max(0.0, elapsed) / self.p('head_scan_dwell')) % len(tilts)]
+        self.look(tilt=tilt)
+
+    def search(self):
+        if self.now() < self.search_pause:
+            self.stop()
+            return
+        target = self.search_origin+self.search_angles[self.search_index]
+        error = wrap(target-self.pose[2])
+        if abs(error) < 0.06:
+            self.stop()
+            self.search_index = (self.search_index+1) % len(self.search_angles)
+            self.search_pause = self.now()+0.6
+        else:
+            self.move(omega=float(np.clip(1.5*error, -self.p('search_rotate_speed'), self.p('search_rotate_speed'))))
+
+    def drive_to(self, goal, tolerance=0.04, docking=False, keep_heading=False):
+        dx, dy = goal[:2]-self.pose[:2]
+        if (not docking and not keep_heading and self.state == State.APPROACH_COLUMN
+                and math.hypot(dx, dy) < 0.40):
+            docking = True
+        if not docking and not keep_heading:
+            vx, vy, omega, arrived = forward_command(
+                dx, dy, self.pose[2], goal[2], self.p('linear_speed'),
+                self.p('rotate_speed'), tolerance)
+            if arrived:
+                self.stop()
+                return True
+            self.move(vx, vy, omega)
+            return False
+        error = wrap(goal[2]-self.pose[2])
+        if math.hypot(dx, dy) < tolerance and abs(error) < 0.04:
+            self.stop()
+            return True
+        omega = float(np.clip(1.6*error, -self.p('rotate_speed'), self.p('rotate_speed')))
+        vx, vy = body_velocity(dx, dy, self.pose[2], self.p('docking_speed'), gain=1.8)
+        if keep_heading:
+            # A reverse retreat must not first turn the carried book into the shelf.
+            vy = 0.0
+            omega = 0.0
+            if self.state == State.RETURN_FOR_GRAB:
+                vx = float(np.clip(vx, -self.p("grasp_return_speed"), self.p("grasp_return_speed")))
+        elif abs(error) > 0.20:
+            vx = vy = 0.0
+        else:
+            vy = float(np.clip(vy, -self.p('strafe_speed'), self.p('strafe_speed')))
+        self.move(vx, vy, omega)
+        return False
+
+    def return_path_clearance(self, direction, horizon):
+        """Estimate LiDAR clearance along a short base-frame translation."""
+        points = np.concatenate([scan[1] for scan in self.scans.values()])
+        wall = self.shelf_wall_points(self.wall_reference())
+        if len(wall):
+            points = np.concatenate([points, wall])
+        direction = np.asarray(direction, dtype=float)
+        direction /= max(np.linalg.norm(direction), 1e-9)
+        side = np.array([-direction[1], direction[0]])
+        extent = abs(direction[0])*0.36+abs(direction[1])*0.32
+        width = abs(direction[1])*0.36+abs(direction[0])*0.32+0.03
+        along, across = points @ direction, points @ side
+        in_path = (along > 0) & (along < horizon+extent) & (np.abs(across) < width)
+        if not in_path.any():
+            return float('inf')
+        return float(along[in_path].min()-extent)
+
+    def drive_return_to_start(self):
+        """Take a direct reverse/strafe route, detouring around LiDAR obstacles."""
+        delta = self.start[:2]-self.pose[:2]
+        distance = float(np.linalg.norm(delta))
+        if distance <= 0.10:
+            # No turn back to the start heading: the start sits beside the bin table and the
+            # bin search turns anyway (through the carried-arm clearance check).
+            self.stop()
+            return True
+        if len(self.scans) < 2 or not all(self.fresh(scan[0]) for scan in self.scans.values()):
+            self.stop()
+            self.last_gate = 'stale_or_missing_lidar'
+            self.warn('return_lidar', 'Waiting for fresh front/rear LiDAR before returning to the start.')
+            return False
+        # The start sits right beside the bin table, whose top the LiDAR cannot see between
+        # its legs: near the start, stop as soon as anything is inside the carried-arm radius
+        # rather than driving the torso into the table's edge.
+        points = np.concatenate([scan[1] for scan in self.scans.values()])
+        if (distance <= 0.8 and len(points)
+                and np.linalg.norm(points, axis=1).min() < self.p('carry_turn_clearance')):
+            self.stop()
+            self.get_logger().info(f'Stopping the return {distance:.2f} m short of the start: '
+                                   'an obstacle (the bin table) is close.')
+            return True
+
+        if getattr(self, 'return_best_distance', float('inf'))-distance > 0.10:
+            self.return_best_distance = distance
+            self.return_progress_at = self.now()
+        elif self.now()-getattr(self, 'return_progress_at', self.now()) > 12.0:
+            self.fail('Return route made no useful progress for 12 s; inspect the obstruction.')
+            return False
+        self.goal = self.start.copy()
+        desired_world = delta/distance
+        c, s = math.cos(self.pose[2]), math.sin(self.pose[2])
+        horizon = min(1.0, distance)
+        offsets = (0.0, math.radians(20), -math.radians(20), math.radians(35),
+                   -math.radians(35), math.radians(50), -math.radians(50),
+                   math.radians(65), -math.radians(65), math.radians(80),
+                   -math.radians(80))
+        options = []
+        for offset in offsets:
+            angle = math.atan2(desired_world[1], desired_world[0])+offset
+            world_direction = np.array([math.cos(angle), math.sin(angle)])
+            body_direction = np.array([c*world_direction[0]+s*world_direction[1],
+                                       -s*world_direction[0]+c*world_direction[1]])
+            progress = float(world_direction @ desired_world)
+            if progress < 0.15:
+                continue
+            clearance = self.return_path_clearance(body_direction, horizon)
+            if clearance < self.p('obstacle_margin'):
+                continue
+            score = abs(offset)+0.025/max(clearance, 0.05)
+            options.append((score, offset, body_direction))
+
+        direct_clear = any(offset == 0.0 for _, offset, _ in options)
+        if direct_clear:
+            self.return_detour_side = 0
+            options = [option for option in options if option[1] == 0.0]
+        else:
+            left = [option for option in options if option[1] > 0]
+            right = [option for option in options if option[1] < 0]
+            if self.return_detour_side > 0 and left:
+                options = left
+            elif self.return_detour_side < 0 and right:
+                options = right
+            elif left or right:
+                best_left = min((option[0] for option in left), default=float('inf'))
+                best_right = min((option[0] for option in right), default=float('inf'))
+                self.return_detour_side = 1 if best_left < best_right else -1
+                options = left if self.return_detour_side > 0 else right
+
+        if not options:
+            self.stop()
+            self.last_gate = 'return_path_blocked'
+            self.warn('return_blocked', 'No short obstacle-free return direction is available; holding position.')
+            return False
+
+        _, offset, direction = min(options, key=lambda option: option[0])
+        speed_cap = self.p('linear_speed')
+        if abs(direction[1]) > 1e-6:
+            speed_cap = min(speed_cap, self.p('strafe_speed')/abs(direction[1]))
+        speed = min(speed_cap, 1.5*distance)
+        self.move(float(direction[0]*speed), float(direction[1]*speed), 0.0)
+        if offset and self.last_gate == 'clear':
+            self.last_gate = f'return_detour_{"left" if offset > 0 else "right"}'
+        return False
+
+    def rotate_to(self, heading):
+        """Align heading without changing the already-valid base position."""
+        error = wrap(heading-self.pose[2])
+        if abs(error) < 0.04:
+            self.stop()
+            return True
+        omega = float(np.clip(1.6*error, -self.p('rotate_speed'), self.p('rotate_speed')))
+        # Keep rotation itself translation-free. APPROACH_BIN handles a blocked
+        # turn with a separate, bounded retreat and recomputes the final advance.
+        self.move(omega=omega, allow_turn_recovery=False)
+        return False
+
+    def back_out_for_bin_turn(self):
+        """Make room for a blocked bin turn without reversing indefinitely."""
+        if self.bin_turn_recoveries >= self.p('max_bin_turn_recoveries'):
+            self.fail('Bin rotation is still blocked after the bounded clearance retreats; inspect front/rear LiDAR around the base.')
+            return
+        # Check the entire planned reverse path before beginning the recovery.
+        # move() continues checking both sensors and obstacles on every tick.
+        if len(self.scans) < 2 or not all(self.fresh(v[0]) for v in self.scans.values()):
+            self.stop()
+            self.last_gate = 'stale_or_missing_lidar'
+            return
+        points = np.concatenate([v[1] for v in self.scans.values()])
+        wall = self.shelf_wall_points(self.wall_reference())
+        points = np.concatenate([points, wall])
+        behind = points[(points[:, 0] < 0) & (np.abs(points[:, 1]) < 0.35)]
+        clearance = float(-behind[:, 0].max())-0.36 if len(behind) else float('inf')
+        retreat = self.p('bin_turn_backoff')
+        if clearance < retreat+self.p('obstacle_margin'):
+            self.fail(f'Bin rotation blocked and rear clearance {clearance:.2f} m is too small for a {retreat:.2f} m retreat.')
+            return
+        self.bin_turn_recoveries += 1
+        self.bin_alignment_goal = self.goal.copy()
+        self.bin_approach_heading = self.goal[2]
+        self.bin_retreat_origin = self.pose[:2].copy()
+        heading = self.pose[2]
+        self.goal = np.r_[self.pose[:2]-retreat*np.array([math.cos(heading), math.sin(heading)]), heading]
+        self.get_logger().warn(
+            f'Bin turn blocked; backing straight out {retreat:.2f} m before retrying '
+            f'({self.bin_turn_recoveries}/{self.p("max_bin_turn_recoveries")}).')
+        self.transition(State.BACK_OUT_FOR_BIN_TURN)
+
+    def table_gap(self):
+        """Free distance from the base's front edge to the nearest LiDAR return ahead (the bin table's legs)."""
+        if len(self.scans) < 2 or not all(self.fresh(v[0]) for v in self.scans.values()):
+            return None
+        pts = np.concatenate([v[1] for v in self.scans.values()])
+        ahead = pts[(pts[:, 0] > 0.30) & (pts[:, 0] < 1.8) & (np.abs(pts[:, 1]) < 0.95)]
+        return float(ahead[:, 0].min())-0.36 if len(ahead) else None
+
+    def rear_clearance(self):
+        if not self.scans:
+            return 0.0
+        pts = np.concatenate([v[1] for v in self.scans.values()])
+        behind = pts[(pts[:, 0] < 0) & (np.abs(pts[:, 1]) < 0.35)]
+        return float(-behind[:, 0].max())-0.36 if len(behind) else 1.0
+
+    def drive_bin_turn_backoff(self):
+        # Translate along the saved heading without any simultaneous rotation.
+        heading = np.array([math.cos(self.goal[2]), math.sin(self.goal[2])])
+        remaining = float((self.pose[:2]-self.goal[:2]) @ heading)
+        if remaining <= 0.02:
+            self.stop()
+            return True
+        self.move(vx=-min(0.08, 1.8*remaining), allow_turn_recovery=False)
+        return False
+
+    def drive_forward_to(self, goal, tolerance=0.03):
+        """Advance along the current heading only; never back away from a bin."""
+        heading = np.array([math.cos(self.pose[2]), math.sin(self.pose[2])])
+        remaining = float((goal[:2]-self.pose[:2]) @ heading)
+        if remaining <= tolerance:
+            self.stop()
+            return True
+        self.move(vx=min(self.p('docking_speed'), 1.8*remaining))
+        return False
+
+    def shelf_limited_return_arrived(self, goal):
+        """Accept a close return stopped solely by the hard shelf boundary."""
+        return (self.last_gate.startswith('shelf_keepout') and
+                math.hypot(*(goal[:2]-self.pose[:2])) <= 0.06 and
+                abs(wrap(goal[2]-self.pose[2])) < 0.04)
+
+    @staticmethod
+    def target_goal(msg, standoff, lateral=0.0):
+        heading = yaw(msg.pose.orientation)
+        normal = np.array([math.cos(heading), math.sin(heading)])
+        left = np.array([-normal[1], normal[0]])
+        p = pose_xyz(msg)[:2]-normal*standoff-left*lateral
+        return np.r_[p, heading]
+
+    def tick(self):
+        elapsed = self.now()-self.entered
+        self.bin_mode_pub.publish(Bool(data=self.state in (
+            State.RETURN_TO_START, State.FIND_BIN, State.APPROACH_BIN,
+            State.BACK_OUT_FOR_BIN_TURN,
+            State.WAIT_FOR_PLACE_PREP, State.APPROACH_BIN_FOR_PLACE, State.WAIT_FOR_PLACE)))
+        if self.state in (State.DONE, State.FAILED):
+            self.stop()
+            return
+        if not self.arms_tucked:
+            # Before the base moves at all: arms held out sweep whatever is beside the start
+            # (the bin table) on the first search turn.
+            self.stop()
+            self.last_gate = 'tucking_arms'
+            self.arms_tucked = self.tuck_arms_at_start()
+            if self.arms_tucked:
+                self.arm_confirmed_since = None
+                self.entered = self.now()
+            elif elapsed > self.p('arm_tuck_timeout'):
+                self.fail('Startup arm tuck did not reach measured targets; inspect controller rejections and joint feedback.')
+            return
+        if self.state == State.FIND_SHELF:
+            self.look_for_shelf(elapsed)
+        if not self.check_feedback():
+            return
+        if self.state in (State.RETREAT_FROM_SHELF, State.WAIT_FOR_CARRY_RAISE, State.RETURN_TO_START,
+                          State.FIND_BIN, State.APPROACH_BIN, State.BACK_OUT_FOR_BIN_TURN, State.WAIT_FOR_PLACE_PREP,
+                          State.APPROACH_BIN_FOR_PLACE) and not self.fresh(self.holding_stamp, 1.5):
+            self.fail('Book contact lost while carrying, or manipulation feedback stopped.')
+            return
+        if self.state in (State.FIND_BOOK, State.REACQUIRE_BOOK) and elapsed > self.p('book_search_timeout'):
+            self.recover_book_view()
+            return
+        limit = (self.p('grab_timeout') if self.state == State.WAIT_FOR_GRAB else
+                 self.p('place_timeout') if self.state == State.WAIT_FOR_PLACE else
+                 self.p('shelf_alignment_timeout') if self.state == State.ALIGN_SHELF_FOR_DOCK else
+                 self.p('phase_timeout'))
+        if elapsed > limit:
+            self.fail(f'{self.state.name} timed out after {elapsed:.1f} simulation seconds; inspect preceding warnings.')
+            return
+        if self.state in (State.FIND_SHELF, State.SCAN_COLUMNS):
+            observing = self.state == State.SCAN_COLUMNS and self.scan_pause_until is not None
+            if self.state == State.SCAN_COLUMNS:
+                self.look_for_shelf(self.now()-self.scan_observe_started if observing else elapsed)
+            target = self.observation('shelf')
+            if target is not None:
+                self.goal = self.target_goal(target, self.p('shelf_alignment_standoff'))
+                self.transition(State.APPROACH_COLUMN)
+            elif self.state == State.FIND_SHELF:
+                if self.observation('shelf_unit') is not None:
+                    self.transition(State.SCAN_COLUMNS)
+                else:
+                    self.search()
+            else:
+                self.goal = self.scan_goal
+                if self.scan_pause_until is not None:
+                    self.stop()
+                    self.last_gate = f'observing_columns_{max(0.0, self.scan_pause_until-self.now()):.1f}s'
+                    if self.now() >= self.scan_pause_until:
+                        self.advance_scan_waypoint()
+                elif self.drive_to(self.scan_goal):
+                    # One full pitch sweep, including head settling and three
+                    # stable observations at each pitch, with the base stopped.
+                    self.scan_observe_started = self.now()
+                    self.scan_pause_until = self.now()+max(
+                        self.p('scan_observe_time'), 3*self.p('head_scan_dwell'))
+                    self.last_gate = 'observing_columns'
+        elif self.state == State.APPROACH_COLUMN:
+            self.update_column_goal()
+            # The goal comes from the markers seen during the search, in odom; the search's turns put a few
+            # degrees of heading error into odom (the robot's wheel odometry reads its turns 4.4 % short), so
+            # the goal can land inside the shelf keep-out. Held there, close and facing the shelf, is arrived:
+            # the book search and the LiDAR shelf alignment that follow re-measure from here.
+            arrived = self.drive_to(self.goal)
+            remaining = float(np.linalg.norm(self.goal[:2]-self.pose[:2]))
+            if not arrived and str(self.last_gate).startswith('shelf_keepout') and remaining < 0.5:
+                self.keepout_since = getattr(self, 'keepout_since', None) or self.now()
+                if self.now()-self.keepout_since > 3.0:
+                    self.get_logger().info(f'Column approach held by the shelf keep-out {remaining:.2f} m short: '
+                                           'close enough, looking for the book from here.')
+                    arrived = True
+            else:
+                self.keepout_since = None
+            if arrived:
+                self.keepout_since = None
+                self.transition(State.FIND_BOOK)
+        elif self.state in (State.FIND_BOOK, State.REACQUIRE_BOOK):
+            book = self.observation('book')
+            if book is not None:
+                self.selected_book = deepcopy(book)
+                self.dock_reference = deepcopy(self.observations.get('shelf'))
+                standoff = self.dock_constraints_for_book(book)
+                self.goal = self.target_goal(
+                    book, standoff, self.p('book_lateral_offset'))
+                shelf = self.observation('shelf')
+                if shelf is not None:
+                    self.goal[2] = yaw(shelf.pose.orientation)
+                self.goal = self.constrain_goal_to_column(self.goal)
+                self.goal = self.clamped_dock_goal(self.goal)
+                self.get_logger().info(
+                    f'Book dock: row={self.current_book_row}, standoff={standoff:.2f} m, '
+                    f'shelf_keepout={self.active_shelf_keepout_distance:.2f} m.')
+                self.get_logger().info('Aligning the base parallel to the shelf before moving the arms.')
+                self.transition(State.ALIGN_SHELF_FOR_DOCK)
+            else:
+                self.scan_for_book(elapsed)
+        elif self.state == State.ALIGN_SHELF_FOR_DOCK:
+            if self.dock_reference is not None:
+                self.update_dock_reference()
+            if (self.blocked_since is not None and
+                    self.now()-self.blocked_since > self.p('align_block_timeout')):
+                self.fail(f'Shelf-parallel alignment blocked ({self.last_gate}); refusing to stow arms against the shelf.')
+                return
+            reference = self.wall_reference()
+            if reference is not None:
+                wall_point, normal = reference
+                shelf_distance = float(-(self.pose[:2]-wall_point) @ normal)
+                safe_distance = max(self.p('shelf_alignment_standoff'),
+                                    self.active_shelf_keepout_distance+0.25)
+                if shelf_distance < safe_distance-0.025:
+                    speed = min(self.p('shelf_alignment_strafe_speed'),
+                                1.5*(safe_distance-shelf_distance))
+                    world_velocity = -normal*speed
+                    c, s = math.cos(self.pose[2]), math.sin(self.pose[2])
+                    vx = c*world_velocity[0]+s*world_velocity[1]
+                    vy = -s*world_velocity[0]+c*world_velocity[1]
+                    self.move(vx=vx, vy=vy, allow_turn_recovery=False)
+                    return
+            heading_error = wrap(self.goal[2]-self.pose[2])
+            if abs(heading_error) > 0.025:
+                omega = float(np.clip(1.6*heading_error,
+                                      -self.p('rotate_speed'), self.p('rotate_speed')))
+                self.move(omega=omega, allow_turn_recovery=False)
+                return
+            tangent = np.array([-math.sin(self.goal[2]), math.cos(self.goal[2])])
+            lateral_error = float((self.goal[:2]-self.pose[:2]) @ tangent)
+            if abs(lateral_error) <= 0.025:
+                self.transition(State.STOW_ARMS_FOR_DOCK)
+                return
+            speed = min(self.p('shelf_alignment_strafe_speed'), 1.5*abs(lateral_error))
+            self.move(vy=math.copysign(speed, lateral_error), allow_turn_recovery=False)
+        elif self.state == State.STOW_ARMS_FOR_DOCK:
+            self.stop()
+            if self.stow_arms_for_dock():
+                self.transition(State.ALIGN_BOOK)
+            elif elapsed > self.p('arm_stow_timeout'):
+                self.fail(f'Arm stow timed out before shelf docking; inspect {self.ros.topics["joint_states"]} and both arm trajectory controllers.')
+        elif self.state == State.BACK_OUT_FOR_VIEW:
+            if self.drive_to(self.goal, keep_heading=True):
+                self.transition(State.FIND_BOOK)
+        elif self.state == State.ALIGN_BOOK:
+            cached = self.observations.get('book')
+            self.look(cached)
+            # Keep the goal consistent with the current wall plane, and never
+            # sit out the 90 s phase timeout against a blocked docking path —
+            # back out and reacquire instead.
+            self.goal = self.constrain_goal_to_column(self.goal)
+            self.goal = self.clamped_dock_goal(self.goal)
+            arrived = self.drive_to(self.goal, tolerance=0.025, docking=True)
+            if arrived or self.shelf_limited_return_arrived(self.goal):
+                if not arrived:
+                    self.get_logger().warn('ALIGN_BOOK reached the shelf keepout boundary; continuing with the compensated staged grasp.')
+                book = self.observation('book', maximum_age=1.2)
+                if book is None:
+                    self.transition(State.REACQUIRE_BOOK)
+                    return
+                if (self.selected_book is not None and
+                        np.linalg.norm(pose_xyz(book)-pose_xyz(self.selected_book)) > 0.12):
+                    realignments = getattr(self, 'book_realignments', 0)
+                    if realignments >= 2:
+                        self.fail('Book pose changed repeatedly during docking; refusing a moving/unstable target.')
+                        return
+                    self.book_realignments = realignments+1
+                    self.get_logger().info('Fresh book pose changed after approach; realigning from here without a view backout.')
+                    self.transition(State.REACQUIRE_BOOK)
+                    return
+                grasp = deepcopy(book)
+                grasp.pose.orientation = deepcopy((self.dock_reference or book).pose.orientation)
+                self.grasp_target_pub.publish(grasp)
+                heading = self.pose[2]
+                retreat = self.p('grasp_base_retreat')
+                self.goal = np.r_[self.pose[:2]-retreat*np.array([math.cos(heading), math.sin(heading)]), heading]
+                self.transition(State.BACK_OUT_FOR_GRASP)
+            elif self.blocked_since is not None and self.now()-self.blocked_since > self.p('align_block_timeout'):
+                self.get_logger().warn(f'Docking path blocked for {self.p("align_block_timeout"):.0f} s (gate={self.last_gate}); backing out to reacquire the book.')
+                self.recover_book_view()
+        elif self.state == State.BACK_OUT_FOR_GRASP:
+            if self.drive_to(self.goal, keep_heading=True):
+                if self.current_book_row == 1:
+                    # Keep the arms folded for the base return. The top-row
+                    # reach is planned from above only after the base is still.
+                    heading = self.pose[2]
+                    advance = self.p('grasp_base_return_advance')
+                    self.goal = np.r_[self.pose[:2]+advance*np.array([math.cos(heading), math.sin(heading)]), heading]
+                    self.transition(State.RETURN_FOR_GRAB)
+                else:
+                    self.result = None
+                    self.transition(State.WAIT_FOR_PREGRASP)
+                    self.prepare_grab_pub.publish(Bool(data=True))
+        elif self.state == State.WAIT_FOR_PREGRASP:
+            self.stop()
+            if self.result is False:
+                self.fail(f'Pregrasp failed: {self.manip_failure or self.ros.topics["manipulation_failure"]}')
+            elif self.result is True:
+                self.result = None
+                if self.current_book_row == 1:
+                    self.transition(State.WAIT_FOR_GRAB)
+                    self.finish_grab_pub.publish(Bool(data=True))
+                else:
+                    heading = self.pose[2]
+                    advance = self.p('grasp_base_return_advance')
+                    self.goal = np.r_[self.pose[:2]+advance*np.array([math.cos(heading), math.sin(heading)]), heading]
+                    self.transition(State.RETURN_FOR_GRAB)
+        elif self.state == State.RETURN_FOR_GRAB:
+            arrived = self.drive_to(self.goal, keep_heading=True)
+            # held a few cm short by an obstacle-clearance gate (a neighbouring divider or book; twin m4 s3: 0.04 m
+            # short for 240 s): the arm reaches the frozen book pose from there, odom knows where the base stopped
+            held = (not arrived and str(self.last_gate).startswith('obstacle_clearance') and
+                    float(np.linalg.norm(self.goal[:2]-self.pose[:2])) < 0.08)
+            self.return_held_since = (getattr(self, 'return_held_since', None) or self.now()) if held else None
+            if held and self.now()-self.return_held_since > 3.0:
+                self.get_logger().warn(f'Return-to-grab held {np.linalg.norm(self.goal[:2]-self.pose[:2]):.2f} m short '
+                                       f'by {self.last_gate}: grabbing from here.')
+                self.return_held_since = None
+                arrived = True
+            if arrived or self.shelf_limited_return_arrived(self.goal):
+                if not arrived:
+                    self.get_logger().warn('Return-to-grab stopped by the shelf keepout at the safe boundary; starting the compensated arm close.')
+                self.result = None
+                if self.current_book_row == 1:
+                    self.transition(State.WAIT_FOR_PREGRASP)
+                    self.prepare_grab_pub.publish(Bool(data=True))
+                else:
+                    self.transition(State.WAIT_FOR_GRAB)
+                    self.finish_grab_pub.publish(Bool(data=True))
+        elif self.state == State.WAIT_FOR_GRAB:
+            self.stop()
+            if self.result is False:
+                if 'redock' in self.manip_failure and self.book_recoveries < self.p('max_book_recoveries'):
+                    # Manipulation refused because the base is jammed too close to
+                    # the shelf. Back straight out and dock again instead of failing.
+                    self.book_recoveries += 1
+                    heading = self.pose[2]
+                    self.goal = np.r_[self.pose[:2]-0.35*np.array([math.cos(heading), math.sin(heading)]), heading]
+                    self.get_logger().warn('Grab refused: base too close to the shelf. Backing out 0.35 m to re-dock.')
+                    self.result = None
+                    self.transition(State.BACK_OUT_FOR_VIEW)
+                    return
+                self.fail(f'Grasp failed: {self.manip_failure or self.ros.topics["manipulation_failure"]}')
+            elif self.result is True:
+                # The upright carry configuration moves its elbow through a
+                # broad arc. Back straight out first, especially for a book
+                # taken from the bottom shelf, before changing arm shape.
+                heading = self.pose[2]
+                retreat = self.p('carry_raise_retreat')
+                self.goal = np.r_[self.pose[:2]-retreat*np.array([math.cos(heading), math.sin(heading)]), heading]
+                self.get_logger().info(f'Grasp verified; withdrawing {retreat:.2f} m before the high carry pose.')
+                self.transition(State.RETREAT_FROM_SHELF)
+        elif self.state == State.RETREAT_FROM_SHELF:
+            if self.drive_to(self.goal, keep_heading=True):
+                self.result = None
+                self.transition(State.WAIT_FOR_CARRY_RAISE)
+                self.raise_carry_pub.publish(Bool(data=True))
+        elif self.state == State.WAIT_FOR_CARRY_RAISE:
+            self.stop()
+            if self.result is False:
+                self.fail(f'Carry raise failed: {self.manip_failure or "see manipulation log"}')
+            elif self.result is True:
+                self.transition(State.RETURN_TO_START)
+        elif self.state == State.RETURN_TO_START:
+            self.look(tilt=-0.1)
+            if self.drive_return_to_start():
+                self.transition(State.FIND_BIN)
+        elif self.state == State.FIND_BIN:
+            # Hold each downward view long enough for three RGB-D confirmations.
+            tilts = (-.10, -.35, -.55)
+            self.look(tilt=tilts[int(elapsed/max(2.0, self.p('head_scan_dwell'))) % len(tilts)])
+            target = self.bin_observation()
+            if target is not None:
+                self.goal = self.target_goal(target, self.p('bin_standoff'), self.p('bin_lateral_offset'))
+                self.bin_turn_recoveries = 0
+                self.bin_turn_retreat_total = 0.0
+                self.transition(State.APPROACH_BIN)
+            else:
+                self.search()
+        elif self.state == State.APPROACH_BIN:
+            target = self.bin_observation()
+            if target is None:
+                self.stop()
+                self.last_gate = 'waiting_for_fresh_bin_pose'
+                since = getattr(self, 'bin_lost_since', None)
+                if since is None:
+                    self.bin_lost_since = self.now()
+                elif self.now()-since >= 3.0:
+                    attempts = getattr(self, 'bin_reacquisitions', 0)
+                    if attempts >= 2:
+                        self.fail('Drop-box observations repeatedly lost; keeping the book held.')
+                    else:
+                        self.bin_reacquisitions = attempts+1
+                        self.bin_lost_since = None
+                        self.transition(State.FIND_BIN)
+                return
+            self.bin_lost_since = None
+            self.look(target)
+            # Refresh the lateral centre from current observations, keeping
+            # the approach heading stable while the base aligns.
+            normal = np.array([math.cos(self.goal[2]), math.sin(self.goal[2])])
+            left = np.array([-normal[1], normal[0]])
+            self.goal[:2] = pose_xyz(target)[:2]-normal*self.p('bin_standoff')-left*self.p('bin_lateral_offset')
+            # Face the bin at the return pose, making a bounded retreat only
+            # when LiDAR prevents rotation. Recompute distance after recovery.
+            if self.rotate_to(self.goal[2]):
+                tangent = np.array([-math.sin(self.goal[2]), math.cos(self.goal[2])])
+                lateral = float((self.goal[:2]-self.pose[:2]) @ tangent)
+                if abs(lateral) > 0.035:
+                    self.move(vy=float(np.clip(1.5*lateral, -self.p('docking_speed'), self.p('docking_speed'))),
+                              allow_turn_recovery=False)
+                    return
+                # The high carry pose cannot reach a bin 1.53 m away (the
+                # observed failure was a 0.425 m IK position error). Advance
+                # only toward the bin until the calibrated 0.95 m arm standoff
+                # is reached; unlike target-goal docking this cannot reverse.
+                bin_pose = target
+                heading = np.array([math.cos(self.pose[2]), math.sin(self.pose[2])])
+                distance = (float((pose_xyz(bin_pose)[:2]-self.pose[:2]) @ heading)
+                            if bin_pose is not None else self.p('bin_standoff'))
+                advance = float(np.clip(distance-self.p('bin_standoff'), 0.0,
+                                         self.p('bin_final_advance_max')+self.bin_turn_retreat_total))
+                # Close a long distance with the arm still in its carry pose.
+                # Never interpret a distant red blob as permission to swing
+                # the arm just because an unrelated table is close by.
+                staging = self.p('bin_standoff')+self.p('bin_final_advance_max')+self.bin_turn_retreat_total
+                if distance > staging+.05:
+                    staging_goal = np.r_[self.goal[:2]-(staging-self.p('bin_standoff'))*heading, self.goal[2]]
+                    self.drive_to(staging_goal, docking=True)
+                    return
+                gap = self.table_gap()
+                if gap is not None and gap < self.p('swing_table_gap') and not self.swing_backed:
+                    # the return can stop right beside the table (twin s13: 0.05 m): the swing into the drop pose
+                    # then sweeps the wrist through the table top and levers the robot over. Back off first.
+                    self.swing_backed = True
+                    retreat = min(self.p('swing_table_gap')-gap+0.03, max(0.0, self.rear_clearance()-self.p('obstacle_margin')))
+                    if retreat > 0.02:
+                        self.get_logger().info(f'Table {gap:.2f} m ahead: backing {retreat:.2f} m before the drop-pose swing.')
+                        self.bin_alignment_goal = self.goal.copy()
+                        self.bin_approach_heading = self.pose[2]
+                        self.bin_retreat_origin = self.pose[:2].copy()
+                        self.goal = np.r_[self.pose[:2]-retreat*heading, self.pose[2]]
+                        self.transition(State.BACK_OUT_FOR_BIN_TURN)
+                        return
+                self.goal = np.r_[self.pose[:2]+advance*heading, self.pose[2]]
+                # swing the arm into the drop pose HERE, with the table out of its reach: from the carry pose the
+                # joint-space swing dips the wrist to 0.62 m and the elbow to 0.76 m in front of the robot (table top
+                # 0.72), and they hit the table and the bin (twin w10). The base then drives in with the arm still.
+                self.result = None
+                self.placement_bin = deepcopy(target)
+                self.place_target_pub.publish(self.placement_bin)
+                self.transition(State.WAIT_FOR_PLACE_PREP)
+                self.prepare_place_pub.publish(Bool(data=True))
+            elif self.last_gate == 'turning_envelope_blocked':
+                self.back_out_for_bin_turn()
+        elif self.state == State.BACK_OUT_FOR_BIN_TURN:
+            self.look(self.observations.get('bin'))
+            if self.drive_bin_turn_backoff():
+                self.bin_turn_retreat_total += float(np.linalg.norm(self.pose[:2]-self.bin_retreat_origin))
+                self.goal = getattr(self, 'bin_alignment_goal', np.r_[self.pose[:2], self.bin_approach_heading]).copy()
+                self.transition(State.APPROACH_BIN)
+            elif elapsed > self.p('bin_turn_backoff_timeout'):
+                self.fail(f'Bin-turn retreat could not finish within {self.p("bin_turn_backoff_timeout"):.0f} s; gate={self.last_gate}.')
+        elif self.state == State.APPROACH_BIN_FOR_PLACE:
+            # The arm may now occlude the rim. Use the exact confirmed,
+            # timestamped world target captured before the swing, not a new
+            # red object or a refreshed timestamp on an old observation.
+            bin_pose = getattr(self, 'placement_bin', None)
+            if (bin_pose is None or not self.fresh(Time.from_msg(bin_pose.header.stamp).nanoseconds/1e9, 30.0)
+                    or not plausible_bin(pose_xyz(bin_pose), self.pose[:2])):
+                self.fail('Confirmed drop-box target expired during final approach; holding the book without release.')
+                return
+            too_close = False
+            # ...and by the table itself. The base fits under the table top but the arms do not: with the
+            # camera faults the bin blob read 11 cm short and the tucked left gripper hit the table's top rail
+            # (twin w8, the bin knocked 1.5 m). The nearest leg ahead is the table's front edge.
+            if len(self.scans) == 2 and all(self.fresh(v[0]) for v in self.scans.values()):
+                pts = np.concatenate([v[1] for v in self.scans.values()])
+                ahead = pts[(pts[:, 0] > 0.30) & (pts[:, 0] < 1.8) & (np.abs(pts[:, 1]) < 0.95)]
+                if len(ahead):
+                    gap = float(ahead[:, 0].min())-0.36
+                    if gap <= self.p('table_gap'):
+                        self.stop()
+                        too_close = True
+                        self.get_logger().info(f'Table edge {gap:.2f} m ahead of the base: placing from here.')
+            if bin_pose is not None:
+                heading = np.array([math.cos(self.pose[2]), math.sin(self.pose[2])])
+                ahead = float((pose_xyz(bin_pose)[:2]-self.pose[:2]) @ heading)
+                blob_close = ahead < self.p('bin_min_distance')
+                too_close = too_close or blob_close
+                if blob_close:
+                    self.stop()
+                    self.get_logger().info(f'Bin {ahead:.2f} m ahead: closest allowed, placing from here.')
+            if too_close or self.drive_forward_to(self.goal):
+                self.result = None
+                self.transition(State.WAIT_FOR_PLACE)
+                self.place_target_pub.publish(bin_pose)
+                self.finish_place_pub.publish(Bool(data=True))
+        elif self.state == State.WAIT_FOR_PLACE_PREP:
+            self.stop()
+            if self.result is False:
+                self.fail(f'Bin hover failed: {self.manip_failure or self.ros.topics["manipulation_failure"]}')
+            elif self.result is True:
+                self.result = None
+                self.transition(State.APPROACH_BIN_FOR_PLACE)
+        elif self.state == State.WAIT_FOR_PLACE:
+            self.stop()
+            if self.result is False:
+                self.fail(f'Placement failed: {self.manip_failure or "manipulation returned false without a reason; inspect its preceding log."}')
+            elif self.result is True:
+                self.transition(State.DONE)
+
+
+def main():
+    rclpy.init()
+    node = NavigationNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if rclpy.ok():
+            node.stop()
+            node.cancel_pub.publish(Bool(data=True))
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()

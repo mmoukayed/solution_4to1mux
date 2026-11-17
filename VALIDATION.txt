@@ -1,0 +1,41 @@
+Build 9.0 / version 0.9.0 — 2026-11-17
+
+Evidence: source plus Pasted markdown(7).md. Analysis focuses on its final
+Build 8 run, whose source fingerprint matches the preceding delivered release.
+No current camera images, rosbag, ROS/DDS connection or physical robot available.
+
+Offline command:
+OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider test --tb=short
+Result: 161 passed, 3 skipped, 22 subtests passed in 11.21 seconds.
+Three optional ament lint integrations skipped because ROS ament tools are absent.
+One warning is from the external anyio pytest plugin's deprecated pytest API.
+
+New regression coverage (22 cases): hollow red rim with far centre background;
+dark/oblique red rim; distant background; held-book shape rejection; repeated
+frame versus distinct observations; track jumps/gaps; mode heartbeats; scattered
+or missing depth; spine letter-gap background; implausible logged bin target;
+stale approach pause/reacquisition; live lateral goal correction; frozen target
+and expiry during final approach; changed book realignment without backout;
+clipped white-ring fallback with wrong-column rejection retained; measured
+right-offset crane IK; forbidden release for distant/misaligned/expired targets
+or incomplete hover; isolated book dropout and long-gap reset; shared launch
+lateral parameter. Prior controller-fault and guarded-grasp tests still pass.
+
+The supplied full URDF reproduces the logged crane_high IK failure at
+wrist [0.660, +0.277, 1.337], best position error 0.053 m. With the intended
+right-side bin offset -0.18 m, both original crane waypoints solve and the final
+grasp frame is within 8 mm of [0.780, -0.180, 1.080], inside joint limits.
+No IK tolerance or joint/shelf/controller limit was relaxed.
+
+Static checks: 23 Python files parse; pyflakes passes for source, launch,
+preflight/install scripts and changed regression suites; shell syntax passes.
+Offline source identity self-check passes (explicit PYTHONPATH=., not a check
+of a live ROS install). Packaging checks cover wheel contents, ZIP CRC, Python
+AST and original image/template bytes. Git staged whitespace check passes.
+
+Not validated: real image detection/threshold recall, controller activation,
+physical collision clearance, bin calibration, ROS transport, real grasp/drop
+success. The centre-background explanation is a source-supported inference,
+not an observed pixel-level diagnosis. Camera/bag evidence is needed to confirm
+remaining perception/calibration issues. Build 8 fault inhibition is retained;
+delivery remains unverified without a bin sensor.
