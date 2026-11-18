@@ -20,7 +20,7 @@ sudo apt install -y ros-humble-rmw-cyclonedds-cpp iproute2
 fi
 source tiago_dds_connect/tiago_env.sh
 source install/setup.bash
-while [ "$(ros2 topic list)" = *"/tf"* ]; do
+while [ ! "$(ros2 topic list)" = *"/tf"* ]; do
 echo "Waiting for robot to connect..."
 done
 if [ "$selcommand" = "simulation" ]; then
