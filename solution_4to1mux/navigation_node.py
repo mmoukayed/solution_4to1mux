@@ -62,6 +62,9 @@ class State(Enum):
     WAIT_FOR_PLACE_PREP = auto()
     APPROACH_BIN_FOR_PLACE = auto()
     WAIT_FOR_PLACE = auto()
+    STOW_FOR_FINAL_RETURN = auto()
+    FINAL_RETURN_TO_START = auto()
+    RESTORE_START_HEADING = auto()
     DONE = auto()
     FAILED = auto()
 
@@ -582,10 +585,10 @@ class NavigationNode(Node):
             self.book_dock_minimum = self.p('shelf_keepout_distance')
             self.current_book_row = None
             self.book_row_pub.publish(Int32(data=-1))
-        if state == State.STOW_ARMS_FOR_DOCK:
+        if state in (State.STOW_ARMS_FOR_DOCK, State.STOW_FOR_FINAL_RETURN):
             self.arm_stow_last = None
             self.arm_confirmed_since = None
-        if state == State.RETURN_TO_START:
+        if state in (State.RETURN_TO_START, State.FINAL_RETURN_TO_START):
             self.return_detour_side = 0
             self.return_progress_at = self.now()
             self.return_best_distance = float(np.linalg.norm(self.pose[:2]-self.start[:2]))
@@ -883,11 +886,11 @@ class NavigationNode(Node):
             return float('inf')
         return float(along[in_path].min()-extent)
 
-    def drive_return_to_start(self):
+    def drive_return_to_start(self, final_return=False):
         """Take a direct reverse/strafe route, detouring around LiDAR obstacles."""
         delta = self.start[:2]-self.pose[:2]
         distance = float(np.linalg.norm(delta))
-        if distance <= 0.10:
+        if distance <= (0.04 if final_return else 0.10):
             # No turn back to the start heading: the start sits beside the bin table and the
             # bin search turns anyway (through the carried-arm clearance check).
             self.stop()
@@ -901,7 +904,7 @@ class NavigationNode(Node):
         # its legs: near the start, stop as soon as anything is inside the carried-arm radius
         # rather than driving the torso into the table's edge.
         points = np.concatenate([scan[1] for scan in self.scans.values()])
-        if (distance <= 0.8 and len(points)
+        if (not final_return and distance <= 0.8 and len(points)
                 and np.linalg.norm(points, axis=1).min() < self.p('carry_turn_clearance')):
             self.stop()
             self.get_logger().info(f'Stopping the return {distance:.2f} m short of the start: '
@@ -1431,6 +1434,20 @@ class NavigationNode(Node):
             if self.result is False:
                 self.fail(f'Placement failed: {self.manip_failure or "manipulation returned false without a reason; inspect its preceding log."}')
             elif self.result is True:
+                self.transition(State.STOW_FOR_FINAL_RETURN)
+        elif self.state == State.STOW_FOR_FINAL_RETURN:
+            self.stop()
+            if self.stow_arms_for_dock():
+                self.transition(State.FINAL_RETURN_TO_START)
+            elif elapsed > self.p('arm_stow_timeout'):
+                self.fail('Final return arm stow did not reach measured targets.')
+        elif self.state == State.FINAL_RETURN_TO_START:
+            if self.drive_return_to_start(final_return=True):
+                self.transition(State.RESTORE_START_HEADING)
+        elif self.state == State.RESTORE_START_HEADING:
+            if np.linalg.norm(self.start[:2]-self.pose[:2]) > 0.04:
+                self.transition(State.FINAL_RETURN_TO_START)
+            elif self.rotate_to(self.start[2]):
                 self.transition(State.DONE)
 
 

@@ -910,3 +910,42 @@ def test_refused_jammed_grab_backs_out_and_redocks_instead_of_failing():
     n.tick()
     assert n.state == State.FAILED
     assert 'redock' in n.failure_pub.messages[-1].data
+
+
+def test_successful_placement_returns_to_saved_position_and_heading():
+    n = bare_nav()
+    n.start = np.array([1., 2., .6])
+    n.state = State.WAIT_FOR_PLACE
+    n.result = True
+    n.holding_stamp = None  # A released book must not block the final return.
+    n.tick()
+    assert n.state == State.STOW_FOR_FINAL_RETURN
+    n.stow_arms_for_dock = lambda: False
+    n.tick()
+    assert n.state == State.STOW_FOR_FINAL_RETURN
+    n.stow_arms_for_dock = lambda: True
+    n.tick()
+    assert n.state == State.FINAL_RETURN_TO_START
+    n.pose = np.array([1., 2., -.5])
+    n.tick()
+    assert n.state == State.RESTORE_START_HEADING
+    n.tick()
+    assert n.state == State.RESTORE_START_HEADING
+    assert n.cmd_pub.messages[-1].angular.z > 0
+    n.pose[2] = .6
+    n.tick()
+    assert n.state == State.DONE
+    assert np.array_equal(n.start, [1., 2., .6])
+
+
+def test_final_return_does_not_accept_bin_table_early_stop():
+    n = bare_nav()
+    n.start = np.array([.5, 0., 0.])
+    n.scans['front'] = (10., np.array([[.6, .2]]))
+    assert n.drive_return_to_start() is True
+    n.move = lambda *args, **kwargs: None
+    assert n.drive_return_to_start(final_return=True) is False
+    n.pose[0] = .43
+    assert n.drive_return_to_start(final_return=True) is False
+    n.pose[0] = .48
+    assert n.drive_return_to_start(final_return=True) is True
