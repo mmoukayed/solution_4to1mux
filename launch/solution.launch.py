@@ -39,8 +39,9 @@ def generate_launch_description():
         'scan_half_width': ('1.3', float),
         'grasp_base_return_advance': ('0.28', float),
         'motion_speed_scale': ('0.60', float),
-        'bin_lateral_offset': ('-0.18', float),
         'sensor_loss_timeout': ('3.0', float),
+        'startup_torso_height': ('0.10', float),
+        'startup_feedback_timeout': ('45.0', float),
         **{name: (str(value), float) for name, value in MOTION_DEFAULTS.items()},
     }
     params = {name: ParameterValue(LaunchConfiguration(name), value_type=kind)
@@ -85,17 +86,16 @@ def generate_launch_description():
             node('navigation_node', ['shelf_column_number', 'scan_half_width', 'linear_speed', 'strafe_speed',
                                     'rotate_speed', 'search_rotate_speed', 'search_direction',
                                     'book_standoff', 'book_lateral_offset', 'grab_timeout',
-                                    'place_timeout', 'phase_timeout', 'docking_speed', 'bin_lateral_offset',
+                                    'place_timeout', 'phase_timeout', 'docking_speed',
                                     'book_search_timeout', 'max_book_recoveries',
                                     'book_view_backoff', 'top_book_marker_offset', 'row_spacing',
                                     'column_half_width', 'lower_book_standoff',
                                     'lower_book_keepout_distance',
                                     'shelf_alignment_standoff',
                                     'shelf_alignment_strafe_speed',
-                                    'shelf_alignment_timeout', 'grasp_base_return_advance', 'sensor_loss_timeout', *MOTION_DEFAULTS]),
+                                    'shelf_alignment_timeout', 'grasp_base_return_advance', 'sensor_loss_timeout', 'startup_torso_height', 'startup_feedback_timeout', *MOTION_DEFAULTS]),
             node('manipulation_node', ['motion_speed_scale'],
-                 {'grasp_base_advance': params['grasp_base_return_advance'],
-                  'place_lateral_offset': params['bin_lateral_offset']}),
+                 {'grasp_base_advance': params['grasp_base_return_advance']}),
         ]
 
     return LaunchDescription(declarations+[OpaqueFunction(function=launch_nodes)])

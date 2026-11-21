@@ -6,7 +6,7 @@ import importlib
 from pathlib import Path
 import sys
 
-EXPECTED_VERSION = '0.9.0'
+EXPECTED_VERSION = '0.8.1'
 
 
 def compare_sources(source, installed, files):
@@ -29,7 +29,7 @@ def main(argv=None):
     try:
         module = importlib.import_module('solution_4to1mux.build_info')
     except ImportError:
-        print('NOT READY: loaded package is missing the Build 9 identity. Rebuild and source the correct install/setup.bash.')
+        print('NOT READY: loaded package is missing the Build 8.1 identity. Rebuild and source the correct install/setup.bash.')
         return 1
     installed = Path(module.__file__).resolve().parent
     problems = compare_sources(source, installed, module.CORE_FILES)

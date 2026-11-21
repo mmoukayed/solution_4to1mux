@@ -60,7 +60,6 @@ TOPICS = {
     'robot_fault': '/solution/robot_fault',
     'book_row': '/solution/book_row',
     'grasp_target_pose': '/solution/grasp_target_pose',
-    'place_target_pose': '/solution/place_target_pose',
     # The auto-calibrated grasp: manipulation asks perception to measure the hand at the pregrasp.
     'measure_hand': '/perception/measure_hand',
     'hand_offset': '/perception/hand_offset',

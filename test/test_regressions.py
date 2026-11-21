@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 import pytest
 
-from ros_stubs import install, Logger, PoseStamped, Pub
+from ros_stubs import install, Logger, Message, PoseStamped, Pub, Time
 from solution_4to1mux.ros_topics import get_ros_config
 from solution_4to1mux.alignment import MOTION_DEFAULTS
 restore_ros = install()
@@ -27,6 +27,26 @@ for module in ('navigation_node', 'manipulation_node', 'perception_node'):
     sys.modules.pop('solution_4to1mux.'+module, None)
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize('point,valid', [
+    ([8.431, .277, .666], False),
+    ([.9, -.07, .85], True),
+    ([float('nan'), 0., .85], False),
+    ([.9, 0., float('inf')], False),
+])
+def test_local_bin_range_rejects_recorded_background_target(point, valid):
+    from solution_4to1mux.geometry import plausible_bin_range
+    assert plausible_bin_range(point, np.zeros(3)) is valid
+    # Range must be relative to the observer, independent of odom origin.
+    offset = np.array([12., -4., 0.])
+    assert plausible_bin_range(np.array(point)+offset, offset) is valid
+
+
+def test_navigation_ignores_fresh_but_implausible_bin():
+    n = bare_nav()
+    n.observations['bin'] = target(8.431, .277, .666)
+    assert n.observation('bin') is None
 
 
 @pytest.fixture(scope='module')
@@ -56,7 +76,7 @@ def bare_nav():
               'shelf_alignment_standoff': 1.35, 'shelf_alignment_strafe_speed': .12,
               'shelf_alignment_timeout': 40., 'bin_search_direction': 'left',
               'carry_turn_clearance': .85, 'table_gap': .10, 'swing_table_gap': .45,
-              'bin_min_distance': .70, 'bin_lateral_offset': -.18, 'sensor_loss_timeout': 3.0}
+              'bin_min_distance': .70, 'sensor_loss_timeout': 3.0}
     n.p = values.__getitem__
     n.now = lambda: 10.0
     n.pose = np.array([0., 0., 0.])
@@ -74,7 +94,7 @@ def bare_nav():
     n.holding_stamp = 10.0
     n.cancel_pub = Pub()
     n.prepare_grab_pub, n.finish_grab_pub, n.grab_pub = Pub(), Pub(), Pub()
-    n.prepare_place_pub, n.finish_place_pub, n.place_target_pub = Pub(), Pub(), Pub()
+    n.prepare_place_pub, n.finish_place_pub = Pub(), Pub()
     n.bin_mode_pub = Pub()
     n.warned = {}
     n.log = Logger()
@@ -88,6 +108,7 @@ def bare_nav():
     n.arm_limits = {name: (-6., 6., 1.) for name in n.arm_joints}
     n.arm_confirmed_since = None
     n.arms_tucked = True
+    n.startup_complete = True
     n.selected_book = n.dock_reference = None
     n.current_book_row = 2
     n.active_shelf_keepout_distance = .62
@@ -195,8 +216,6 @@ def test_wrong_column_larger_colour_blob_is_rejected():
     n.column_pose = target(3., 0., 2.26)
     n.column_hits = 3
     n.point = lambda x, y: np.array([3.0, 0.1 if x < 100 else 1.0, .935])
-    n.colour_surface = lambda box, colour, **kw: (n.point(box[0]+box[2]/2, box[1]+box[3]/2), .05, .20)
-    n.text_search_crop = lambda: None
     values = {'column_half_width': .43, 'top_book_marker_offset': .665, 'row_spacing': .33}
     n.get_parameter = lambda key: NS(value=values[key])
     n.latest_book, n.book_hits = None, 0
@@ -235,8 +254,6 @@ def shelf_perception(height):
                                          (2, .9, (50, 0, 20, 30))])
     n.camera_to_odom = np.eye(4)
     n.point = lambda x, y: None if height is None else np.array([3., float(x > 50), height])
-    n.colour_surface = lambda box, colour, **kw: (n.point(box[0]+box[2]/2, box[1]+box[3]/2), .05, .20)
-    n.text_search_crop = lambda: None
     values = dict(marker_min_height=1.75, marker_max_height=2.55,
                   column_half_width=.43, top_book_marker_offset=.335, row_spacing=.33)
     n.get_parameter = lambda key: NS(value=values[key])
@@ -280,8 +297,6 @@ def test_current_marker_mount_keeps_book_row_identification_correct(row, height)
         n.process_shelf()
     n.image[40:100, 50:65] = (0, 0, 255)
     n.point = lambda x, y: np.array([3., 1., height])
-    n.colour_surface = lambda box, colour, **kw: (n.point(box[0]+box[2]/2, box[1]+box[3]/2), .05, .20)
-    n.text_search_crop = lambda: None
     for _ in range(3):
         n.process_book()
     assert n.row_pub.messages[-1].data == row
@@ -633,8 +648,8 @@ def test_stale_cached_book_does_not_pin_camera_forever():
     looked = []
     n.look = lambda *args, **kwargs: looked.append((args, kwargs))
     n.scan_for_book(0.5)
-    n.scan_for_book(9.1)
-    n.scan_for_book(12.7)
+    n.scan_for_book(2.0)
+    n.scan_for_book(4.0)
     assert looked[0][0] == (n.observations['book'],)
     assert looked[1][1]['tilt'] != looked[2][1]['tilt']
     assert all(msg.linear.x == 0 and msg.linear.y == 0 for msg in n.cmd_pub.messages)
@@ -807,8 +822,6 @@ def test_deep_colour_blob_inside_shelf_is_rejected():
     n.column_hits = 3
     depth_x = [3.40]  # 0.4 m behind the marker plane: a gap hit inside the shelf
     n.point = lambda x, y: np.array([depth_x[0], 0.1, .935])
-    n.colour_surface = lambda box, colour, **kw: (n.point(box[0]+box[2]/2, box[1]+box[3]/2), .05, .20)
-    n.text_search_crop = lambda: None
     values = {'column_half_width': .43, 'top_book_marker_offset': .665, 'row_spacing': .33}
     n.get_parameter = lambda key: NS(value=values[key])
     n.latest_book, n.book_hits = None, 0

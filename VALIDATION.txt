@@ -1,41 +1,91 @@
-Build 9.0 / version 0.9.0 — 2026-11-17
+Startup-reset update — Build 8.1 / version 0.8.1 — 2026-11-21
 
-Evidence: source plus Pasted markdown(7).md. Analysis focuses on its final
-Build 8 run, whose source fingerprint matches the preceding delivered release.
-No current camera images, rosbag, ROS/DDS connection or physical robot available.
+Baseline: miracle at 3ee0283f654c9961e10e3d62d4839cc7aa48fe67.
+All local baseline files and image assets were checked against GitHub blob SHAs.
+Existing branch perception, bin detection, grasp, delivery and speed changes
+were retained. No Build 9 archive was overlaid onto this newer branch.
 
-Offline command:
+New reset: WAIT_FEEDBACK -> TUCK_ARMS -> RESET_TORSO -> RESET_HEAD -> FIND_SHELF.
+The base remains stopped. Command subscribers and per-joint feedback must be
+current; actual URDF limits and velocities bound goals. Arm convergence precedes
+torso lowering. Each motion is sent once after connection and has a bounded
+feedback deadline. Beginning a new launch always begins the reset; no physical
+base repositioning, gripper opening or end-of-run reset was added.
+
+Offline regression command:
 OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider test --tb=short
-Result: 161 passed, 3 skipped, 22 subtests passed in 11.21 seconds.
-Three optional ament lint integrations skipped because ROS ament tools are absent.
-One warning is from the external anyio pytest plugin's deprecated pytest API.
 
-New regression coverage (22 cases): hollow red rim with far centre background;
-dark/oblique red rim; distant background; held-book shape rejection; repeated
-frame versus distinct observations; track jumps/gaps; mode heartbeats; scattered
-or missing depth; spine letter-gap background; implausible logged bin target;
-stale approach pause/reacquisition; live lateral goal correction; frozen target
-and expiry during final approach; changed book realignment without backout;
-clipped white-ring fallback with wrong-column rejection retained; measured
-right-offset crane IK; forbidden release for distant/misaligned/expired targets
-or incomplete hover; isolated book dropout and long-gap reset; shared launch
-lateral parameter. Prior controller-fault and guarded-grasp tests still pass.
+Result: 188 passed, 3 skipped, 22 subtests passed in 4.86 seconds.
+Python syntax, pyflakes (source/launch/new tests), source identity self-check and
+git whitespace checks passed. The identity self-check is local, not a test of
+a ROS-installed overlay.
 
-The supplied full URDF reproduces the logged crane_high IK failure at
-wrist [0.660, +0.277, 1.337], best position error 0.053 m. With the intended
-right-side bin offset -0.18 m, both original crane waypoints solve and the final
-grasp frame is within 8 mm of [0.780, -0.180, 1.080], inside joint limits.
-No IK tolerance or joint/shelf/controller limit was relaxed.
+New cases cover a full relaunch from extended arm/high torso/downward head;
+already-reset joints; delayed subscribers; missing/partial/stale per-joint
+feedback; controller rejection; missing connection and convergence timeouts;
+no repeated trajectory preemption; arm limits and torso speed; launch options;
+no reset at DONE. Existing fault/grasp/colour/false-bin regressions remain.
+Three optional ament lint integrations are skipped in this non-ROS environment.
+The external anyio pytest plugin emits one deprecation warning.
 
-Static checks: 23 Python files parse; pyflakes passes for source, launch,
-preflight/install scripts and changed regression suites; shell syntax passes.
-Offline source identity self-check passes (explicit PYTHONPATH=., not a check
-of a live ROS install). Packaging checks cover wheel contents, ZIP CRC, Python
-AST and original image/template bytes. Git staged whitespace check passes.
+No second-run log was supplied, so the reported cause is unconfirmed. Tests
+mock ROS messages and measured joint convergence; no physical robot, DDS or
+controller lifecycle was exercised. The existing arm tuck is not a full
+collision-planned recovery from arbitrary contact or an interrupted grasp.
 
-Not validated: real image detection/threshold recall, controller activation,
-physical collision clearance, bin calibration, ROS transport, real grasp/drop
-success. The centre-background explanation is a source-supported inference,
-not an observed pixel-level diagnosis. Camera/bag evidence is needed to confirm
-remaining perception/calibration issues. Build 8 fault inhibition is retained;
-delivery remains unverified without a bin sensor.
+Prior validation history follows (baseline build):
+
+Build 8.0 / version 0.8.0 — validated 2026-11-17
+
+Environment: Python 3.12; offline ROS message/action stubs. No ROS installation,
+DDS session, physical robot, controller lifecycle or rosbag playback available.
+
+Command:
+OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider test --tb=short
+Result: 139 passed, 3 skipped, 22 subtests passed in 7.28 s.
+Skipped: optional ROS ament copyright/flake8/pep257 integrations absent.
+Warning: external anyio pytest plugin uses a deprecated pytest API.
+
+Coverage includes marker/shelf geometry, joint-limit and tuck constraints,
+perception timestamps/depth, guarded grasp paths, navigation/return state
+transitions, deactivation error replay, late action callbacks, frozen feedback,
+failed cancellation, bounded sensor-loss faults, no automatic release/retract
+on robot fault, source/install mismatch and read-only controller-state checks.
+
+Python AST parsing passed for 21 source, launch, script and test files.
+Pyflakes passed for all solution modules, launch, preflight/verify scripts and
+alignment/runtime regression files. Bash syntax checks passed for both scripts.
+Source identity self-check passed with PYTHONPATH=. (this is an offline source
+self-check, NOT validation of a ROS-installed overlay).
+Versioned wheel built successfully; archive/module/assets checks accompany
+packaging. Optional ROS ament lint checks have not been claimed as passed.
+
+All nodes print the same Build 8 identity and source fingerprint. The underlying
+controller deactivation in the supplied log remains unexplained. No physical
+speed, calibration, collision safety or grasp/delivery success is certified by
+these offline tests. Perform the documented installed-code/preflight checks and
+supervised robot validation before operation.
+
+Git staged whitespace check passed after formatting cleanup. Original 49 image/
+template assets are byte-identical to the supplied archive. Wheel contents and
+ZIP CRC/module/AST checks passed.
+
+Perception follow-up, 2026-11-17:
+Removed colour white balance/brightness stretching, adjusted raw book thresholds
+and shelf-context checks, and added red-surface bin depth/confirmation checks.
+No navigation or manipulation behavior was changed in this follow-up; the
+previous local range guards remain in place.
+
+Full-suite command (isolated Python 3.12 environment):
+OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider test --tb=short
+Result: 172 passed, 3 skipped, 22 subtests passed in 8.96 s.
+Environment packages: NumPy 2.5.5, OpenCV headless 5.0.0.93, SciPy 1.18.1,
+pytest 9.2.0. The robot's ROS runtime has not been exercised here.
+
+The 28 new perception cases cover the three supplied annotated camera frames,
+an existing positive bin frame, unchanged colour pixels in bright/dark flat
+frames, red-surface depth instead of background in an opening, missing/far or
+incoherent depth, measured size limits, distinct-frame confirmation, target
+loss, mode changes and ambiguous candidates. See test/data/PERCEPTION_FIXTURES.md
+for annotation limitations. AST checks passed for 19 package/test Python files;
+git diff --check passed. No physical detection or placement trial was performed.

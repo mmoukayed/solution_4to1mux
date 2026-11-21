@@ -26,7 +26,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .ros_topics import configure_ros
 from .runtime_health import current_transform, is_controller_deactivation, sample_age
-from .geometry import ArmKinematics, pose_xyz, rotation, transform_matrix, yaw
+from .geometry import ArmKinematics, plausible_bin_range, pose_xyz, rotation, transform_matrix, yaw
 
 GRIPPER_JOINT = 'gripper_right_finger_joint'
 GRIPPER_GRASP_FRAME = 'gripper_right_grasping_link'
@@ -72,7 +72,7 @@ class ManipulationNode(Node):
             'place_base_advance': 0.35, 'place_clearance_height': 0.20,
             'place_torso_hover': 0.35, 'place_torso_drop': 0.0,
             'target_max_age': 2.0, 'finish_grab_target_max_age': 120.0, 'gripper_timeout': 8.0,  # finish_grab reuses the book pose frozen at prepare_grab
-            'placement_target_max_age': 30.0, 'place_lateral_offset': -0.18,
+            'placement_target_max_age': 30.0,
             'grip_contact_hold': 1.0,
             'motion_timeout_margin': 8.0, 'planning_timeout': 60.0,
             'motion_speed_scale': 0.60,
@@ -106,7 +106,6 @@ class ManipulationNode(Node):
         self.joint_stamp = None
         self.targets = {}
         self.selected_grasp_target = None
-        self.selected_place_target = None
         self.prepared_at = None
         self.grasp_prepared = False
         self.book_row = None
@@ -137,9 +136,6 @@ class ManipulationNode(Node):
         self.create_subscription(JointState, topics['joint_states'], self.on_joints, qos_profile_sensor_data)
         self.create_subscription(PoseStamped, topics['grasp_target_pose'],
             lambda msg: setattr(self, 'selected_grasp_target', msg),
-            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.create_subscription(PoseStamped, topics['place_target_pose'],
-            lambda msg: setattr(self, 'selected_place_target', msg),
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         for name in ('book', 'bin'):
             self.create_subscription(PoseStamped, topics[f'{name}_pose'], lambda m, n=name: self.targets.update({n: m}), 10)
@@ -188,7 +184,7 @@ class ManipulationNode(Node):
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(0.1, self.tick, clock=self.wall_clock)
         self.get_logger().info(
-            f'Manipulation BUILD 9.0: {self.ros.profile} gripper positions '
+            f'Manipulation BUILD 8.1: {self.ros.profile} gripper positions '
             f'open={self.p("gripper_open"):.3f}, closed={self.p("gripper_closed"):.3f}.')
 
     def p(self, name):
@@ -347,10 +343,7 @@ class ManipulationNode(Node):
             return
         if sequence == 'prepare_place':
             self.placement_hover_target = None
-            self.placement_prepared_at = None
         target = self.targets.get('book' if sequence in ('grab', 'prepare_grab', 'finish_grab') else 'bin')
-        if sequence in ('place', 'prepare_place', 'finish_place'):
-            target = getattr(self, 'selected_place_target', None) or target
         # the book as measured before the arm came up: once the hand is in front of it, perception sees only
         # the part the hand leaves visible and its "centre" drifts (twin: 9 cm up, the fingers closed above it)
         if sequence == 'prepare_grab':
@@ -368,6 +361,13 @@ class ManipulationNode(Node):
                       else self.p('finish_grab_target_max_age') if sequence == 'finish_grab'
                       else 20.0 if sequence == 'prepare_grab' and self.selected_grasp_target is not None
                       else self.p('target_max_age'))
+        if sequence == 'finish_place' and self.p('place_torso_drop') < 0.01:
+            # the release is only "open the gripper": the hand may hide the bin from the camera by now
+            self.active = sequence
+            self.token += 1
+            self.phases = [('release_book', 'open', None, 1.0), ('verify_delivery', 'delivery', None, 3.0)]
+            self.next_phase()
+            return
         stale = (target is None or target.header.frame_id != self.ros.frames['odom'] or
                  not self.fresh(Time.from_msg(target.header.stamp).nanoseconds/1e9, target_age))
         if stale and sequence == 'prepare_grab':
@@ -401,28 +401,10 @@ class ManipulationNode(Node):
             return
         matrix = transform_matrix(tf.transform)
         point = (matrix @ np.r_[pose_xyz(target), 1])[:3]
-        if sequence in ('place', 'prepare_place', 'finish_place'):
-            max_x = 1.80 if sequence == 'prepare_place' else 1.30
-            if not (np.isfinite(point).all() and .35 < point[0] <= max_x and
-                    abs(point[1]-self.p('place_lateral_offset')) <= .10 and .60 < point[2] < 1.20):
-                self.report(sequence, False, f'Drop-box pose is outside the placement staging envelope: {point.round(3)}; realign the base, keeping the book held.')
-                return
-            if (sequence == 'finish_place' and self.p('bin_release_x') > 0 and
-                    abs(point[0]-self.p('bin_release_x')) > .25):
-                self.report(sequence, False, 'Drop box is not under the calibrated release position; refusing to open the gripper.')
-                return
-        if sequence == 'finish_place' and self.p('place_torso_drop') < 0.01:
-            hover = getattr(self, 'placement_hover_target', None)
-            completed = getattr(self, 'placement_prepared_at', None)
-            if (hover is None or not self.fresh(completed, 30.0) or
-                    np.max(np.abs(np.array([self.joints[name] for name in self.model.names])-hover)) > .10):
-                self.report(sequence, False, 'No recent completed/measured bin hover; refusing to release the book.')
-                return
-            # the release is only "open the gripper": the hand may hide the bin from the camera by now
-            self.active = sequence
-            self.token += 1
-            self.phases = [('release_book', 'open', None, 1.0), ('verify_delivery', 'delivery', None, 3.0)]
-            self.next_phase()
+        if sequence in ('place', 'prepare_place') and not plausible_bin_range(point, np.zeros(3)):
+            self.report(sequence, False,
+                        f'Implausible bin target in base frame {point.round(3)}; '
+                        'refusing fixed-distance placement. Inspect bin RGB-D detection.')
             return
         if sequence in ('grab', 'finish_grab') and self.hand_corr is not None and self.now()-self.hand_corr[1] < 120.0:
             # the auto-calibrated grasp: aim where the camera says the book is, shifted by the
@@ -729,8 +711,6 @@ class ManipulationNode(Node):
                 return
             sequence = self.active
             self.active = self.phase = None
-            if sequence == 'prepare_place':
-                self.placement_prepared_at = self.now()
             if sequence == 'prepare_grab':
                 self.grasp_prepared = True
                 self.prepared_at = self.now()
@@ -1057,7 +1037,6 @@ class ManipulationNode(Node):
         self.deferred_plan = None
         self.pending_request = None
         self.grasp_prepared = False
-        self.placement_prepared_at = None
         self.selected_grasp_target = None
         self.active = self.phase = None
         if allow_retract and not self.controller_fault:

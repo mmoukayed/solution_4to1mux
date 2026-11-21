@@ -19,9 +19,8 @@ from tf2_ros import Buffer, TransformListener, TransformException
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .ros_topics import configure_ros
-from .target_geometry import plausible_bin
 from .alignment import MOTION_DEFAULTS, angle_delta, read_joint_limits
-from .geometry import (body_velocity, forward_command, pose_xyz, row_for_height,
+from .geometry import (body_velocity, forward_command, plausible_bin_range, pose_xyz, row_for_height,
                        scan_points, transform_matrix, wrap, yaw)
 
 
@@ -41,6 +40,7 @@ DOCK_STOW_POSES = {
 
 
 class State(Enum):
+    RESET_ROBOT = auto()
     FIND_SHELF = auto()
     SCAN_COLUMNS = auto()
     APPROACH_COLUMN = auto()
@@ -86,7 +86,7 @@ class NavigationNode(Node):
             'reading_max_age': 1.0,
             'book_standoff': 0.68, 'book_lateral_offset': -0.18,
             'table_gap': 0.10,    # the base's front stops this far from the bin table's front legs
-            'bin_lateral_offset': -0.18, 'bin_standoff': 0.60, 'bin_final_advance_max': 0.65, 'bin_min_distance': 0.70,  # the table edge (table_gap) decides; these are backstops
+            'bin_standoff': 0.60, 'bin_final_advance_max': 0.65, 'bin_min_distance': 0.70,  # the table edge (table_gap) decides; these are backstops
             'bin_turn_backoff': 0.25, 'max_bin_turn_recoveries': 2, 'carry_turn_clearance': 0.85,
             'bin_turn_backoff_timeout': 8.0,
             'place_base_advance': 0.35,
@@ -120,6 +120,8 @@ class NavigationNode(Node):
             'max_book_recoveries': 2, 'head_scan_dwell': 3.0,
             'book_view_backoff': 0.35,
             'sensor_loss_timeout': 3.0,
+            'startup_feedback_timeout': 45.0, 'startup_motion_margin': 8.0,
+            'startup_torso_height': 0.10, 'startup_torso_speed': 0.07,
             **MOTION_DEFAULTS,
         }
         for key, value in defaults.items():
@@ -128,9 +130,12 @@ class NavigationNode(Node):
                     'shelf_alignment_strafe_speed'):
             if not 0 < self.p(key) <= 1.0:
                 raise ValueError(f'{key} must be >0 and <=1')
-        for key in (*MOTION_DEFAULTS, 'sensor_loss_timeout'):
+        for key in (*MOTION_DEFAULTS, 'sensor_loss_timeout', 'startup_feedback_timeout',
+                    'startup_motion_margin', 'startup_torso_speed'):
             if not np.isfinite(self.p(key)) or self.p(key) <= 0:
                 raise ValueError(f'{key} must be finite and positive')
+        if not np.isfinite(self.p('startup_torso_height')):
+            raise ValueError('startup_torso_height must be finite')
         self.tf = Buffer()
         self.listener = TransformListener(self.tf, self)
         self.pose = self.start = None
@@ -154,12 +159,19 @@ class NavigationNode(Node):
         self.last_command = (0.0, 0.0, 0.0)
         self.actual_speed = 0.0
         self.arm_joints = {}
+        self.joint_observed_at = {}
         self.arm_limits = {}
         self.arm_confirmed_since = None
         self.arm_stow_secs = 2.0
         self.arm_joint_stamp = None
         self.arm_stow_last = None
         self.arms_tucked = False
+        self.startup_complete = False
+        self.startup_phase = 'WAIT_FEEDBACK'
+        self.startup_phase_started = self.startup_now()
+        self.startup_deadline = None
+        self.startup_settled_since = None
+        self.startup_joint_sent = False
         self.arm_tuck_last = None
         self.arm_tuck_secs = 2.0
         self.last_gate = 'clear'
@@ -175,6 +187,7 @@ class NavigationNode(Node):
         self.cmd_pub = self.create_publisher(Twist, topics['cmd_vel'], 10)
         self.head_pub = self.create_publisher(JointTrajectory, topics['head_command'], 10)
         self.left_arm_pub = self.create_publisher(JointTrajectory, topics['left_arm_command'], 10)
+        self.torso_pub = self.create_publisher(JointTrajectory, topics['torso_command'], 10)
         self.right_arm_pub = self.create_publisher(JointTrajectory, topics['right_arm_command'], 10)
         self.bin_mode_pub = self.create_publisher(Bool, topics['looking_for_bin'], 10)
         self.grab_pub = self.create_publisher(Bool, topics['request_grab'], 10)
@@ -198,8 +211,6 @@ class NavigationNode(Node):
         self.create_subscription(JointState, topics['joint_states'], self.on_arm_joints, qos_profile_sensor_data)
         self.create_subscription(String, topics['robot_description'], self.on_description,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-        self.place_target_pub = self.create_publisher(PoseStamped, topics['place_target_pose'],
-                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.grasp_target_pub = self.create_publisher(PoseStamped, topics['grasp_target_pose'],
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         for name in ('shelf', 'shelf_unit', 'book', 'bin'):
@@ -220,9 +231,8 @@ class NavigationNode(Node):
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(0.05, self.tick)
         self.create_timer(5.0, self.wall_status, clock=self.wall_clock)
-        self.get_logger().info(f'Navigation BUILD 9.0 (tracked shelf alignment): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
-        self.transition(State.FIND_SHELF)
-        self.look_for_shelf(0.0)
+        self.get_logger().info(f'Navigation BUILD 8.1 (tracked shelf alignment): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
+        self.transition(State.RESET_ROBOT)
 
     def p(self, name):
         return self.get_parameter(name).value
@@ -259,8 +269,12 @@ class NavigationNode(Node):
     def on_arm_joints(self, msg):
         if not np.isfinite(msg.position).all():
             return
-        self.arm_joints.update(zip(msg.name, msg.position))
+        observed = dict(zip(msg.name, msg.position))
+        self.arm_joints.update(observed)
         self.arm_joint_stamp = Time.from_msg(msg.header.stamp).nanoseconds/1e9
+        if not hasattr(self, 'joint_observed_at'):
+            self.joint_observed_at = {}
+        self.joint_observed_at.update({name: self.arm_joint_stamp for name in observed})
 
     def on_pose(self, name, msg):
         if msg.header.frame_id == self.ros.frames['odom'] and np.isfinite(pose_xyz(msg)).all():
@@ -282,6 +296,10 @@ class NavigationNode(Node):
         # to our current action or triggering an unrelated state transition.
         self.get_logger().error(
             f'Controller rejection on {self.ros.topics["controller_rejections"]}: {msg.data}')
+        if (self.state == State.RESET_ROBOT and 'REJECTED' in msg.data
+                and any(name in msg.data for name in ('arm_', 'torso', 'head'))):
+            self.fail(f'Startup reset rejected by the controller: {msg.data}')
+            return
         if ('arm_' in msg.data and 'REJECTED' in msg.data and
                 (not self.arms_tucked or self.state == State.STOW_ARMS_FOR_DOCK)):
             self.fail(f'Arm pose rejected by the controller: {msg.data}')
@@ -635,31 +653,125 @@ class NavigationNode(Node):
         self.stop()
         self.last_gate = 'waiting_for_fresh_book_pose'
         cached = self.observations.get('book')
-        dwell = self.p('head_scan_dwell')
-        # Spend the first four settled views on the known book, and revisit
-        # it between broad scans. A close spine otherwise vanishes while the
-        # old five-pitch sweep spends most of its time on unrelated rows.
-        index = int(elapsed/dwell)
-        if cached is not None and (index < 4 or index % 2 == 0):
+        if cached is not None and elapsed < self.p('head_scan_dwell'):
             self.look(cached)
         else:
+            # Hold each head pose long enough to settle and collect three detections.
             tilts = (0.28, 0.05, -0.25, -0.50, -0.78)
-            self.look(tilt=tilts[(max(0, index-4)//2 if cached is not None else index) % len(tilts)])
+            offset = self.p('head_scan_dwell') if cached is not None else 0.0
+            index = int(max(0.0, elapsed-offset)/self.p('head_scan_dwell')) % len(tilts)
+            self.look(tilt=tilts[index])
         self.warn('book', f'Book reacquisition: {self.book_diagnostics}')
 
-    def bin_observation(self):
-        target = self.observation('bin', maximum_age=1.5)
-        if target is None:
-            return None
-        if not plausible_bin(pose_xyz(target), self.pose[:2]):
-            self.warn('bin_range', 'Ignoring implausible red drop-box pose; waiting for a fresh surface-supported target within 4 m.')
-            return None
-        return target
+    def startup_now(self):
+        # A paused or newly arriving /clock must not hide a stalled reset.
+        return time.monotonic()
+
+    def joint_feedback_current(self, names):
+        stamps = getattr(self, 'joint_observed_at', None)
+        if stamps is None:  # Legacy offline fixtures; real instances track each joint.
+            return self.fresh(self.arm_joint_stamp)
+        return all(self.fresh(stamps.get(name)) for name in names)
+
+    def startup_stage(self, phase):
+        self.startup_phase = phase
+        self.startup_phase_started = self.startup_now()
+        self.startup_deadline = None
+        self.startup_settled_since = None
+        self.startup_joint_sent = False
+        self.arm_confirmed_since = None
+        self.get_logger().info(f'Startup reset: {phase}; base held stopped.')
+
+    def startup_joint_pose(self, publisher, names, values, speed, tolerance):
+        """One connected, bounded command; complete only on measured convergence."""
+        if not self.joint_feedback_current(names):
+            self.startup_settled_since = None
+            self.warn('startup_joints', f'Waiting for current startup feedback: {names}.')
+            return False
+        if publisher.get_subscription_count() == 0:
+            self.warn('startup_controller', f'Waiting for startup controller subscriber: {names}.')
+            return False
+        targets = [float(np.clip(q, *self.arm_limits[name][:2])) for name, q in zip(names, values)]
+        now = self.startup_now()
+        if all(abs(self.arm_joints[name]-q) <= tolerance for name, q in zip(names, targets)):
+            if self.startup_settled_since is None:
+                self.startup_settled_since = now
+            return now-self.startup_settled_since >= self.p('arm_feedback_settle')
+        self.startup_settled_since = None
+        if not self.startup_joint_sent:
+            duration = max(1.0, max(abs(self.arm_joints[name]-q)/min(speed, .8*self.arm_limits[name][2])
+                                    for name, q in zip(names, targets)))
+            msg = JointTrajectory()
+            msg.joint_names = names
+            point = JointTrajectoryPoint()
+            point.positions = targets
+            point.time_from_start.sec = int(duration)
+            point.time_from_start.nanosec = int((duration-int(duration))*1e9)
+            msg.points = [point]
+            publisher.publish(msg)
+            self.startup_joint_sent = True
+            self.startup_deadline = now+duration+self.p('startup_motion_margin')
+            self.get_logger().info(f'Startup reset: commanded {names} to {targets} ({duration:.1f} s); waiting for feedback.')
+        return False
+
+    def reset_robot_at_start(self):
+        """Reset on every new launch, including a launch after a completed drop."""
+        self.stop()
+        now = self.startup_now()
+        self.last_gate = f'startup_reset_{self.startup_phase.lower()}'
+        required = [f'arm_{side}_{i}_joint' for side in ('left', 'right') for i in range(1, 8)]
+        required += ['torso_lift_joint', 'head_1_joint', 'head_2_joint']
+        if self.startup_phase == 'WAIT_FEEDBACK':
+            connected = all(pub.get_subscription_count() > 0 for pub in
+                            (self.left_arm_pub, self.right_arm_pub, self.torso_pub, self.head_pub))
+            measured = (all(name in self.arm_joints and name in self.arm_limits for name in required)
+                        and self.joint_feedback_current(required))
+            sensors = (self.pose is not None and self.fresh(self.odom_stamp) and len(self.scans) == 2
+                       and all(self.fresh(scan[0]) for scan in self.scans.values()))
+            if not (connected and measured and sensors):
+                self.warn('startup_wait', f'Startup reset waiting: controllers={connected}, joints/limits={measured}, odom/scans={sensors}.')
+                if now-self.startup_phase_started > self.p('startup_feedback_timeout'):
+                    self.fail('Startup reset timed out waiting for connected controllers, URDF limits and fresh joint/odom/LiDAR feedback.')
+                return
+            self.arm_tuck_last = None
+            self.startup_stage('TUCK_ARMS')
+            return
+        # Losing any reset joint pauses commands immediately; a timer cannot
+        # approve a folded arm or a lowered torso in place of actual feedback.
+        if not self.joint_feedback_current(required):
+            self.startup_settled_since = self.arm_confirmed_since = None
+            self.warn('startup_wait', 'Startup reset paused: joint feedback is stale or incomplete.')
+        elif self.startup_phase == 'TUCK_ARMS':
+            if self.tuck_arms_at_start():
+                self.arms_tucked = True
+                self.startup_stage('RESET_TORSO')
+                return
+            if self.arm_tuck_last is not None and self.startup_deadline is None:
+                self.startup_deadline = now+max(self.p('arm_tuck_timeout'), self.arm_tuck_secs+self.p('startup_motion_margin'))
+        elif self.startup_phase == 'RESET_TORSO':
+            if self.startup_joint_pose(self.torso_pub, ['torso_lift_joint'],
+                                       [self.p('startup_torso_height')], self.p('startup_torso_speed'), .015):
+                self.startup_stage('RESET_HEAD')
+                return
+        elif self.startup_phase == 'RESET_HEAD':
+            if self.startup_joint_pose(self.head_pub, ['head_1_joint', 'head_2_joint'], [0., .28], .35, .04):
+                self.startup_complete = True
+                self.last_head = self.arm_joints['head_2_joint']
+                self.start = self.pose.copy()
+                self.observations.clear()
+                self.transition(State.FIND_SHELF)
+                self.get_logger().info('Startup reset complete: arms tucked, torso/head measured at start pose; beginning the new run.')
+                return
+        deadline = self.startup_deadline
+        if deadline is None:
+            deadline = self.startup_phase_started+self.p('startup_feedback_timeout')
+        if now > deadline:
+            self.fail(f'Startup reset {self.startup_phase} did not reach measured targets before its deadline; inspect controller rejections and feedback.')
 
     def command_arm_pose(self, targets, stamp_name):
         """Send one checked trajectory; require measured completion, not a timer."""
         names = {side: [f'arm_{side}_{i}_joint' for i in range(1, 8)] for side in ('left', 'right')}
-        if not self.fresh(self.arm_joint_stamp) or any(
+        if not self.joint_feedback_current([name for side in names.values() for name in side]) or any(
                 name not in self.arm_joints or name not in self.arm_limits
                 for side in names.values() for name in side):
             self.warn('arm_feedback', 'Waiting for fresh arm feedback and URDF joint limits.')
@@ -677,6 +789,9 @@ class NavigationNode(Node):
         if getattr(self, stamp_name) is not None:
             self.warn('arm_moving', 'Arm target not confirmed yet; keeping the base stopped.')
             return False
+        if any(pub.get_subscription_count() == 0 for pub in (self.left_arm_pub, self.right_arm_pub)):
+            self.warn('arm_connection', 'Waiting for both arm command subscribers before sending the checked pose.')
+            return False
         secs = max(1.0, max(abs(self.arm_joints[name]-q)/min(self.p('arm_motion_speed'),
                         0.8*self.arm_limits[name][2])
                         for side, joints in names.items() for name, q in zip(joints, bounded[side])))
@@ -690,6 +805,7 @@ class NavigationNode(Node):
             msg.points = [point]
             publisher.publish(msg)
         setattr(self, stamp_name, self.now())
+        setattr(self, stamp_name.replace('_last', '_secs'), secs)
         self.get_logger().info(f'Commanded checked arm pose ({secs:.1f} s); waiting for measured completion.')
         return False
 
@@ -789,6 +905,8 @@ class NavigationNode(Node):
     def observation(self, name, maximum_age=2.0):
         msg = self.observations.get(name)
         if msg is None or not self.fresh(Time.from_msg(msg.header.stamp).nanoseconds/1e9, maximum_age):
+            return None
+        if name == 'bin' and not plausible_bin_range(pose_xyz(msg), self.pose):
             return None
         return msg
 
@@ -1083,17 +1201,8 @@ class NavigationNode(Node):
         if self.state in (State.DONE, State.FAILED):
             self.stop()
             return
-        if not self.arms_tucked:
-            # Before the base moves at all: arms held out sweep whatever is beside the start
-            # (the bin table) on the first search turn.
-            self.stop()
-            self.last_gate = 'tucking_arms'
-            self.arms_tucked = self.tuck_arms_at_start()
-            if self.arms_tucked:
-                self.arm_confirmed_since = None
-                self.entered = self.now()
-            elif elapsed > self.p('arm_tuck_timeout'):
-                self.fail('Startup arm tuck did not reach measured targets; inspect controller rejections and joint feedback.')
+        if not self.startup_complete:
+            self.reset_robot_at_start()
             return
         if self.state == State.FIND_SHELF:
             self.look_for_shelf(elapsed)
@@ -1242,13 +1351,7 @@ class NavigationNode(Node):
                     return
                 if (self.selected_book is not None and
                         np.linalg.norm(pose_xyz(book)-pose_xyz(self.selected_book)) > 0.12):
-                    realignments = getattr(self, 'book_realignments', 0)
-                    if realignments >= 2:
-                        self.fail('Book pose changed repeatedly during docking; refusing a moving/unstable target.')
-                        return
-                    self.book_realignments = realignments+1
-                    self.get_logger().info('Fresh book pose changed after approach; realigning from here without a view backout.')
-                    self.transition(State.REACQUIRE_BOOK)
+                    self.recover_book_view()
                     return
                 grasp = deepcopy(book)
                 grasp.pose.orientation = deepcopy((self.dock_reference or book).pose.orientation)
@@ -1348,41 +1451,17 @@ class NavigationNode(Node):
             if self.drive_return_to_start():
                 self.transition(State.FIND_BIN)
         elif self.state == State.FIND_BIN:
-            # Hold each downward view long enough for three RGB-D confirmations.
-            tilts = (-.10, -.35, -.55)
-            self.look(tilt=tilts[int(elapsed/max(2.0, self.p('head_scan_dwell'))) % len(tilts)])
-            target = self.bin_observation()
+            self.look(tilt=-0.1)
+            target = self.observation('bin')
             if target is not None:
-                self.goal = self.target_goal(target, self.p('bin_standoff'), self.p('bin_lateral_offset'))
+                self.goal = self.target_goal(target, self.p('bin_standoff'), self.p('book_lateral_offset'))
                 self.bin_turn_recoveries = 0
                 self.bin_turn_retreat_total = 0.0
                 self.transition(State.APPROACH_BIN)
             else:
                 self.search()
         elif self.state == State.APPROACH_BIN:
-            target = self.bin_observation()
-            if target is None:
-                self.stop()
-                self.last_gate = 'waiting_for_fresh_bin_pose'
-                since = getattr(self, 'bin_lost_since', None)
-                if since is None:
-                    self.bin_lost_since = self.now()
-                elif self.now()-since >= 3.0:
-                    attempts = getattr(self, 'bin_reacquisitions', 0)
-                    if attempts >= 2:
-                        self.fail('Drop-box observations repeatedly lost; keeping the book held.')
-                    else:
-                        self.bin_reacquisitions = attempts+1
-                        self.bin_lost_since = None
-                        self.transition(State.FIND_BIN)
-                return
-            self.bin_lost_since = None
-            self.look(target)
-            # Refresh the lateral centre from current observations, keeping
-            # the approach heading stable while the base aligns.
-            normal = np.array([math.cos(self.goal[2]), math.sin(self.goal[2])])
-            left = np.array([-normal[1], normal[0]])
-            self.goal[:2] = pose_xyz(target)[:2]-normal*self.p('bin_standoff')-left*self.p('bin_lateral_offset')
+            self.look(self.observations.get('bin'))
             # Face the bin at the return pose, making a bounded retreat only
             # when LiDAR prevents rotation. Recompute distance after recovery.
             if self.rotate_to(self.goal[2]):
@@ -1396,20 +1475,12 @@ class NavigationNode(Node):
                 # observed failure was a 0.425 m IK position error). Advance
                 # only toward the bin until the calibrated 0.95 m arm standoff
                 # is reached; unlike target-goal docking this cannot reverse.
-                bin_pose = target
+                bin_pose = self.observations.get('bin')
                 heading = np.array([math.cos(self.pose[2]), math.sin(self.pose[2])])
                 distance = (float((pose_xyz(bin_pose)[:2]-self.pose[:2]) @ heading)
                             if bin_pose is not None else self.p('bin_standoff'))
                 advance = float(np.clip(distance-self.p('bin_standoff'), 0.0,
                                          self.p('bin_final_advance_max')+self.bin_turn_retreat_total))
-                # Close a long distance with the arm still in its carry pose.
-                # Never interpret a distant red blob as permission to swing
-                # the arm just because an unrelated table is close by.
-                staging = self.p('bin_standoff')+self.p('bin_final_advance_max')+self.bin_turn_retreat_total
-                if distance > staging+.05:
-                    staging_goal = np.r_[self.goal[:2]-(staging-self.p('bin_standoff'))*heading, self.goal[2]]
-                    self.drive_to(staging_goal, docking=True)
-                    return
                 gap = self.table_gap()
                 if gap is not None and gap < self.p('swing_table_gap') and not self.swing_backed:
                     # the return can stop right beside the table (twin s13: 0.05 m): the swing into the drop pose
@@ -1429,8 +1500,6 @@ class NavigationNode(Node):
                 # joint-space swing dips the wrist to 0.62 m and the elbow to 0.76 m in front of the robot (table top
                 # 0.72), and they hit the table and the bin (twin w10). The base then drives in with the arm still.
                 self.result = None
-                self.placement_bin = deepcopy(target)
-                self.place_target_pub.publish(self.placement_bin)
                 self.transition(State.WAIT_FOR_PLACE_PREP)
                 self.prepare_place_pub.publish(Bool(data=True))
             elif self.last_gate == 'turning_envelope_blocked':
@@ -1444,14 +1513,8 @@ class NavigationNode(Node):
             elif elapsed > self.p('bin_turn_backoff_timeout'):
                 self.fail(f'Bin-turn retreat could not finish within {self.p("bin_turn_backoff_timeout"):.0f} s; gate={self.last_gate}.')
         elif self.state == State.APPROACH_BIN_FOR_PLACE:
-            # The arm may now occlude the rim. Use the exact confirmed,
-            # timestamped world target captured before the swing, not a new
-            # red object or a refreshed timestamp on an old observation.
-            bin_pose = getattr(self, 'placement_bin', None)
-            if (bin_pose is None or not self.fresh(Time.from_msg(bin_pose.header.stamp).nanoseconds/1e9, 30.0)
-                    or not plausible_bin(pose_xyz(bin_pose), self.pose[:2])):
-                self.fail('Confirmed drop-box target expired during final approach; holding the book without release.')
-                return
+            # The LiDAR sees only the bin table's legs: stop by the bin's own measured pose too.
+            bin_pose = self.observations.get('bin')
             too_close = False
             # ...and by the table itself. The base fits under the table top but the arms do not: with the
             # camera faults the bin blob read 11 cm short and the tucked left gripper hit the table's top rail
@@ -1476,7 +1539,6 @@ class NavigationNode(Node):
             if too_close or self.drive_forward_to(self.goal):
                 self.result = None
                 self.transition(State.WAIT_FOR_PLACE)
-                self.place_target_pub.publish(bin_pose)
                 self.finish_place_pub.publish(Bool(data=True))
         elif self.state == State.WAIT_FOR_PLACE_PREP:
             self.stop()
