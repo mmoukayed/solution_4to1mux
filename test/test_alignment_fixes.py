@@ -272,6 +272,7 @@ def test_prepare_grab_uses_navigation_snapshot_not_latest_occluded_blob():
     n.readiness_issues = lambda: []
     n.selected_grasp_target = target(.75, -.07, 1.2)
     n.targets = {'book': target(9., 9., 9.)}
+    n.selected_grasp_geometry = dict(point=[.75,-.07,1.2], shelf_point=[.75,0.,2.], normal=[1.,0.,0.], left=-.4, right=.4, width=.04, height=.24, stamp=10., depth_supported=True)
     n.now = lambda: 10.
     n.book_row, n.token, n.hand_corr = 2, 0, None
     n.model = NS(names=['torso_lift_joint']+[f'arm_right_{i}_joint' for i in range(1, 8)])
@@ -279,7 +280,7 @@ def test_prepare_grab_uses_navigation_snapshot_not_latest_occluded_blob():
     values = dict(grasp_insert_depth=.085, grasp_right_offset=0., pregrasp_distance=.1,
                   lift_distance=.025, extract_distance=.1, grasp_base_advance=.28,
                   top_book_clearance_height=.12, top_book_front_standoff=.1,
-                  tf_max_age=1.0, place_base_advance=.35, place_clearance_height=.2, place_torso_hover=.35,
+                  tf_max_age=1.0, gripper_half_width=.065, divider_margin=.015, place_base_advance=.35, place_clearance_height=.2, place_torso_hover=.35,
                   place_torso_drop=0., bin_inset=.2, bin_release_height=.21,
                   bin_release_z=1.08, bin_release_x=.78, planning_timeout=60.)
     n.p = values.__getitem__

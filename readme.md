@@ -1,57 +1,15 @@
-# Library robot — Build 8.1 (0.8.1)
+# Library robot — Build 10.0 / version 0.10.0
 
-## Starting another run after a completed delivery
+Based on `miracle_alt` commit `0dbc7016b392bec134d4611bbf7c5a8d1e78a1e7`.
+This release adds depth-supported white text books, guarded edge-book alignment,
+and slower release. It preserves the branch's startup reset and joint-limit fix.
 
-Every fresh launch now begins in `RESET_ROBOT`. The base stays stopped while
-startup waits for connected arm/torso/head command subscribers, URDF limits,
-fresh per-joint feedback, odometry and both LiDAR scans. It then confirms both
-arms in the existing checked tuck pose, restores the torso to 0.10 m (bounded by
-the loaded URDF), and centres the head at pan 0 / shelf-search tilt (also bounded
-by the URDF). Each stage requires measured convergence and settling; elapsed
-time cannot approve a reset. Motion deadlines include the commanded duration.
-The torso lowers only after both arms are confirmed tucked.
+## Replace, rebuild and verify
 
-This happens at the beginning of a new launch, including after a successful
-previous run. No end-of-run reset was added. The gripper is not automatically
-opened by startup. No controllers or robot safety systems are reactivated.
-The base's physical location/odometry are not reset: the fresh run uses its
-current measured pose as the return origin. As with the existing arm tuck,
-provide clear space for the arm motion; this is not collision-planned recovery
-from an arbitrary interrupted grasp or an arm wedged inside the shelf.
-
-Stop the previous launch with Ctrl+C, then launch again. Pull the startup-reset
-change, rebuild, and source the new install. The existing launch command works:
-
-```bash
-cd /opt/erc_ws
-source /opt/ros/humble/setup.bash
-source tiago_dds_connect/tiago_env.sh
-colcon build --symlink-install --packages-select solution_4to1mux
-source install/setup.bash
-python3 src/solution_4to1mux/scripts/verify_install.py --source src/solution_4to1mux
-ros2 launch solution_4to1mux solution.launch.py robot_profile:=real shelf_column_number:=3 book_colour:=red
-```
-
-Expect `BUILD 8.1` on all nodes, followed by `Startup reset: TUCK_ARMS`,
-`RESET_TORSO`, `RESET_HEAD`, then `Startup reset complete` and `FIND_SHELF`.
-`startup_torso_height:=0.10` can select another measured start height;
-`startup_feedback_timeout:=45.0` controls the controller/sensor connection wait.
-A rejection, stale/incomplete feedback, or missed motion deadline keeps the
-mission stopped with the failed reset stage on `/solution/failure`.
-
-Without a second-run log, the exact cause of the reported stopped run is not
-proven. The previous branch only tucked arms and could send its one-shot tuck
-before command subscribers connected; it did not reset torso/head as a measured
-startup sequence. These code paths are now covered by offline regressions.
-
-
-This release consolidates the alignment, perception, navigation and live-robot grasp repairs into the supplied package. The uploaded ZIP contained the original older code, while the supplied output contained several different builds. Replace the complete package; do not overlay selected files or leave another copy under the workspace's src directory.
-
-The final insertion in the output failed with “Current goal cancelled during deactivate transition.” Joint and TF updates then froze. This release inhibits autonomous recovery after that failure; it does not establish or repair the underlying robot/controller/safety/communication cause. Inspect the robot's own controller and safety logs. If the arm is inside the shelf or holding a book, perform operator-controlled recovery before restarting. The application never resets safety systems or activates controllers.
-
-## Install and check the loaded code
-
-Use the existing ERC ROS Humble container and your normal DDS connection. Extract this archive so the package.xml is at `/opt/erc_ws/src/solution_4to1mux/package.xml`. Move any previous package copy outside src first.
+Stop the previous launch. Put the included package at
+`/opt/erc_ws/src/solution_4to1mux/package.xml`, moving the old package outside src
+first. Keep a backup of local changes; do not leave two copies of the ROS package
+under src. Alternatively apply the included patch to the exact baseline checkout.
 
 ```bash
 cd /opt/erc_ws
@@ -63,41 +21,135 @@ python3 src/solution_4to1mux/scripts/verify_install.py --source src/solution_4to
 python3 src/solution_4to1mux/scripts/preflight.py
 ```
 
-`verify_install.py` compares the loaded core Python files to this release and prints their path and source fingerprint. Do not add src to PYTHONPATH to make this check pass. All three nodes must print BUILD 8.1, version 0.8.1 and the same fingerprint. This detects mixed or stale installs, not physical readiness.
+Every node must print `BUILD 10.0`, version `0.10.0` and the same source fingerprint.
+Do not add src to PYTHONPATH to make install verification pass. The check detects
+mixed installations; it does not verify physical calibration or controller health.
+The existing beginning-of-run arm/torso/head reset remains active.
 
-The read-only preflight checks streams, transforms, actions and advertised ListControllers services. An action server alone does not prove the controller is active. An unavailable controller-state service produces a warning, not proof of readiness. Resolve failures and check robot readiness before launching.
+## White books with black labels
+
+Supported titles: `ROBOT`, `LIBRARY`, `AGENT`, `FUTURE`. The photo supplied for this
+repair shows those on rows 1, 2, 3 and 4 respectively; the column is not inferred
+from the cropped photo. Set `shelf_column_number` to the actual numbered column.
+Start validation with LIBRARY on row 2 or AGENT on row 3. Existing top-row shelf
+clearance refusals are retained; recognizing ROBOT does not override them.
+
+Example **if the white books are in column 2** (replace 2 as needed):
 
 ```bash
-ros2 launch solution_4to1mux solution.launch.py robot_profile:=real shelf_column_number:=3 book_colour:=yellow
+ros2 launch solution_4to1mux solution.launch.py robot_profile:=real shelf_column_number:=2 book_colour:=white book_text:=LIBRARY
 ```
 
-`book_color:=yellow` is also accepted. Conflicting colour aliases are rejected. Check the selected colour in startup output. Use `robot_profile:=sim` for the simulator; clock defaults follow the profile. This archive contains the solution package and offline URDF test fixture, not a complete simulator workspace.
-
-## Movement, alignment and grasp changes
-
-- Travel speed cap 0.45 m/s; carrying 0.25 m/s; docking 0.16 m/s; final grasp return 0.08 m/s. Acceleration ramps, immediate obstacle stops and scan-age braking remain enforced. These are caps, not guaranteed achieved speeds. Arm timing uses a 0.60 speed fraction and the robot's joint limits.
-- Shelf headings come from distinct marker observations, reject outliers and update coherently during approach. Final docking uses a single frozen shelf reference for lateral alignment and grasp orientation. The selected book pose is handed to manipulation explicitly.
-- The live marker minimum is 1.60 m, accepting the approximately 1.70 m markers seen in the output. Simulation retains 1.75 m. Override with `marker_min_height:=...` only for a measured setup.
-- Startup tuck and dock stow require measured joint convergence. Right-arm joint 2 obeys the live URDF limit instead of the rejected 1.25 rad target. Both arms stay in their calibrated tucked configuration during base movement where required.
-- Depth registration uses both camera transforms and timestamp checks. OCR keeps the original observation time; stale results cannot become fresh targets. Depth projection uses a nearest-depth buffer and limits repeated calibration work.
-- Colour detection uses the original BGR camera pixels, without automatic white balance or brightness stretching. Book thresholds accept the live feed's olive green and pale blue, narrow spines, and pink-tinted shelf surrounds. The saved camera images also retain the original pixels apart from the detection outline and timestamp; washed-out pixels in those files originate in the camera feed.
-- Bin detection requires a mostly saturated red, wide surface, plausible measured dimensions and local range, coherent depth on the red surface, and three distinct consistent camera observations. Missing depth or multiple plausible candidates keeps the search active. The centre of a bounding box is no longer used as the bin's depth sample.
-- Live grasp-frame fallback, hand-camera correction and visual grasp confirmation are preserved. The fallback calibration still needs checking on the physical robot. Missing confirmation is a failed grasp, not assumed success.
-- Top-row torso clearance and sampled arm-link shelf checks remain mandatory. Unsafe plans are refused. These checks are not a full mesh collision planner.
-- Return and placement preserve the full navigation goal across backoffs, use carrying clearances and align laterally to the bin. Without a live bin sensor, completion means the release sequence completed, not independently proven delivery.
-
-## Runtime faults and diagnostics
-
-Controller deactivation, rejected/failed trajectory actions, lost action responses, motion feedback timeouts, stale grasp transforms and lost active joint feedback latch a robot fault. The attempt cancels accepted action goals where possible, stops requesting new manipulation trajectories, and does not automatically open the gripper, retract or retry. Navigation requests zero base velocity. Continued odometry/LiDAR loss stops movement immediately and latches a fault after 3 seconds. A communication failure can prevent commands reaching the robot; application commands cannot guarantee a physical stop in that situation.
-
-Fresh feedback alone does not clear the fault. Inspect the robot, recover under operator control, then restart the solution. Inspect the recorded reason and fault snapshot with:
+Change only `book_text` for the other three titles. `book_color` is also accepted.
+For ordinary coloured edge books, omit `book_text` and select their colour:
 
 ```bash
+ros2 launch solution_4to1mux solution.launch.py robot_profile:=real shelf_column_number:=3 book_colour:=red
+```
+
+Tesseract plus English language data must be installed in the container. OCR groups
+black print into horizontal/vertical regions rather than feeding shelf grids to the
+recognizer. A bounded four-title spelling correction handles one uniquely closest
+glyph error at sufficient OCR score. Weak readings get an isolated-line re-read;
+they are not accepted solely because spelling is close. Three independent fresh
+captures and 3D bay checks must agree. A broad-side label alone does not authorize
+pickup: the vertical spine must be identified.
+
+A registered depth component anchored at the spine label determines the book's
+front-surface centre, width and height. It separates the book from a deeper white
+backboard and removes broad horizontal shelf-board rows. Missing/merged/incoherent
+surfaces are refused, rather than treating all white pixels as a book. RGB, depth,
+camera transforms and timestamps remain tied to the original capture.
+
+Text search holds the head 6 seconds per view and permits 36 seconds before a view
+backout. Colour mode keeps 3/20 seconds. Override with `head_scan_dwell:=...` and
+`book_search_timeout:=...`. OCR work is bounded; stale OCR results are discarded.
+The colour-mode travel speed and obstacle/sensor limits remain unchanged.
+
+Live text grasp confirmation is now enabled. For these neutral spines it re-reads
+the same title in a projected hand ROI in two distinct fresh captures, checks depth
+near the hand, and requires displacement out of the frozen pre-grasp shelf position.
+Reading the book still standing behind an empty gripper cannot prove a grasp.
+An unreadable/occluded title remains unconfirmed and the robot refuses carry.
+
+The supplied RGB photo passes recognition for all four titles. It contains no
+depth data: depth segmentation and physical grasp success are not established by
+that photo. Top/bottom rows, clipped spines, glare and low-resolution print still
+need supervised robot validation. A useful read-only image check after sourcing:
+
+```bash
+python3 src/solution_4to1mux/scripts/check_text_book.py frame.png --text LIBRARY
+```
+
+`--roi X Y W H` optionally crops to a column/spine. OCR scores are not calibrated
+probabilities of a successful retrieval.
+
+## Books near a divider
+
+Perception publishes depth-supported book dimensions, shelf normal and divider
+bounds. When visible, side-facing depth clusters refine the calibrated divider
+positions. An unseen divider uses the calibrated column width with a 3 cm inward
+margin; it is never assumed farther away to make a plan fit.
+
+For an edge book with checked finger clearance, the base may align laterally beyond
+the old single-bay footprint clamp while its entire footprint remains behind the
+shelf front. Fresh LiDAR, footprint, turning and front keepout gates remain. This
+reduces excessive sideways reach by the right arm. The checked alignment snapshot
+survives brief camera occlusion during stow, but the final handoff still needs fresh
+matching geometry.
+
+The frozen geometry is transformed into the actual base pose for each staged arm
+plan. Adaptive samples check arm-link capsules and the open gripper envelope
+against both side dividers during approach, insertion, lift and extraction.
+Retry/retraction paths also need divider clearance. Impossible side gaps are
+refused before opening/inserting; the robot does not shove books off a divider.
+
+Default open gripper half-width is 0.065 m plus a 0.015 m margin. This is a
+conservative configurable envelope, not a measurement of the real gripper mesh.
+`gripper_half_width:=...` is shared between base and arm; measure the actual open
+outer envelope before changing it. The included arm tests use the supplied URDF,
+not a complete mesh/self-collision planner. The nominal column half-width remains
+0.43 m; it must match the physical shelf. A book flush against a divider may be
+physically ungrippable with the available fingers.
+
+## Slower, lower release
+
+After the measured bin hover and base approach, the arm follows four short vertical
+waypoints with the torso fixed. Default lowering is up to 0.08 m at no more than
+0.025 m/s, stopping above the configured bin rim. Sampled link envelopes must stay
+above the configured table. If the full descent is unsafe, smaller checked descents
+are tried; if none is safe, the book is held and no opening command is sent.
+The gripper opens over 3 seconds and the sequence waits for the complete ramp,
+including when the live finger-feedback channel is frozen. There is no automatic
+fallback to the old abrupt opening. Placement requires a fresh plausible bin target
+under the held book and a recently completed hover.
+
+Launch options: `gentle_drop_distance:=0.08` (allowed 0.02–0.12 m),
+`gentle_open_duration:=3.0` (2–6 seconds). Internal calibration defaults are bin rim
+0.95 m and table surface 0.72 m; these must agree with the actual setup. The lowering
+reduces the remaining fall height. Without bin-floor/contact/force sensing it is
+not a contact-controlled set-down, and bin delivery remains unverified on live
+hardware without a bin sensor. Validate with an empty bin first.
+
+The bin detector uses surface depth instead of the hollow centre, temporal/size/range
+checks, fresh lateral alignment and a frozen placement snapshot. This also resolves
+inconsistencies between the branch's included drop-box tests and its earlier nodes.
+
+## Diagnostics and validation
+
+```bash
+ros2 topic echo /perception/book_diagnostics
+ros2 topic echo /perception/book_geometry
+ros2 topic echo /solution/failure
 ros2 topic echo /solution/robot_fault
 ```
 
-For a new trial, run `scripts/record.sh trial_name` in another sourced terminal before launching. It records solution diagnostics, ROS logs, TF, feedback, selected camera data and matching controller state/action-status topics when published. `--light` omits depth images; `--raw` adds raw colour and can generate very large bags. `scripts/run_trial.sh` saves launch output. No rosbag was supplied for this repair; the evidence was source code and text output.
+`book_geometry` reports world point/dimensions, original stamp, divider bounds and
+whether the bounds came from depth or calibrated margins. The recorder already
+captures `/perception/*` and `/solution/*`. Use `scripts/record.sh trial_name` before
+launching and preserve launch output for a supervised test.
 
-## Validation and limits
-
-See VALIDATION.txt and CHANGELOG_RUNTIME.md. Offline tests exercise alignment geometry, joint limits, guarded planning, state transitions, camera logic and the final deactivation/frozen-feedback failure. ROS, DDS, controller lifecycle and physical grasp/delivery have not been run here. Rebuild and verify the installed code, then validate on the robot under supervision before changing speed caps or calibrations.
+See `VALIDATION.txt` and `CHANGELOG_TEXT_EDGE_GENTLE.md`. No real RGB-D recording,
+controller session or physical execution was available for this repair. All limits,
+controller-fault inhibition and guarded startup remain; no safety/controller reset
+or deployment to the robot was performed.

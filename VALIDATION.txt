@@ -1,3 +1,47 @@
+Text / edge / gentle placement update — Build 10.0 / version 0.10.0 — 2026-11-21
+
+Baseline: miracle_alt at 0dbc7016b392bec134d4611bbf7c5a8d1e78a1e7.
+All downloaded baseline files were verified against GitHub blob SHAs.
+
+Offline regression command:
+OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider test --tb=short
+Result: 252 passed, 3 skipped, 22 subtests passed in 9.79 seconds.
+Three optional ament lint integrations skipped because ROS is unavailable.
+One external anyio pytest plugin deprecation warning.
+The exact baseline independently produced 193 passed, 17 failed, 3 skipped;
+its drop-box regressions exposed missing node behavior addressed in this update.
+
+Actual supplied RGB photo: all four titles recognized with Tesseract 5.5.0 English.
+ROBOT needed an isolated-line re-read; weak spelling alone was not accepted.
+Depth/pose segmentation tests use synthetic registered RGB-D, not this RGB photo.
+Edge grasp and gentle placement tests use the supplied calibrated arm model.
+They are offline geometry/state tests, not hardware or full mesh collision tests.
+
+Coverage includes fresh independent OCR frames, same-depth white background and
+sparse/missing depth refusal, shelf-board separation, full-spine centres,
+left/right edge alignment, divider and gripper envelopes, calibrated grasp paths
+on rows 2–4, dock occlusion, white-title extraction confirmation, fixed-torso
+placement IK, bounded descent speed, gradual opening and frozen-feedback timing.
+Existing startup, controller-fault, colour, bin, return and sensor guards pass.
+
+Pyflakes, Python syntax, shell syntax, source-identity and whitespace checks pass.
+The source identity check is not a test of the robot's installed ROS overlay.
+Wheel/patch/ZIP checks are recorded in APPLY_UPDATE.md in the delivery archive.
+
+No physical robot, ROS controllers, real RGB-D recording, rosbag playback or
+force/contact/floor sensing was available. Measure open-gripper envelope, shelf
+width, bin rim and table height before physical validation. The code refuses
+books without sufficient finger clearance. Existing top-row guards remain.
+Start supervised validation with LIBRARY or AGENT; successful recognition does
+not establish successful grasp. Gentle lowering reduces drop height but does
+not provide contact-controlled placement. No guaranteed success rate is claimed.
+
+GitHub publication was denied by the integration (403 Resource not accessible).
+The repository branch has not been modified. Apply the supplied patch or use the
+complete package, then rebuild and run installed-code verification as documented.
+
+Prior baseline validation history follows; older build results are historical:
+
 Startup-reset update — Build 8.1 / version 0.8.1 — 2026-11-21
 
 Baseline: miracle at 3ee0283f654c9961e10e3d62d4839cc7aa48fe67.

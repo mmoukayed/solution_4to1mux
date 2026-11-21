@@ -25,6 +25,7 @@ from tf2_ros import Buffer, TransformListener, TransformException
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .ros_topics import configure_ros
+from .book_geometry import validate_geometry, grasp_fits, check_divider_points
 from .runtime_health import current_transform, is_controller_deactivation, sample_age
 from .geometry import ArmKinematics, plausible_bin_range, pose_xyz, rotation, transform_matrix, yaw
 
@@ -57,6 +58,10 @@ class ManipulationNode(Node):
             # Insert past the measured spine rather than asking the base to
             # violate its shelf keepout. Keep the lateral target centred on
             # perception; the former 1.5 cm right bias led to left-only contact.
+            'gripper_half_width': .065, 'divider_margin': .015, 'place_lateral_offset': -.18,
+            'gentle_drop_distance': .08, 'gentle_lower_speed': .025,
+            'gentle_open_duration': 3.0, 'bin_rim_height': .95,
+            'table_surface_height': .72,
             'grasp_insert_depth': 0.085, 'grasp_right_offset': 0.0,
             'pregrasp_distance': 0.10,
             'lift_distance': 0.025, 'extract_distance': 0.10,
@@ -97,6 +102,14 @@ class ManipulationNode(Node):
             raise ValueError('motion_speed_scale must be >0 and <=0.80')
         if not math.isfinite(self.p('tf_max_age')) or self.p('tf_max_age') <= 0:
             raise ValueError('tf_max_age must be finite and >0')
+        for key in ('gripper_half_width', 'divider_margin', 'gentle_lower_speed', 'gentle_open_duration'):
+            if not np.isfinite(self.p(key)) or self.p(key) <= 0:
+                raise ValueError(f'{key} must be finite and positive')
+        if not .02 <= self.p('gentle_drop_distance') <= .12 or not 2. <= self.p('gentle_open_duration') <= 6.:
+            raise ValueError('Gentle drop distance must be 0.02..0.12 m and opening 2..6 seconds')
+        if (not np.isfinite([self.p('bin_rim_height'), self.p('table_surface_height')]).all()
+                or self.p('bin_rim_height') <= self.p('table_surface_height')+.05):
+            raise ValueError('Bin rim and table height must be finite and ordered')
         self.tf = Buffer()
         self.listener = TransformListener(self.tf, self)
         self.model = None
@@ -105,6 +118,8 @@ class ManipulationNode(Node):
         self.joints = {}
         self.joint_stamp = None
         self.targets = {}
+        self.selected_place_target = None
+        self.selected_grasp_geometry = None
         self.selected_grasp_target = None
         self.prepared_at = None
         self.grasp_prepared = False
@@ -136,6 +151,11 @@ class ManipulationNode(Node):
         self.create_subscription(JointState, topics['joint_states'], self.on_joints, qos_profile_sensor_data)
         self.create_subscription(PoseStamped, topics['grasp_target_pose'],
             lambda msg: setattr(self, 'selected_grasp_target', msg),
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(PoseStamped, topics['place_target_pose'],
+            lambda msg: setattr(self, 'selected_place_target', msg),
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(String, topics['grasp_geometry'], self.on_grasp_geometry,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         for name in ('book', 'bin'):
             self.create_subscription(PoseStamped, topics[f'{name}_pose'], lambda m, n=name: self.targets.update({n: m}), 10)
@@ -184,7 +204,7 @@ class ManipulationNode(Node):
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(0.1, self.tick, clock=self.wall_clock)
         self.get_logger().info(
-            f'Manipulation BUILD 8.1: {self.ros.profile} gripper positions '
+            f'Manipulation BUILD 10.0: {self.ros.profile} gripper positions '
             f'open={self.p("gripper_open"):.3f}, closed={self.p("gripper_closed"):.3f}.')
 
     def p(self, name):
@@ -234,6 +254,49 @@ class ManipulationNode(Node):
         if GRIPPER_JOINT in msg.name:
             self.grip_history.append((self.joint_stamp, self.joints[GRIPPER_JOINT]))
             self.grip_history = [h for h in self.grip_history if h[0] > self.joint_stamp-0.6]
+
+    def on_grasp_geometry(self, msg):
+        try:
+            g = json.loads(msg.data)
+            if validate_geometry(g) and g.get('frame') == self.ros.frames['odom']:
+                self.selected_grasp_geometry = g
+        except (ValueError, TypeError):
+            pass
+
+    def grasp_geometry_in_base(self, target, matrix):
+        g = getattr(self, 'selected_grasp_geometry', None)
+        if (g is None or not validate_geometry(g) or not self.fresh(g['stamp'], 60.)
+                or np.linalg.norm(np.asarray(g['point'])-pose_xyz(target)) > .08):
+            raise ValueError('Missing/mismatched depth-supported grasp geometry; reacquire the book.')
+        if not grasp_fits(g, self.p('gripper_half_width'), self.p('divider_margin')):
+            raise ValueError('Book is too close to its divider for the open fingers.')
+        result = dict(g)
+        for name in ('point', 'shelf_point'):
+            result[name] = (matrix @ np.r_[g[name], 1.])[:3].tolist()
+        result['normal'] = (matrix[:3, :3] @ np.asarray(g['normal'])).tolist()
+        return result
+
+    def check_divider_clear(self, start, path, geometry):
+        models = getattr(self, 'link_models', [])
+        if len(models) < 4:
+            raise ValueError('Divider check requires all four arm link models.')
+        previous = np.asarray(start)
+        for q in path:
+            travel_bound = 1.2*np.sum(np.abs(q[1:]-previous[1:]))+abs(q[0]-previous[0])
+            samples = max(17, int(np.ceil(travel_bound/.025))+1)
+            for ratio in np.linspace(0., 1., samples):
+                joints = previous+(q-previous)*ratio
+                links = [m.fk(joints[:len(m.names)])[:3, 3] for m in models]
+                wrist = self.model.fk(joints)
+                grasp = wrist @ self.base_to_grasp
+                chain = links+[wrist[:3, 3], grasp[:3, 3]]
+                probes, radii = [], []
+                for index, (a, b) in enumerate(zip(chain, chain[1:])):
+                    for t in np.linspace(0., 1., 9):
+                        probes.append(a+(b-a)*t)
+                        radii.append(max(self.p('gripper_half_width'), geometry['width']/2+.015) if index == len(chain)-2 else .045)
+                check_divider_points(probes, radii, geometry, self.p('divider_margin'))
+            previous = q
 
     def on_book_row(self, msg):
         self.book_row = int(msg.data) if 1 <= msg.data <= 4 else None
@@ -344,6 +407,8 @@ class ManipulationNode(Node):
         if sequence == 'prepare_place':
             self.placement_hover_target = None
         target = self.targets.get('book' if sequence in ('grab', 'prepare_grab', 'finish_grab') else 'bin')
+        if sequence in ('place', 'prepare_place', 'finish_place'):
+            target = getattr(self, 'selected_place_target', None) or target
         # the book as measured before the arm came up: once the hand is in front of it, perception sees only
         # the part the hand leaves visible and its "centre" drifts (twin: 9 cm up, the fingers closed above it)
         if sequence == 'prepare_grab':
@@ -361,13 +426,6 @@ class ManipulationNode(Node):
                       else self.p('finish_grab_target_max_age') if sequence == 'finish_grab'
                       else 20.0 if sequence == 'prepare_grab' and self.selected_grasp_target is not None
                       else self.p('target_max_age'))
-        if sequence == 'finish_place' and self.p('place_torso_drop') < 0.01:
-            # the release is only "open the gripper": the hand may hide the bin from the camera by now
-            self.active = sequence
-            self.token += 1
-            self.phases = [('release_book', 'open', None, 1.0), ('verify_delivery', 'delivery', None, 3.0)]
-            self.next_phase()
-            return
         stale = (target is None or target.header.frame_id != self.ros.frames['odom'] or
                  not self.fresh(Time.from_msg(target.header.stamp).nanoseconds/1e9, target_age))
         if stale and sequence == 'prepare_grab':
@@ -401,11 +459,19 @@ class ManipulationNode(Node):
             return
         matrix = transform_matrix(tf.transform)
         point = (matrix @ np.r_[pose_xyz(target), 1])[:3]
-        if sequence in ('place', 'prepare_place') and not plausible_bin_range(point, np.zeros(3)):
+        if sequence in ('place', 'prepare_place', 'finish_place') and not plausible_bin_range(point, np.zeros(3)):
             self.report(sequence, False,
                         f'Implausible bin target in base frame {point.round(3)}; '
                         'refusing fixed-distance placement. Inspect bin RGB-D detection.')
             return
+        if sequence in ('place', 'prepare_place', 'finish_place'):
+            if not (.35 < point[0] < (1.8 if sequence == 'prepare_place' else 1.30)
+                    and abs(point[1]-self.p('place_lateral_offset')) <= .10 and .60 < point[2] < 1.20):
+                self.report(sequence, False, 'Bin outside placement alignment envelope; holding book without release.')
+                return
+            if sequence == 'finish_place' and abs(point[0]-self.p('bin_release_x')) > .25:
+                self.report(sequence, False, 'Bin is not under calibrated release position; refusing opening.')
+                return
         if sequence in ('grab', 'finish_grab') and self.hand_corr is not None and self.now()-self.hand_corr[1] < 120.0:
             # the auto-calibrated grasp: aim where the camera says the book is, shifted by the
             # difference between where the arm's kinematics and the camera put the hand
@@ -418,6 +484,10 @@ class ManipulationNode(Node):
             self.report(sequence, False, 'Invalid shelf normal in target pose.')
             return
         normal /= np.linalg.norm(normal)
+        if sequence == 'finish_place' and (getattr(self, 'placement_hover_target', None) is None
+                or not self.fresh(getattr(self, 'placement_prepared_at', None), 40.)):
+            self.report(sequence, False, 'Missing recent completed bin hover; refusing release.')
+            return
         self.active = sequence
         self.token += 1
         self.arm_in_shelf = False
@@ -425,6 +495,17 @@ class ManipulationNode(Node):
             self.retreat_target = None
         current = np.array([self.joints[n] for n in self.model.names])
         params = {key: self.p(key) for key in ('grasp_insert_depth', 'grasp_right_offset', 'pregrasp_distance', 'lift_distance', 'extract_distance', 'grasp_base_advance', 'top_book_clearance_height', 'top_book_front_standoff', 'place_base_advance', 'place_clearance_height', 'place_torso_hover', 'place_torso_drop', 'bin_inset', 'bin_release_height', 'bin_release_z', 'bin_release_x')}
+        if sequence in ('place', 'prepare_place', 'finish_place'):
+            params.update({key: self.p(key) for key in ('gentle_drop_distance', 'gentle_lower_speed',
+                'gentle_open_duration', 'bin_rim_height', 'table_surface_height')})
+        if sequence in ('grab', 'prepare_grab', 'finish_grab'):
+            try:
+                params['shelf_geometry'] = self.grasp_geometry_in_base(target, matrix)
+                self.active_grasp_geometry = params['shelf_geometry']
+            except ValueError as error:
+                self.active = None
+                self.report(sequence, False, str(error))
+                return
         self.deferred_plan = None
         self.phases = []
         if sequence == 'prepare_grab':
@@ -438,6 +519,7 @@ class ManipulationNode(Node):
             torso_target[0] = self.model.upper[0]
             try:
                 self.check_shelf_clear(current, [torso_target], point, normal)
+                self.check_divider_clear(current, [torso_target], params['shelf_geometry'])
             except ValueError as error:
                 self.abort(f'Top-row clearance refused before torso lift: {error}')
                 return
@@ -491,21 +573,7 @@ class ManipulationNode(Node):
         # a nonzero grasp_right_offset remains available for measured tuning.
         point = point+np.array([0.0, -params.get('grasp_right_offset', 0.0), 0.0]) if sequence in ('grab', 'prepare_grab', 'finish_grab') else point
         if sequence == 'finish_place':
-            if self.placement_hover_target is None:
-                raise ValueError('No staged crane pose is available; run prepare_place before finish_place.')
-            if params['place_torso_drop'] < 0.01:
-                # release from the hover: lowering the torso put the upper arm on the table edge
-                return [('release_book', 'open', None, 1.0),
-                        ('verify_delivery', 'delivery', None, 3.0)]
-            lowered = self.placement_hover_target.copy()
-            lowered[0] = max(self.model.lower[0],
-                             lowered[0]-params['place_torso_drop'])
-            if self.placement_hover_target[0]-lowered[0] < 0.05:
-                raise ValueError('Torso has less than 5 cm of safe downward travel from the bin hover pose.')
-            duration = self.model.duration(current, lowered, 1.0)
-            motions = [('lower_to_bin', 'motion', lowered, duration)]
-            return motions+[('release_book', 'open', None, 1.0),
-                            ('verify_delivery', 'delivery', None, 3.0)]
+            return self.plan_gentle_place(current, point, params)
         facing = rotation([0, 0, 1], math.atan2(normal[1], normal[0]))
         if sequence == 'grab':
             grasp = point+normal*params['grasp_insert_depth']
@@ -625,6 +693,8 @@ class ManipulationNode(Node):
                 # placing: prefer the rolls that keep the book's long side along the bin's long axis
                 if top_grasp:
                     self.check_shelf_clear(current, [step[2] for step in candidate], point, normal)
+                if grasp_sequence and params.get('shelf_geometry') is not None:
+                    self.check_divider_clear(current, [step[2] for step in candidate], params['shelf_geometry'])
                 penalty = 100.0 if placing and abs(math.sin(roll)) > 0.5 else 0.0
                 candidates.append((sum(step[3] for step in candidate)+penalty, candidate))
             except ValueError as error:
@@ -664,6 +734,46 @@ class ManipulationNode(Node):
                             ('verify_delivery', 'delivery', None, 3.0)]
         return motions+[('release_book', 'open', None, 1.0),
                         ('verify_delivery', 'delivery', None, 3.0)]
+
+    def plan_gentle_place(self, current, point, params):
+        if self.base_to_grasp is None or len(getattr(self, 'link_models', [])) < 4:
+            raise ValueError('Gentle release requires calibrated grasp frame and arm link models.')
+        original = self.model.fk(current) @ self.base_to_grasp
+        centre = original[:3, 3]
+        if not (.35 < point[0] < 1.60 and abs(point[1]-centre[1]) < .18
+                and abs(point[0]-centre[0]) < .25 and .60 < point[2] < 1.20):
+            raise ValueError('Bin is not under the held book; realign before gentle release.')
+        # Keep the hand above the rim. This reduces the existing fall height;
+        # without a floor/contact sensor it cannot promise a contact set-down.
+        available = min(params['gentle_drop_distance'], centre[2]-params['bin_rim_height']-.035)
+        errors = []
+        for distance in (available, available*.75, available*.5):
+            if distance < .02:
+                continue
+            q, steps = current.copy(), []
+            try:
+                for drop in np.linspace(distance/4, distance, 4):
+                    target = original.copy()
+                    target[2, 3] -= drop
+                    wrist = target @ np.linalg.inv(self.base_to_grasp)
+                    solved = self.model.solve(wrist[:3, 3], wrist[:3, :3], q, fixed={0: current[0]})
+                    if np.max(np.abs(solved[1:]-q[1:])) > .7:
+                        raise ValueError('Gentle-release IK branch jump')
+                    for ratio in np.linspace(0., 1., 13):
+                        sample = q+(solved-q)*ratio
+                        for model in self.link_models:
+                            position = model.fk(sample[:len(model.names)])[:3, 3]
+                            if position[0] > .40 and position[2]-.045 < params['table_surface_height']+.03:
+                                raise ValueError('Gentle-release arm envelope too close to table')
+                    travelled = abs((self.model.fk(solved) @ self.base_to_grasp)[2, 3]-(self.model.fk(q) @ self.base_to_grasp)[2, 3])
+                    duration = max(self.model.duration(q, solved, 1.), travelled/params['gentle_lower_speed'])
+                    steps.append((f'gentle_lower_{drop:.3f}m', 'motion', solved, duration))
+                    q = solved
+                return steps+[('gentle_release', 'gentle_open', None, params['gentle_open_duration']),
+                              ('verify_delivery', 'delivery', None, 3.)]
+            except ValueError as error:
+                errors.append(str(error))
+        raise ValueError('No safe gentle-lowering path: '+'; '.join(errors))
 
     def plan_carry_raise(self, current):
         """Move the held book to the fixed top-shelf carry pose, without torso motion."""
@@ -711,6 +821,8 @@ class ManipulationNode(Node):
                 return
             sequence = self.active
             self.active = self.phase = None
+            if sequence == 'prepare_place':
+                self.placement_prepared_at = self.now()
             if sequence == 'prepare_grab':
                 self.grasp_prepared = True
                 self.prepared_at = self.now()
@@ -759,14 +871,15 @@ class ManipulationNode(Node):
                 goal.trajectory = self.trajectory(names, values, duration)
                 future = client.send_goal_async(goal)
                 future.add_done_callback(lambda f, t=token: self.goal_response(f, t))
-        elif self.phase in ('open', 'close'):
-            value = self.p('gripper_open' if self.phase == 'open' else 'gripper_closed')
+        elif self.phase in ('open', 'close', 'gentle_open'):
+            value = self.p('gripper_closed' if self.phase == 'close' else 'gripper_open')
             if self.phase == 'close':
                 # Do not let contact from a previous approach/attempt count as
                 # proof of a grasp. The close phase needs fresh bilateral data.
                 self.contacts.clear()
             self.gripper_pub.publish(self.trajectory([GRIPPER_JOINT], [value], duration))
-            self.deadline = self.now()+self.p('gripper_timeout')
+            self.phase_duration = duration
+            self.deadline = self.now()+max(duration, self.p('gripper_timeout'))+2.0
             self.contact_since = None
         elif self.phase == 'verify' and not self.finger_feedback:
             self.deadline = self.now()+18.0     # the visual grasp check answers within ~5 s, longer in a depth stall
@@ -906,6 +1019,11 @@ class ManipulationNode(Node):
                 self.get_logger().info(
                     f'Top-row torso lift confirmed at {actual:.3f} m; starting arm approach.')
                 self.next_phase()
+        elif self.phase == 'gentle_open':
+            settled = self.now()-self.phase_started >= self.phase_duration+.5
+            measured = (not self.finger_feedback or abs(self.joints.get(GRIPPER_JOINT, -1)-self.p('gripper_open')) < .006)
+            if settled and measured:
+                self.next_phase()
         elif self.phase == 'open':
             if self.fresh(self.joint_stamp) and abs(self.joints.get(GRIPPER_JOINT, -1)-self.p('gripper_open')) < 0.006 and self.now()-self.phase_started > 0.8:
                 self.next_phase()
@@ -991,8 +1109,11 @@ class ManipulationNode(Node):
         side = np.array([-normal[1], normal[0], 0.0])
         current = np.array([self.joints[n] for n in self.model.names])
         self.get_logger().warn(f'finish_grab: {why}; retry {self.grasp_retries}/{len(offsets)} {offset*100:+.1f} cm to the side.')
+        if params.get('shelf_geometry') is None:
+            return False
         self.holding_book = None
-        self.gripper_pub.publish(self.trajectory([GRIPPER_JOINT], [self.p('gripper_open')], 1.0))
+        # Opening/retrying is deferred until the new plan passes divider checks.
+
         self.retry_open = True
         self.phase = 'planning'
         self.phases = []
@@ -1060,9 +1181,18 @@ class ManipulationNode(Node):
         retreat = getattr(self, 'retreat_target', None)
         if not getattr(self, 'arm_in_shelf', False) or retreat is None:
             return
-        self.arm_in_shelf = False
         if self.model is None or not self.fresh(self.joint_stamp):
             self.get_logger().error('Cannot retract from shelf: no model or stale joint feedback.')
+            return
+        geometry = getattr(self, 'active_grasp_geometry', None)
+        if geometry is None:
+            self.get_logger().error('Retraction inhibited: no frozen divider geometry.')
+            return
+        try:
+            start = np.array([self.joints[n] for n in self.model.names])
+            self.check_divider_clear(start, [retreat], geometry)
+        except ValueError as error:
+            self.get_logger().error(f'Retraction inhibited by divider check: {error}')
             return
         self.get_logger().warn('Grasp ended inside the shelf; requesting retreat to pregrasp with fresh joint feedback.')
         try:

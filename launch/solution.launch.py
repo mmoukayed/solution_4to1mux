@@ -15,6 +15,12 @@ def generate_launch_description():
         'book_colour': ('', str),
         'book_color': ('', str),
         'book_text': ('', str),
+        'book_text_colour_hint': ('', str),
+        'head_scan_dwell': ('auto', str),
+        'bin_lateral_offset': ('-0.18', float),
+        'gripper_half_width': ('0.065', float),
+        'gentle_drop_distance': ('0.08', float),
+        'gentle_open_duration': ('3.0', float),
         'search_direction': ('right', str),
         'book_standoff': ('0.68', float),
         'book_lateral_offset': ('-0.18', float),
@@ -31,7 +37,7 @@ def generate_launch_description():
         'lower_book_keepout_distance': ('0.84', float),
         'shelf_alignment_standoff': ('1.35', float),
         'shelf_alignment_timeout': ('40.0', float),
-        'book_search_timeout': ('20.0', float),
+        'book_search_timeout': ('auto', str),
         'max_book_recoveries': ('2', int),
         'book_view_backoff': ('0.35', float),
         # how far either side of the shelf numbers the column sweep goes: 1.3 keeps it on a small platform,
@@ -66,10 +72,17 @@ def generate_launch_description():
         if colour and alias and colour != alias:
             raise ValueError('Conflicting book_colour and book_color; specify one colour.')
         colour = colour or alias or 'red'
-        if colour not in ('red', 'green', 'blue', 'yellow'):
+        text_mode = bool(LaunchConfiguration('book_text').perform(context).strip())
+        if colour not in ('red', 'green', 'blue', 'yellow') and not (text_mode and colour == 'white'):
             raise ValueError(f'Invalid book colour: {colour}')
         minimum = LaunchConfiguration('marker_min_height').perform(context).strip()
         minimum = (1.60 if profile == 'real' else 1.75) if minimum == 'auto' else float(minimum)
+        dwell = LaunchConfiguration('head_scan_dwell').perform(context).strip()
+        dwell = (6.0 if text_mode else 3.0) if dwell == 'auto' else float(dwell)
+        timeout = LaunchConfiguration('book_search_timeout').perform(context).strip()
+        timeout = (36.0 if text_mode else 20.0) if timeout == 'auto' else float(timeout)
+        if dwell <= 0 or timeout <= 0:
+            raise ValueError('Text search timing must be positive')
         shared = {'robot_profile': profile,
                   'use_sim_time': config.use_sim_time if clock == 'auto' else clock == 'true'}
 
@@ -80,22 +93,23 @@ def generate_launch_description():
                         output='screen', emulate_tty=True)
 
         return [
-            node('perception_node', ['shelf_column_number', 'book_colour', 'book_text', 'perception_rate',
+            node('perception_node', ['shelf_column_number', 'book_colour', 'book_text', 'book_text_colour_hint', 'perception_rate',
                                      'marker_min_height', 'marker_max_height', 'top_book_marker_offset',
                                      'row_spacing', 'column_half_width'], {'book_colour': colour, 'marker_min_height': minimum}),
             node('navigation_node', ['shelf_column_number', 'scan_half_width', 'linear_speed', 'strafe_speed',
                                     'rotate_speed', 'search_rotate_speed', 'search_direction',
                                     'book_standoff', 'book_lateral_offset', 'grab_timeout',
-                                    'place_timeout', 'phase_timeout', 'docking_speed',
+                                    'place_timeout', 'phase_timeout', 'docking_speed', 'bin_lateral_offset', 'gripper_half_width',
                                     'book_search_timeout', 'max_book_recoveries',
                                     'book_view_backoff', 'top_book_marker_offset', 'row_spacing',
                                     'column_half_width', 'lower_book_standoff',
                                     'lower_book_keepout_distance',
                                     'shelf_alignment_standoff',
                                     'shelf_alignment_strafe_speed',
-                                    'shelf_alignment_timeout', 'grasp_base_return_advance', 'sensor_loss_timeout', 'startup_torso_height', 'startup_feedback_timeout', *MOTION_DEFAULTS]),
-            node('manipulation_node', ['motion_speed_scale'],
-                 {'grasp_base_advance': params['grasp_base_return_advance']}),
+                                    'shelf_alignment_timeout', 'grasp_base_return_advance', 'sensor_loss_timeout', 'startup_torso_height', 'startup_feedback_timeout', *MOTION_DEFAULTS],
+                 {'head_scan_dwell': dwell, 'book_search_timeout': timeout, 'book_pose_max_age': 2.5 if text_mode else 1.2}),
+            node('manipulation_node', ['motion_speed_scale', 'gentle_drop_distance', 'gentle_open_duration', 'gripper_half_width'],
+                 {'grasp_base_advance': params['grasp_base_return_advance'], 'place_lateral_offset': params['bin_lateral_offset']}),
         ]
 
     return LaunchDescription(declarations+[OpaqueFunction(function=launch_nodes)])

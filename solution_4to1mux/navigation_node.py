@@ -19,6 +19,8 @@ from tf2_ros import Buffer, TransformListener, TransformException
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from .ros_topics import configure_ros
+from .book_geometry import validate_geometry, grasp_fits
+from .target_geometry import plausible_bin
 from .alignment import MOTION_DEFAULTS, angle_delta, read_joint_limits
 from .geometry import (body_velocity, forward_command, plausible_bin_range, pose_xyz, row_for_height,
                        scan_points, transform_matrix, wrap, yaw)
@@ -84,9 +86,12 @@ class NavigationNode(Node):
             'bin_search_direction': 'left',
             'phase_timeout': 240.0, 'grab_timeout': 120.0, 'place_timeout': 90.0,
             'reading_max_age': 1.0,
+            'gripper_half_width': .065,
+            'edge_outside_allowance': .20,
+            'book_pose_max_age': 1.2,
             'book_standoff': 0.68, 'book_lateral_offset': -0.18,
             'table_gap': 0.10,    # the base's front stops this far from the bin table's front legs
-            'bin_standoff': 0.60, 'bin_final_advance_max': 0.65, 'bin_min_distance': 0.70,  # the table edge (table_gap) decides; these are backstops
+            'bin_lateral_offset': -.18, 'bin_standoff': 0.60, 'bin_final_advance_max': 0.65, 'bin_min_distance': 0.70,  # the table edge (table_gap) decides; these are backstops
             'bin_turn_backoff': 0.25, 'max_bin_turn_recoveries': 2, 'carry_turn_clearance': 0.85,
             'bin_turn_backoff_timeout': 8.0,
             'place_base_advance': 0.35,
@@ -131,7 +136,7 @@ class NavigationNode(Node):
             if not 0 < self.p(key) <= 1.0:
                 raise ValueError(f'{key} must be >0 and <=1')
         for key in (*MOTION_DEFAULTS, 'sensor_loss_timeout', 'startup_feedback_timeout',
-                    'startup_motion_margin', 'startup_torso_speed'):
+                    'startup_motion_margin', 'startup_torso_speed', 'book_pose_max_age', 'gripper_half_width', 'edge_outside_allowance'):
             if not np.isfinite(self.p(key)) or self.p(key) <= 0:
                 raise ValueError(f'{key} must be finite and positive')
         if not np.isfinite(self.p('startup_torso_height')):
@@ -142,6 +147,7 @@ class NavigationNode(Node):
         self.odom_stamp = None
         self.observations = {}
         self.dock_reference = None
+        self.book_geometry = None
         self.selected_book = None
         self.scans = {}
         self.result = None
@@ -211,6 +217,11 @@ class NavigationNode(Node):
         self.create_subscription(JointState, topics['joint_states'], self.on_arm_joints, qos_profile_sensor_data)
         self.create_subscription(String, topics['robot_description'], self.on_description,
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.place_target_pub = self.create_publisher(PoseStamped, topics['place_target_pose'],
+                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.grasp_geometry_pub = self.create_publisher(String, topics['grasp_geometry'],
+                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(String, topics['book_geometry'], self.on_book_geometry, 10)
         self.grasp_target_pub = self.create_publisher(PoseStamped, topics['grasp_target_pose'],
                                  QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         for name in ('shelf', 'shelf_unit', 'book', 'bin'):
@@ -231,7 +242,7 @@ class NavigationNode(Node):
         self.wall_clock = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(0.05, self.tick)
         self.create_timer(5.0, self.wall_status, clock=self.wall_clock)
-        self.get_logger().info(f'Navigation BUILD 8.1 (tracked shelf alignment): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
+        self.get_logger().info(f'Navigation BUILD 10.0 (tracked shelf alignment): target column {self.p("shelf_column_number")}, forward cap {self.p("linear_speed")} m/s')
         self.transition(State.RESET_ROBOT)
 
     def p(self, name):
@@ -279,6 +290,22 @@ class NavigationNode(Node):
     def on_pose(self, name, msg):
         if msg.header.frame_id == self.ros.frames['odom'] and np.isfinite(pose_xyz(msg)).all():
             self.observations[name] = msg
+
+    def on_book_geometry(self, msg):
+        try:
+            geometry = json.loads(msg.data)
+            if validate_geometry(geometry) and geometry.get('frame') == self.ros.frames['odom']:
+                self.book_geometry = geometry
+        except (ValueError, TypeError):
+            pass
+
+    def geometry_for_book(self, book, maximum_age=None):
+        g = getattr(self, 'book_geometry', None)
+        age = self.p('book_pose_max_age') if maximum_age is None else maximum_age
+        if (g is None or not validate_geometry(g) or not self.fresh(g['stamp'], age)
+                or np.linalg.norm(np.array(g['point'])-pose_xyz(book)) > .08):
+            return None
+        return g
 
     def on_holding(self, msg):
         if msg.data:
@@ -464,6 +491,23 @@ class NavigationNode(Node):
         robot_half_width = (0.36*abs(math.sin(goal[2]-heading))
                             + 0.32*abs(math.cos(goal[2]-heading)))
         safe_lateral = max(0.02, self.p('column_half_width')-robot_half_width-0.03)
+        book = self.selected_book
+        g = self.geometry_for_book(book) if book is not None else None
+        cached = getattr(self, 'dock_geometry', None)
+        if (g is None and cached is not None and self.state in (State.STOW_ARMS_FOR_DOCK, State.ALIGN_BOOK)
+                and self.fresh(cached['stamp'], 30.) and book is not None
+                and np.linalg.norm(np.array(cached['point'])-pose_xyz(book)) <= .12):
+            g = cached
+        # Outside the shelf front there is no physical reason to keep the
+        # bumper centred in a single bay. LiDAR still guards the sideways move.
+        # This lets the right arm align with either edge instead of reaching
+        # far across the robot from an artificially clamped base goal.
+        distance = -float(relative @ np.array([math.cos(heading), math.sin(heading)]))
+        forward_extent = .36*abs(math.cos(goal[2]-heading))+.32*abs(math.sin(goal[2]-heading))
+        if (g is not None and grasp_fits(g, self.p('gripper_half_width'))
+                and distance > forward_extent+self.p('obstacle_margin')
+                and abs(float((pose_xyz(book)[:2]-pose_xyz(shelf)[:2]) @ tangent)) > self.p('column_half_width')-.17):
+            safe_lateral = self.p('column_half_width')+self.p('edge_outside_allowance')
         bounded = float(np.clip(lateral, -safe_lateral, safe_lateral))
         if abs(bounded-lateral) > 1e-3:
             goal = goal.copy()
@@ -603,7 +647,10 @@ class NavigationNode(Node):
             self.book_dock_minimum = self.p('shelf_keepout_distance')
             self.current_book_row = None
             self.book_row_pub.publish(Int32(data=-1))
+        if state in (State.FIND_BOOK, State.REACQUIRE_BOOK):
+            self.dock_geometry = None
         if state == State.STOW_ARMS_FOR_DOCK:
+            self.dock_geometry = self.geometry_for_book(self.selected_book) if self.selected_book is not None else None
             self.arm_stow_last = None
             self.arm_confirmed_since = None
         if state == State.RETURN_TO_START:
@@ -833,7 +880,7 @@ class NavigationNode(Node):
             if (np.linalg.norm(pose_xyz(shelf)-pose_xyz(old)) <= 0.35
                     and abs(angle_delta(yaw(shelf.pose.orientation), yaw(old.pose.orientation))) <= 0.35):
                 self.dock_reference = deepcopy(shelf)
-        book = self.observation('book', maximum_age=1.2)
+        book = self.observation('book', maximum_age=self.p('book_pose_max_age'))
         if book is not None and self.selected_book is not None:
             if np.linalg.norm(pose_xyz(book)-pose_xyz(self.selected_book)) <= 0.12:
                 self.selected_book = deepcopy(book)
@@ -843,6 +890,15 @@ class NavigationNode(Node):
         standoff = self.p('lower_book_standoff') if self.current_book_row in (3, 4) else self.p('book_standoff')
         self.goal = self.target_goal(self.selected_book, standoff, self.p('book_lateral_offset'))
         self.goal = self.clamped_dock_goal(self.constrain_goal_to_column(self.goal))
+
+    def bin_observation(self):
+        target = self.observation('bin', maximum_age=1.5)
+        if target is None:
+            return None
+        if not plausible_bin(pose_xyz(target), self.pose[:2]):
+            self.warn('bin_range', 'Ignoring implausible red drop-box pose; waiting for a fresh surface-supported target within 4 m.')
+            return None
+        return target
 
     def recover_book_view(self):
         # Only before a grasp: never move away after a partially executed arm motion.
@@ -1345,14 +1401,23 @@ class NavigationNode(Node):
             if arrived or self.shelf_limited_return_arrived(self.goal):
                 if not arrived:
                     self.get_logger().warn('ALIGN_BOOK reached the shelf keepout boundary; continuing with the compensated staged grasp.')
-                book = self.observation('book', maximum_age=1.2)
+                book = self.observation('book', maximum_age=self.p('book_pose_max_age'))
                 if book is None:
                     self.transition(State.REACQUIRE_BOOK)
                     return
                 if (self.selected_book is not None and
                         np.linalg.norm(pose_xyz(book)-pose_xyz(self.selected_book)) > 0.12):
-                    self.recover_book_view()
+                    self.transition(State.REACQUIRE_BOOK)
                     return
+                geometry = self.geometry_for_book(book)
+                if geometry is None:
+                    self.stop()
+                    self.warn('book_geometry', 'Waiting for fresh depth-supported book dimensions and divider bounds.')
+                    return
+                if not grasp_fits(geometry, self.p('gripper_half_width')):
+                    self.fail('Insufficient finger clearance between this book and the divider; refusing insertion.')
+                    return
+                self.grasp_geometry_pub.publish(String(data=json.dumps(geometry)))
                 grasp = deepcopy(book)
                 grasp.pose.orientation = deepcopy((self.dock_reference or book).pose.orientation)
                 self.grasp_target_pub.publish(grasp)
@@ -1451,17 +1516,41 @@ class NavigationNode(Node):
             if self.drive_return_to_start():
                 self.transition(State.FIND_BIN)
         elif self.state == State.FIND_BIN:
-            self.look(tilt=-0.1)
-            target = self.observation('bin')
+            # Hold each downward view long enough for three RGB-D confirmations.
+            tilts = (-.10, -.35, -.55)
+            self.look(tilt=tilts[int(elapsed/max(2.0, self.p('head_scan_dwell'))) % len(tilts)])
+            target = self.bin_observation()
             if target is not None:
-                self.goal = self.target_goal(target, self.p('bin_standoff'), self.p('book_lateral_offset'))
+                self.goal = self.target_goal(target, self.p('bin_standoff'), self.p('bin_lateral_offset'))
                 self.bin_turn_recoveries = 0
                 self.bin_turn_retreat_total = 0.0
                 self.transition(State.APPROACH_BIN)
             else:
                 self.search()
         elif self.state == State.APPROACH_BIN:
-            self.look(self.observations.get('bin'))
+            target = self.bin_observation()
+            if target is None:
+                self.stop()
+                self.last_gate = 'waiting_for_fresh_bin_pose'
+                since = getattr(self, 'bin_lost_since', None)
+                if since is None:
+                    self.bin_lost_since = self.now()
+                elif self.now()-since >= 3.0:
+                    attempts = getattr(self, 'bin_reacquisitions', 0)
+                    if attempts >= 2:
+                        self.fail('Drop-box observations repeatedly lost; keeping the book held.')
+                    else:
+                        self.bin_reacquisitions = attempts+1
+                        self.bin_lost_since = None
+                        self.transition(State.FIND_BIN)
+                return
+            self.bin_lost_since = None
+            self.look(target)
+            # Refresh the lateral centre from current observations, keeping
+            # the approach heading stable while the base aligns.
+            normal = np.array([math.cos(self.goal[2]), math.sin(self.goal[2])])
+            left = np.array([-normal[1], normal[0]])
+            self.goal[:2] = pose_xyz(target)[:2]-normal*self.p('bin_standoff')-left*self.p('bin_lateral_offset')
             # Face the bin at the return pose, making a bounded retreat only
             # when LiDAR prevents rotation. Recompute distance after recovery.
             if self.rotate_to(self.goal[2]):
@@ -1475,12 +1564,20 @@ class NavigationNode(Node):
                 # observed failure was a 0.425 m IK position error). Advance
                 # only toward the bin until the calibrated 0.95 m arm standoff
                 # is reached; unlike target-goal docking this cannot reverse.
-                bin_pose = self.observations.get('bin')
+                bin_pose = target
                 heading = np.array([math.cos(self.pose[2]), math.sin(self.pose[2])])
                 distance = (float((pose_xyz(bin_pose)[:2]-self.pose[:2]) @ heading)
                             if bin_pose is not None else self.p('bin_standoff'))
                 advance = float(np.clip(distance-self.p('bin_standoff'), 0.0,
                                          self.p('bin_final_advance_max')+self.bin_turn_retreat_total))
+                # Close a long distance with the arm still in its carry pose.
+                # Never interpret a distant red blob as permission to swing
+                # the arm just because an unrelated table is close by.
+                staging = self.p('bin_standoff')+self.p('bin_final_advance_max')+self.bin_turn_retreat_total
+                if distance > staging+.05:
+                    staging_goal = np.r_[self.goal[:2]-(staging-self.p('bin_standoff'))*heading, self.goal[2]]
+                    self.drive_to(staging_goal, docking=True)
+                    return
                 gap = self.table_gap()
                 if gap is not None and gap < self.p('swing_table_gap') and not self.swing_backed:
                     # the return can stop right beside the table (twin s13: 0.05 m): the swing into the drop pose
@@ -1500,6 +1597,8 @@ class NavigationNode(Node):
                 # joint-space swing dips the wrist to 0.62 m and the elbow to 0.76 m in front of the robot (table top
                 # 0.72), and they hit the table and the bin (twin w10). The base then drives in with the arm still.
                 self.result = None
+                self.placement_bin = deepcopy(target)
+                self.place_target_pub.publish(self.placement_bin)
                 self.transition(State.WAIT_FOR_PLACE_PREP)
                 self.prepare_place_pub.publish(Bool(data=True))
             elif self.last_gate == 'turning_envelope_blocked':
@@ -1513,8 +1612,14 @@ class NavigationNode(Node):
             elif elapsed > self.p('bin_turn_backoff_timeout'):
                 self.fail(f'Bin-turn retreat could not finish within {self.p("bin_turn_backoff_timeout"):.0f} s; gate={self.last_gate}.')
         elif self.state == State.APPROACH_BIN_FOR_PLACE:
-            # The LiDAR sees only the bin table's legs: stop by the bin's own measured pose too.
-            bin_pose = self.observations.get('bin')
+            # The arm may now occlude the rim. Use the exact confirmed,
+            # timestamped world target captured before the swing, not a new
+            # red object or a refreshed timestamp on an old observation.
+            bin_pose = getattr(self, 'placement_bin', None)
+            if (bin_pose is None or not self.fresh(Time.from_msg(bin_pose.header.stamp).nanoseconds/1e9, 30.0)
+                    or not plausible_bin(pose_xyz(bin_pose), self.pose[:2])):
+                self.fail('Confirmed drop-box target expired during final approach; holding the book without release.')
+                return
             too_close = False
             # ...and by the table itself. The base fits under the table top but the arms do not: with the
             # camera faults the bin blob read 11 cm short and the tucked left gripper hit the table's top rail
@@ -1539,6 +1644,7 @@ class NavigationNode(Node):
             if too_close or self.drive_forward_to(self.goal):
                 self.result = None
                 self.transition(State.WAIT_FOR_PLACE)
+                self.place_target_pub.publish(bin_pose)
                 self.finish_place_pub.publish(Bool(data=True))
         elif self.state == State.WAIT_FOR_PLACE_PREP:
             self.stop()

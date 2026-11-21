@@ -7,12 +7,12 @@ package_name = 'solution_4to1mux'
 
 setup(
     name=package_name,
-    version='0.8.1',
+    version='0.10.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml', 'readme.md', 'CHANGELOG_RUNTIME.md', 'VALIDATION.txt']),
+        ('share/' + package_name, ['package.xml', 'readme.md', 'CHANGELOG_RUNTIME.md', 'CHANGELOG_TEXT_EDGE_GENTLE.md', 'VALIDATION.txt']),
         # Launch files must be installed or `ros2 launch` can't find them,
         # even though they exist in the source tree.
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),

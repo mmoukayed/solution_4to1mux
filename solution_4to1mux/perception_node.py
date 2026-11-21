@@ -1,13 +1,10 @@
 """Live RGB-D target detection; no Gazebo model poses or fixed column ordering."""
-import csv
-import io
 import math
+import json
 import shutil
-import subprocess
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from difflib import SequenceMatcher
 from pathlib import Path
 
 import cv2
@@ -17,103 +14,22 @@ from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PointStamped, PoseStamped
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.duration import Duration
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Bool, Int32, String
 from tf2_ros import Buffer, TransformListener, TransformException
 
+from .text_detection import normalized_label, label_matches, read_text_label_boxes, WHITE_BOOK_TITLES
+from .book_geometry import measure_book, divider_bounds
+from .target_geometry import masked_surface
 from .digit_detector import DigitDetector
 from .ros_topics import configure_ros
 from .alignment import angle_delta, fit_shelf_line
-from .geometry import depth_median, plausible_bin_range, pose_xyz, row_for_height, transform_matrix, yaw
+from .geometry import depth_median, pose_xyz, row_for_height, transform_matrix, yaw
 
 SENSOR_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
-
-
-def normalized_label(text):
-    return ''.join(character for character in text.casefold() if character.isalnum())
-
-
-def label_matches(candidate, target):
-    candidate, target = normalized_label(candidate), normalized_label(target)
-    if candidate == target:
-        return True
-    return (len(target) >= 5 and abs(len(candidate)-len(target)) <= 1
-            and SequenceMatcher(None, candidate, target).ratio() >= 0.90)
-
-
-def read_text_label_boxes(crop, target):
-    """Read exact target labels printed vertically along book spines.
-
-    Tesseract runs in a worker thread so book search continues while OCR is
-    processing. The returned boxes use coordinates in the unrotated crop.
-    """
-    if crop.size == 0:
-        return []
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
-    gray = cv2.equalizeHist(gray)
-    scale = 3
-    matches = []
-    rotations = (
-        ('ccw', cv2.rotate(gray, cv2.ROTATE_90_COUNTERCLOCKWISE)),
-        ('cw', cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE)),
-    )
-    for direction, rotated in rotations:
-        enlarged = cv2.resize(rotated, None, fx=scale, fy=scale,
-                              interpolation=cv2.INTER_CUBIC)
-        success, encoded = cv2.imencode('.png', enlarged)
-        if not success:
-            continue
-        result = subprocess.run(
-            ['tesseract', 'stdin', 'stdout', '--psm', '11', '-l', 'eng', 'tsv'],
-            input=encoded.tobytes(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            check=False, timeout=1.5)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.decode(errors='replace').strip()
-                               or 'Tesseract returned a non-zero status.')
-        lines = {}
-        reader = csv.DictReader(io.StringIO(result.stdout.decode(errors='replace')),
-                                delimiter='\t')
-        for word in reader:
-            if word.get('level') != '5' or not word.get('text', '').strip():
-                continue
-            try:
-                confidence = float(word['conf'])
-                x, y = int(word['left']), int(word['top'])
-                width, height = int(word['width']), int(word['height'])
-                key = tuple(int(word[name]) for name in
-                            ('page_num', 'block_num', 'par_num', 'line_num'))
-            except (KeyError, TypeError, ValueError):
-                continue
-            if confidence < 18:
-                continue
-            group = lines.setdefault(key, {'words': [], 'confidence': [],
-                                           'left': x, 'top': y,
-                                           'right': x+width, 'bottom': y+height})
-            group['words'].append((int(word['word_num']), word['text']))
-            group['confidence'].append(confidence)
-            group['left'] = min(group['left'], x)
-            group['top'] = min(group['top'], y)
-            group['right'] = max(group['right'], x+width)
-            group['bottom'] = max(group['bottom'], y+height)
-        for group in lines.values():
-            text = ''.join(word for _, word in sorted(group['words']))
-            if not label_matches(text, target):
-                continue
-            left = group['left']/scale
-            top = group['top']/scale
-            width = (group['right']-group['left'])/scale
-            height = (group['bottom']-group['top'])/scale
-            crop_height, crop_width = gray.shape
-            if direction == 'ccw':
-                box = (crop_width-top-height, left, height, width)
-            else:
-                box = (top, crop_height-left-width, height, width)
-            confidence = float(np.mean(group['confidence']))
-            matches.append((tuple(int(round(value)) for value in box), confidence, text))
-    return matches
 
 
 # Bands apply to the unmodified camera feed. The November live frames include
@@ -227,7 +143,7 @@ class PerceptionNode(Node):
         topics = self.ros.topics
         defaults = {
             'shelf_column_number': 1, 'book_colour': 'red', 'book_text': '',
-            'perception_rate': 8.0, 'book_text_ocr_period': 0.45,
+            'perception_rate': 8.0, 'book_text_ocr_period': 0.45, 'book_text_colour_hint': '',
             'erc_images_dir': str(Path.cwd() / 'erc_images'),
             'template_dir': str(Path(get_package_share_directory('solution_4to1mux')) / 'templates'),
             # registered depth is in the colour camera's pixels: project from the colour frame
@@ -237,7 +153,7 @@ class PerceptionNode(Node):
             # Current simulator: marker centre 1.93 m, top active book 1.595 m.
             'marker_min_height': 1.60 if self.ros.profile == 'real' else 1.75, 'marker_max_height': 2.55,
             'column_half_width': 0.43, 'top_book_marker_offset': 0.335,
-            'row_spacing': 0.33, 'bin_min_area_fraction': 0.006,
+            'row_spacing': 0.33, 'bin_min_area_fraction': 0.002,
             'floor_calibration_period': 1.0,
             # the gripper's visible centroid in its own frame (calibrated on the fault-free twin)
             'hand_frame': 'gripper_right_base_link', 'hand_bias': [-0.038, 0.020, -0.116],
@@ -256,6 +172,15 @@ class PerceptionNode(Node):
         self.target_text = str(self.get_parameter('book_text').value).strip()
         if self.target_column not in range(1, 6) or (not self.target_text and self.target_colour not in STRICT):
             raise ValueError('shelf_column_number must be 1..5; set book_colour to red/green/blue/yellow or provide book_text')
+        if self.target_text and normalized_label(self.target_text) not in [normalized_label(t) for t in WHITE_BOOK_TITLES]:
+            raise ValueError('book_text must be ROBOT, LIBRARY, AGENT or FUTURE')
+        self.text_colour_hint = str(self.get_parameter('book_text_colour_hint').value).strip().lower()
+        if self.text_colour_hint and self.text_colour_hint not in STRICT:
+            raise ValueError('book_text_colour_hint must be empty or red/green/blue/yellow')
+        if self.target_text and len(normalized_label(self.target_text)) < 2:
+            raise ValueError('book_text must contain at least two letters/digits')
+        self.text_book_colour = None
+        self.text_grasp_origin = self.text_grasp_normal = None
         if self.target_text and shutil.which('tesseract') is None:
             raise RuntimeError('book_text requires Tesseract OCR. Install it in the simulator container with: apt install tesseract-ocr')
         self.images_dir = Path(self.get_parameter('erc_images_dir').value)
@@ -290,6 +215,7 @@ class PerceptionNode(Node):
         self.tilt_samples = 0
         self.processed = None
         self.mode = 'shelf'
+        self.bin_candidate, self.bin_stamp, self.bin_hits = None, None, 0
         self.bin_candidate = None
         self.bin_hits = 0
         self.bin_candidate_stamp = None
@@ -310,6 +236,8 @@ class PerceptionNode(Node):
         self.ocr_pending_context = None
         self.ocr_result_context = None
         self.ocr_boxes = []
+        self.ocr_readings = []
+        self.held_ocr_handled = -1
         self.ocr_sequence = 0
         self.ocr_handled = 0
         self.ocr_submit_at = -100.0
@@ -326,6 +254,8 @@ class PerceptionNode(Node):
         self.create_subscription(Bool, topics['looking_for_bin'], self.on_mode, 10)
         self.create_subscription(Bool, topics['measure_hand'], self.on_measure_hand, 10)
         self.create_subscription(Bool, topics['check_held'], self.on_check_held, 10)
+        self.create_subscription(PoseStamped, topics['grasp_target_pose'], self.on_grasp_target,
+                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.held_pub = self.create_publisher(Bool, topics['book_held'], 10)
         self.held_until = 0.0
         self.held_votes = []
@@ -336,13 +266,14 @@ class PerceptionNode(Node):
         self.shelf_pub = self.create_publisher(PoseStamped, topics['shelf_pose'], 10)
         self.unit_pub = self.create_publisher(PoseStamped, topics['shelf_unit_pose'], 10)
         self.book_diag_pub = self.create_publisher(String, topics['book_diagnostics'], 10)
+        self.geometry_pub = self.create_publisher(String, topics['book_geometry'], 10)
         self.book_pub = self.create_publisher(PoseStamped, topics['book_pose'], 10)
         self.bin_pub = self.create_publisher(PoseStamped, topics['bin_pose'], 10)
         self.column_pub = self.create_publisher(Int32, topics['shelf_column_identification'], 10)
         self.row_pub = self.create_publisher(Int32, topics['shelf_row_identification'], 10)
         self.create_timer(1.0/self.get_parameter('perception_rate').value, self.process)
         self.get_logger().info(
-            f'Perception BUILD 8.1: column {self.target_column}, '
+            f'Perception BUILD 10.0: column {self.target_column}, '
             f'{"text="+self.target_text if self.target_text else self.target_colour}; '
             f'marker height {self.get_parameter("marker_min_height").value:.2f}-'
             f'{self.get_parameter("marker_max_height").value:.2f} m')
@@ -488,6 +419,7 @@ class PerceptionNode(Node):
         if msg.data and now >= self.held_until:
             self.held_until = now+12.0
             self.held_votes = []
+            self.held_text_stamp = None
 
     def book_at_hand(self, stamp):
         """Is a book of the target colour within 18 cm of the grasp point (the fingers)? None when the
@@ -508,18 +440,120 @@ class PerceptionNode(Node):
         u, v = fx*camera[0]/camera[2]+cx, fy*camera[1]/camera[2]+cy
         if not 0 <= u < self.image.shape[1] or not 0 <= v < self.image.shape[0]:
             return None
-        for (x, y, w, h) in colour_boxes(self.image, self.target_colour, books=False):
+        colour = getattr(self, 'text_book_colour', None) if self.target_text else self.target_colour
+        if colour is None:
+            return None
+        for (x, y, w, h) in colour_boxes(self.image, colour, books=False):
             q = self.point(x+w/2, y+h/2)
-            if q is not None and np.linalg.norm(q-grasp) < 0.18:
+            if (q is not None and np.linalg.norm(q-grasp) < 0.18
+                    and (not self.target_text or self.text_book_extracted(q))):
                 return True
         return False
+
+    def on_grasp_target(self, msg):
+        if self.target_text and msg.header.frame_id == self.ros.frames['odom'] and np.isfinite(pose_xyz(msg)).all():
+            self.text_grasp_origin = pose_xyz(msg).copy()
+            heading = yaw(msg.pose.orientation)
+            self.text_grasp_normal = np.array([math.cos(heading), math.sin(heading), 0.])
+
+    def text_book_extracted(self, point):
+        # Reading the original book still sitting behind an empty gripper is
+        # not evidence of a successful grasp. Require motion out of its bay.
+        origin, normal = self.text_grasp_origin, self.text_grasp_normal
+        if origin is None or normal is None:
+            return False
+        delta = point-origin
+        return bool(np.linalg.norm(delta) > .05 and delta @ normal < -.035)
+
+    def text_spine_box(self, image, label_box):
+        """Associate an OCR label with a full coloured spine, never colour alone."""
+        x, y, w, h = label_box
+        centre = (x+w/2, y+h/2)
+        colours = [self.text_colour_hint] if self.text_colour_hint else list(STRICT)
+        candidates = []
+        for colour in colours:
+            for box in colour_boxes(image, colour):
+                bx, by, bw, bh = box
+                if bh < 1.3*bw or not (bx <= centre[0] <= bx+bw and by <= centre[1] <= by+bh):
+                    continue
+                overlap = max(0, min(x+w, bx+bw)-max(x, bx))*max(0, min(y+h, by+bh)-max(y, by))
+                if overlap >= .60*w*h:
+                    candidates.append((box, colour))
+        return candidates[0] if len(candidates) == 1 else None
+
+    def hand_text_crop(self):
+        """Read the held title in a small projected hand ROI at this RGB stamp."""
+        stamp = Time.from_msg(self.observation_stamp)
+        try:
+            tf = self.tf.lookup_transform(self.ros.frames['odom'], self.get_parameter('hand_frame').value,
+                                          stamp, timeout=Duration(seconds=.05))
+        except TransformException:
+            return None
+        hand = transform_matrix(tf.transform)
+        grasp = (hand @ np.array([0., 0., .157, 1.]))[:3]
+        camera = np.linalg.inv(self.camera_to_odom) @ np.r_[grasp, 1.]
+        if camera[2] <= .15:
+            return None
+        height, width = self.image.shape[:2]
+        fx, fy = self.info.k[0]*width/(self.info.width or width), self.info.k[4]*height/(self.info.height or height)
+        cx, cy = self.info.k[2]*width/(self.info.width or width), self.info.k[5]*height/(self.info.height or height)
+        u, v = fx*camera[0]/camera[2]+cx, fy*camera[1]/camera[2]+cy
+        if not 0 <= u < width or not 0 <= v < height:
+            return None
+        rx, ry = fx*.28/camera[2], fy*.28/camera[2]
+        x0, x1 = max(0, int(u-rx)), min(width, int(u+rx)+1)
+        y0, y1 = max(0, int(v-ry)), min(height, int(v+ry)+1)
+        if x1-x0 < 12 or y1-y0 < 12:
+            return None
+        return self.image[y0:y1, x0:x1].copy(), (x0, y0), grasp
+
+    def record_held_vote(self, vote, required=3):
+        if vote is None:
+            return
+        self.held_votes.append(bool(vote))
+        if len(self.held_votes) >= required:
+            held = sum(self.held_votes) >= required//2+1
+            self.held_pub.publish(Bool(data=held))
+            self.get_logger().info(f'Grasp check: {sum(self.held_votes)}/{len(self.held_votes)} fresh votes -> {"held" if held else "NOT held"}')
+            self.held_until = 0.
+
+    def verify_book_at_hand(self, stamp):
+        if not self.target_text or self.text_book_colour is not None:
+            self.record_held_vote(self.book_at_hand(stamp))
+            return
+        # White/neutral spines: require the exact title at the hand instead
+        # of silently using the unrelated default red colour.
+        self.update_text_search('hand')
+        if self.ocr_sequence == self.held_ocr_handled:
+            return
+        self.held_ocr_handled = self.ocr_sequence
+        context = self.ocr_result_context
+        if context is None or context.get('purpose') != 'hand' or context.get('grasp') is None:
+            return
+        age = (self.get_clock().now()-Time.from_msg(context['stamp'])).nanoseconds/1e9
+        if not 0 <= age <= 2.0:
+            return
+        captured = (context['stamp'].sec, context['stamp'].nanosec)
+        if captured == getattr(self, 'held_text_stamp', None):
+            return
+        self.held_text_stamp = captured
+        x0, y0 = context['origin']
+        for (x, y, w, h), _, recognized in self.ocr_boxes:
+            if not label_matches(recognized, self.target_text):
+                continue
+            point = self.point_in_frame(x+x0+w/2, y+y0+h/2, context['image_shape'],
+                                        context['depth_image'], context['camera_to_odom'], context['info'])
+            if (point is not None and np.linalg.norm(point-context['grasp']) < .18
+                    and self.text_book_extracted(point)):
+                self.record_held_vote(True, required=2)
+                break
 
     def on_mode(self, msg):
         mode = 'bin' if msg.data else 'shelf'
         if mode != self.mode:
             self.bin_candidate = None
             self.bin_hits = 0
-            self.bin_candidate_stamp = None
+            self.bin_stamp = None
         self.mode = mode
 
     def warn(self, text):
@@ -582,12 +616,13 @@ class PerceptionNode(Node):
             return None
         return self.image[y0:y1, x0:x1].copy(), (x0, y0)
 
-    def update_text_search(self):
+    def update_text_search(self, purpose='shelf'):
         if self.ocr_future is not None and self.ocr_future.done():
             try:
-                self.ocr_boxes = self.ocr_future.result()
+                result = self.ocr_future.result()
+                self.ocr_boxes, self.ocr_readings = result.matches, result.readings
             except Exception as error:
-                self.ocr_boxes = []
+                self.ocr_boxes, self.ocr_readings = [], []
                 self.warn(f'Text OCR failed: {error}')
             self.ocr_result_context = self.ocr_pending_context
             self.ocr_sequence += 1
@@ -596,12 +631,13 @@ class PerceptionNode(Node):
                 self.get_clock().now().nanoseconds/1e9-self.ocr_submit_at <
                 self.get_parameter('book_text_ocr_period').value):
             return
-        search = self.text_search_crop()
+        search = self.hand_text_crop() if purpose == 'hand' else self.text_search_crop()
         if search is None:
             return
-        crop, origin = search
+        crop, origin = search[:2]
         self.ocr_pending_context = {
-            'origin': origin,
+            'origin': origin, 'purpose': purpose, 'rgb_crop': crop, 'rgb_image': self.image.copy(),
+            'grasp': search[2] if purpose == 'hand' else None,
             'image_shape': self.image.shape[:2],
             'depth_image': self.depth_image.copy(),
             'camera_to_odom': self.camera_to_odom.copy(),
@@ -690,21 +726,14 @@ class PerceptionNode(Node):
         # the base turns, and a fixed depth->colour transform would smear every point by that motion
         T_cd = np.linalg.inv(self.camera_to_odom) @ (T_od @ tilt)
         self.image = self.bridge.imgmsg_to_cv2(self.rgb, 'bgr8')
+        self.surface_masks = {}
         K_c = np.array(self.info.k, float).reshape(3, 3).copy()
         K_c[0] *= self.image.shape[1]/float(self.info.width or self.image.shape[1])
         K_c[1] *= self.image.shape[0]/float(self.info.height or self.image.shape[0])
         self.observation_stamp = self.rgb.header.stamp
         self.depth_image = self.register(depth_m, K_d, T_cd, K_c, self.image.shape[1], self.image.shape[0])
-        if self.get_clock().now().nanoseconds/1e9 < self.held_until and not self.target_text:
-            vote = self.book_at_hand(stamp)
-            if vote is not None:
-                self.held_votes.append(vote)
-            if len(self.held_votes) >= 3:
-                held = sum(self.held_votes) >= 2
-                self.held_pub.publish(Bool(data=held))
-                self.get_logger().info(f'Grasp check: book at the hand in {sum(self.held_votes)}/{len(self.held_votes)} frames -> '
-                                       f'{"held" if held else "NOT held"}')
-                self.held_until = 0.0
+        if self.get_clock().now().nanoseconds/1e9 < self.held_until:
+            self.verify_book_at_hand(stamp)
         if self.get_clock().now().nanoseconds/1e9 < self.hand_until:
             c_, s__ = math.cos(self.head_tilt), math.sin(self.head_tilt)
             tilt_ = np.eye(4)
@@ -870,13 +899,15 @@ class PerceptionNode(Node):
         rejected = {'shape': 0, 'depth': 0, 'column': 0, 'plane': 0, 'row': 0}
         plane_offsets = []
         if self.target_text:
+            if self.get_clock().now().nanoseconds/1e9 < self.held_until:
+                return
             self.update_text_search()
             if self.ocr_sequence == self.ocr_handled:
                 return
             self.ocr_handled = self.ocr_sequence
             boxes = self.ocr_boxes
             context = self.ocr_result_context
-            if context is None:
+            if context is None or context.get('purpose', 'shelf') != 'shelf':
                 self.book_hits = 0
                 return
             source_stamp = context['stamp']
@@ -884,29 +915,52 @@ class PerceptionNode(Node):
                 self.book_hits = 0
                 self.book_status('OCR result too old; waiting for a current frame')
                 return
+            captured = (source_stamp.sec, source_stamp.nanosec)
+            if captured == getattr(self, 'last_text_book_stamp', None):
+                return
+            self.last_text_book_stamp = captured
             x0, y0 = context['origin']
+            candidate_colours, candidate_surfaces = {}, {}
+            vertical = [entry for entry in boxes if entry[0][3] > 1.3*entry[0][2]]
+            if not vertical:
+                self.book_status('Title not yet confirmed on a vertical spine; waiting for a front view.')
+                return
+            boxes = vertical
             for local_box, confidence, recognized in boxes:
+                if not label_matches(recognized, self.target_text):
+                    continue
                 x, y, w, h = local_box
-                box = (x+x0, y+y0, w, h)
-                p = self.point_in_frame(
-                    box[0]+w/2, box[1]+h/2, context['image_shape'],
-                    context['depth_image'], context['camera_to_odom'], context['info'])
-                if p is None:
+                label_box = (x+x0, y+y0, w, h)
+                surface = measure_book(context['rgb_image'], context['depth_image'],
+                    context['camera_to_odom'], context['info'], label_box, np.r_[normal, 0.], white=True)
+                if surface is None:
                     rejected['depth'] += 1
                     continue
+                box, p = tuple(surface['box']), np.array(surface['point'])
+                candidate_colours[box] = None
+                candidate_surfaces[box] = surface
                 candidates.append((box, p, None, confidence, recognized))
         else:
             source_stamp = self.observation_stamp
             boxes = colour_boxes(self.image, self.target_colour)
+            crop = self.text_search_crop()
+            if crop is not None:
+                image, (x0, y0) = crop
+                local, _ = _raw_boxes(image, RELAXED[self.target_colour], 60)
+                for x, y, w, h in local:
+                    box = (x+x0, y+y0, w, h)
+                    if not any(abs(box[0]-old[0]) < 5 and abs(box[1]-old[1]) < 5 for old in boxes):
+                        boxes.append(box)
             for box in boxes:
                 x, y, w, h = box
                 if h < 1.3*w:
                     rejected['shape'] += 1
                     continue
-                p = self.point(x+w/2, y+h/2)
-                if p is None:
+                surface = self.colour_surface(box, self.target_colour)
+                if surface is None:
                     rejected['depth'] += 1
                     continue
+                p, _, _ = surface
                 candidates.append((box, p, None, 100.0, self.target_colour))
 
         valid = []
@@ -937,24 +991,44 @@ class PerceptionNode(Node):
         valid.sort(key=lambda candidate: candidate[3], reverse=True)
         candidates = []
         for candidate in valid:
-            if not any(np.linalg.norm(candidate[1]-kept[1]) < 0.12 for kept in candidates):
+            def same_detection(kept):
+                if np.linalg.norm(candidate[1]-kept[1]) >= .12:
+                    return False
+                if not self.target_text:
+                    return True
+                x, y, w, h = candidate[0]
+                a, b, c, d = kept[0]
+                overlap = max(0, min(x+w, a+c)-max(x, a))*max(0, min(y+h, b+d)-max(y, b))
+                return overlap > .5*min(w*h, c*d)
+            if not any(same_detection(kept) for kept in candidates):
                 candidates.append(candidate)
         if len(candidates) != 1:
-            self.book_hits = 0
+            self.book_misses = getattr(self, 'book_misses', 0)+1
+            if self.book_misses > 1:
+                self.book_hits = 0
             detail = f'; plane_offsets_m={plane_offsets}' if plane_offsets else ''
+            if self.target_text:
+                detail += f'; OCR_readings={self.ocr_readings}'
             target = f'text={self.target_text!r}' if self.target_text else f'colour={self.target_colour}'
             self.book_status(f'{target}; candidates={len(boxes)}; valid_in_column={len(candidates)}; rejected={rejected}{detail}')
             return
         box, p, row, confidence, recognized = candidates[0]
-        if self.latest_book is not None and np.linalg.norm(p-self.latest_book) < 0.08:
+        observed = Time.from_msg(source_stamp).nanoseconds/1e9
+        last = getattr(self, 'last_book_observed', None)
+        if (self.latest_book is not None and np.linalg.norm(p-self.latest_book) < 0.08
+                and (last is None or 0 <= observed-last <= 1.0)):
             self.book_hits += 1
         else:
             self.book_hits = 1
         self.latest_book = p
-        required_hits = 2 if self.target_text else 3
+        self.book_misses = 0
+        self.last_book_observed = observed
+        required_hits = 3
         if self.book_hits < required_hits:
             self.book_status(f'confirming_book: {self.book_hits}/{required_hits} observations')
             return
+        if self.target_text:
+            self.text_book_colour = candidate_colours.get(box)
         target = f'text={self.target_text!r}' if self.target_text else f'colour={self.target_colour}'
         self.book_status(f'book_confirmed: {target}, row={row}, xyz={p.round(3).tolist()}')
         previous = self.filtered_book
@@ -962,6 +1036,17 @@ class PerceptionNode(Node):
                               np.linalg.norm(p-previous) < 0.12 else p.copy())
         pose = self.make_pose(self.filtered_book, heading)
         pose.header.stamp = source_stamp
+        geometry = self.publish_book_geometry(box, p, source_stamp,
+                candidate_surfaces.get(box) if self.target_text else None,
+                context if self.target_text else None)
+        if not geometry:
+            return
+        if isinstance(geometry, dict):
+            # Target the measured front-surface centre for colour books too,
+            # keeping the grasp target and its divider envelope consistent.
+            self.filtered_book = self.latest_book = np.array(geometry['point'])
+            pose = self.make_pose(self.filtered_book, heading)
+            pose.header.stamp = source_stamp
         self.book_pub.publish(pose)
         if 'row' not in self.reported:
             self.row_pub.publish(Int32(data=row))
@@ -971,41 +1056,90 @@ class PerceptionNode(Node):
                 f'Confirmed {target} book in target column, row {row}, '
                 f'confidence={confidence:.0f}, recognized={recognized!r}, xyz={p.round(3)}')
 
+    def publish_book_geometry(self, box, point, stamp, surface=None, context=None):
+        image = self.image if context is None else context['rgb_image']
+        depth = self.depth_image if context is None else context['depth_image']
+        transform = self.camera_to_odom if context is None else context['camera_to_odom']
+        info = self.info if context is None else context['info']
+        heading = yaw(self.column_pose.pose.orientation)
+        normal = np.array([math.cos(heading), math.sin(heading), 0.])
+        if surface is None:
+            surface = measure_book(image, depth, transform, info, box, normal)
+        if surface is None or np.linalg.norm(np.asarray(surface['point'])-point) > .08:
+            self.book_status('Book surface lacks stable depth/size support; holding for a clearer view.')
+            return False
+        shelf = pose_xyz(self.column_pose)
+        left, right, source = divider_bounds(depth, transform, info, image.shape[:2], shelf, normal,
+                                            point[2], self.get_parameter('column_half_width').value)
+        geometry = {**surface, 'shelf_point': shelf.tolist(), 'normal': normal.tolist(),
+                    'left': left, 'right': right, 'divider_source': source,
+                    'stamp': stamp.sec+stamp.nanosec/1e9, 'frame': self.ros.frames['odom']}
+        self.geometry_pub.publish(String(data=json.dumps(geometry)))
+        return geometry
+
+    def colour_surface(self, box, colour, maximum_depth=8.0):
+        masks = getattr(self, 'surface_masks', {})
+        if colour not in masks:
+            image = self.image
+            hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+            mask = np.zeros(image.shape[:2], np.uint8)
+            for lower, upper in RELAXED[colour]:
+                mask |= cv2.inRange(hsv, np.array(lower), np.array(upper))
+            masks[colour] = mask
+            self.surface_masks = masks
+        mask = masks[colour]
+        return masked_surface(box, mask, self.depth_image, self.camera_to_odom,
+                              self.info, maximum_depth)
+
     def process_bin(self):
         frame_area = self.image.shape[0]*self.image.shape[1]
+        image = self.image
+        # A dark red rim and an oblique view need a wider band than a book.
+        bands = [((0, 80, 45), (16, 255, 255)), ((168, 80, 45), (180, 255, 255))]
+        boxes, _ = _raw_boxes(image, bands, frame_area*self.get_parameter('bin_min_area_fraction').value)
         candidates = []
-        boxes, mask = bin_colour_candidates(
-            self.image, frame_area*self.get_parameter('bin_min_area_fraction').value)
+        rejected = {'shape': 0, 'surface_depth': 0, 'size_or_height': 0}
         for box in boxes:
-            p = bin_surface_point(box, mask, self.depth_image, self.camera_to_odom, self.info)
-            if (p is not None and 0.60 < p[2] < 1.20
-                    and plausible_bin_range(p, self.camera_to_odom[:3, 3])):
-                candidates.append((box, p))
-        # Two plausible red objects are ambiguous; keep searching instead of
-        # choosing a person/object solely because its contour is larger.
+            x, y, w, h = box
+            if not .65 <= w/max(h, 1) <= 6.0:
+                rejected['shape'] += 1
+                continue
+            surface = self.colour_surface(box, 'red', maximum_depth=4.0)
+            if surface is None:
+                rejected['surface_depth'] += 1
+                continue
+            p, metric_width, metric_height = surface
+            if not (.60 < p[2] < 1.20 and .20 <= metric_width <= 1.20 and
+                    .08 <= metric_height <= .80 and
+                    np.linalg.norm(p[:2]-self.camera_to_odom[:2, 3]) > .40):
+                rejected['size_or_height'] += 1
+                continue
+            candidates.append((w*h, box, p))
         if len(candidates) != 1:
-            self.bin_candidate = None
             self.bin_hits = 0
-            self.bin_candidate_stamp = None
+            self.bin_candidate = None
+            self.warn(f'Red drop-box search: candidates={len(boxes)}, valid={len(candidates)}, rejected={rejected}; waiting for one surface-supported box.')
             return
-        box, p = candidates[0]
-        stamp = Time.from_msg(self.observation_stamp).nanoseconds/1e9
-        previous_stamp = self.bin_candidate_stamp
-        if previous_stamp is not None and stamp <= previous_stamp:
+        _, box, p = candidates[0]
+        stamp = (self.observation_stamp.sec, self.observation_stamp.nanosec)
+        if stamp == self.bin_stamp:
             return
-        consistent = (self.bin_candidate is not None and previous_stamp is not None
-                      and stamp-previous_stamp <= 0.8
-                      and np.linalg.norm(p-self.bin_candidate) < 0.15)
+        previous = self.bin_candidate
+        consistent = (previous is not None and self.bin_stamp is not None and
+                      0 < stamp[0]+stamp[1]/1e9-(self.bin_stamp[0]+self.bin_stamp[1]/1e9) <= 1.0 and
+                      np.linalg.norm(p-previous) <= .18)
         self.bin_hits = self.bin_hits+1 if consistent else 1
-        self.bin_candidate = p.copy()
-        self.bin_candidate_stamp = stamp
+        self.bin_candidate = .65*previous+.35*p if consistent else p.copy()
+        self.bin_stamp = stamp
         if self.bin_hits < 3:
             return
+        p = self.bin_candidate
         d = p[:2]-self.camera_to_odom[:2, 3]
         self.bin_pub.publish(self.make_pose(p, math.atan2(d[1], d[0])))
         if 'bin' not in self.reported:
             self.save(box, 'collection_bin')
             self.reported.add('bin')
+            self.get_logger().info(f'Confirmed red drop box on coloured surface: xyz={p.round(3)}, camera_range={np.linalg.norm(d):.2f} m')
 
     def save(self, box, label):
         x, y, w, h = box

@@ -15,7 +15,7 @@ from solution_4to1mux.ros_topics import get_ros_config
 from solution_4to1mux.alignment import MOTION_DEFAULTS
 restore_ros = install()
 from solution_4to1mux.geometry import (ArmKinematics, body_velocity, depth_median, forward_command,
-                                      rotation, row_for_height, scan_points, wrap)
+                                      rotation, row_for_height, scan_points, wrap, pose_xyz)
 from solution_4to1mux.digit_detector import DigitDetector
 from solution_4to1mux.navigation_node import NavigationNode, State
 from solution_4to1mux.manipulation_node import HIGH_CARRY_RIGHT_ARM, ManipulationNode
@@ -60,7 +60,7 @@ def bare_nav():
     values = dict(reading_max_age=1.0, obstacle_margin=0.12, linear_speed=0.85,
                   strafe_speed=0.25, rotate_speed=0.85, search_rotate_speed=0.45,
                   phase_timeout=90, search_direction='right', docking_speed=.25,
-                  book_search_timeout=24., head_scan_dwell=1.8, max_book_recoveries=1,
+                  book_search_timeout=24., book_pose_max_age=1.2, head_scan_dwell=1.8, max_book_recoveries=1,
                   scan_half_width=2.6, scan_step=.65, scan_observe_time=1.0,
                   shelf_keepout_distance=.62, arm_stow_timeout=10.0,
                   arm_stow_settle_time=2.5, grasp_base_retreat=.25,
@@ -76,7 +76,7 @@ def bare_nav():
               'shelf_alignment_standoff': 1.35, 'shelf_alignment_strafe_speed': .12,
               'shelf_alignment_timeout': 40., 'bin_search_direction': 'left',
               'carry_turn_clearance': .85, 'table_gap': .10, 'swing_table_gap': .45,
-              'bin_min_distance': .70, 'sensor_loss_timeout': 3.0}
+              'bin_min_distance': .70, 'sensor_loss_timeout': 3.0, 'gripper_half_width': .065, 'edge_outside_allowance': .20, 'bin_lateral_offset': -.18}
     n.p = values.__getitem__
     n.now = lambda: 10.0
     n.pose = np.array([0., 0., 0.])
@@ -96,10 +96,12 @@ def bare_nav():
     n.prepare_grab_pub, n.finish_grab_pub, n.grab_pub = Pub(), Pub(), Pub()
     n.prepare_place_pub, n.finish_place_pub = Pub(), Pub()
     n.bin_mode_pub = Pub()
+    n.place_target_pub = Pub()
     n.warned = {}
     n.log = Logger()
     n.get_logger = lambda: n.log
     n.observations = {}
+    n.geometry_for_book = lambda book, **kw: dict(point=pose_xyz(book).tolist(), shelf_point=[book.pose.position.x, book.pose.position.y, 2.], normal=[1.,0.,0.], left=-.4, right=.4, width=.04, height=.24, stamp=10., depth_supported=True)
     n.arm_joints = {f'arm_{side}_{index}_joint': 0.0
                     for side in ('left', 'right') for index in range(1, 8)}
     n.arm_joint_stamp = 10.0
@@ -113,7 +115,7 @@ def bare_nav():
     n.current_book_row = 2
     n.active_shelf_keepout_distance = .62
     n.book_dock_minimum = .62
-    n.book_row_pub, n.grasp_target_pub = Pub(), Pub()
+    n.book_row_pub, n.grasp_target_pub, n.grasp_geometry_pub = Pub(), Pub(), Pub()
     n.last_command = (0., 0., 0.)
     n.last_gate = 'clear'
     n.actual_speed = 0.
@@ -216,6 +218,8 @@ def test_wrong_column_larger_colour_blob_is_rejected():
     n.column_pose = target(3., 0., 2.26)
     n.column_hits = 3
     n.point = lambda x, y: np.array([3.0, 0.1 if x < 100 else 1.0, .935])
+    n.colour_surface = lambda box, colour, **kw: (n.point(box[0]+box[2]/2, box[1]+box[3]/2), .05, .20)
+    n.text_search_crop = lambda: None
     values = {'column_half_width': .43, 'top_book_marker_offset': .665, 'row_spacing': .33}
     n.get_parameter = lambda key: NS(value=values[key])
     n.latest_book, n.book_hits = None, 0
@@ -223,6 +227,7 @@ def test_wrong_column_larger_colour_blob_is_rejected():
     n.reported = set()
     n.saved = []
     n.save = lambda b, label: n.saved.append((b, label))
+    n.publish_book_geometry = lambda *args: True
     n.make_pose = lambda p, h: target(*p)
     n.get_logger = lambda: Logger()
     for _ in range(3):
@@ -254,6 +259,8 @@ def shelf_perception(height):
                                          (2, .9, (50, 0, 20, 30))])
     n.camera_to_odom = np.eye(4)
     n.point = lambda x, y: None if height is None else np.array([3., float(x > 50), height])
+    n.colour_surface = lambda box, colour, **kw: (n.point(box[0]+box[2]/2, box[1]+box[3]/2), .05, .20)
+    n.text_search_crop = lambda: None
     values = dict(marker_min_height=1.75, marker_max_height=2.55,
                   column_half_width=.43, top_book_marker_offset=.335, row_spacing=.33)
     n.get_parameter = lambda key: NS(value=values[key])
@@ -265,6 +272,7 @@ def shelf_perception(height):
     n.get_logger = lambda: n.log
     n.warn = n.log.warn
     n.save = lambda *args: None
+    n.publish_book_geometry = lambda *args: True
     return n
 
 
@@ -297,6 +305,8 @@ def test_current_marker_mount_keeps_book_row_identification_correct(row, height)
         n.process_shelf()
     n.image[40:100, 50:65] = (0, 0, 255)
     n.point = lambda x, y: np.array([3., 1., height])
+    n.colour_surface = lambda box, colour, **kw: (n.point(box[0]+box[2]/2, box[1]+box[3]/2), .05, .20)
+    n.text_search_crop = lambda: None
     for _ in range(3):
         n.process_book()
     assert n.row_pub.messages[-1].data == row
@@ -822,12 +832,15 @@ def test_deep_colour_blob_inside_shelf_is_rejected():
     n.column_hits = 3
     depth_x = [3.40]  # 0.4 m behind the marker plane: a gap hit inside the shelf
     n.point = lambda x, y: np.array([depth_x[0], 0.1, .935])
+    n.colour_surface = lambda box, colour, **kw: (n.point(box[0]+box[2]/2, box[1]+box[3]/2), .05, .20)
+    n.text_search_crop = lambda: None
     values = {'column_half_width': .43, 'top_book_marker_offset': .665, 'row_spacing': .33}
     n.get_parameter = lambda key: NS(value=values[key])
     n.latest_book, n.book_hits = None, 0
     n.book_pub, n.row_pub, n.book_diag_pub = Pub(), Pub(), Pub()
     n.reported = set()
     n.save = lambda b, label: None
+    n.publish_book_geometry = lambda *args: True
     n.make_pose = lambda p, h: target(*p)
     n.get_logger = lambda: Logger()
     for _ in range(3):

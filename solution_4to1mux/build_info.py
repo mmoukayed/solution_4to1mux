@@ -2,9 +2,9 @@
 import hashlib
 from pathlib import Path
 
-BUILD = '8.1'
-VERSION = '0.8.1'
-CORE_FILES = ('alignment.py', 'build_info.py', 'runtime_health.py', 'ros_topics.py',
+BUILD = '10.0'
+VERSION = '0.10.0'
+CORE_FILES = ('alignment.py', 'text_detection.py', 'book_geometry.py', 'target_geometry.py', 'build_info.py', 'runtime_health.py', 'ros_topics.py',
               'geometry.py', 'digit_detector.py', 'perception_node.py',
               'navigation_node.py', 'manipulation_node.py')
 

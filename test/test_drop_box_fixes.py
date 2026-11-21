@@ -247,13 +247,17 @@ def placement_request(point, sequence='finish_place', stamp=10, hover=True):
     n.placement_hover_target = np.zeros(8) if hover else None
     n.placement_prepared_at = 9. if hover else None
     params = dict(placement_target_max_age=30., place_torso_drop=0., tf_max_age=1.,
-                  place_lateral_offset=-.18, bin_release_x=.78)
-    n.p = params.__getitem__
+                  place_lateral_offset=-.18, bin_release_x=.78, planning_timeout=60.,
+                  gentle_drop_distance=.08, gentle_lower_speed=.025, gentle_open_duration=3., bin_rim_height=.95, table_surface_height=.72)
+    n.p = lambda key: params.get(key, 0.1)  # Unused grasp parameters still travel with the worker plan.
     tf = NS(header=NS(stamp=NS(sec=10, nanosec=0)), transform=NS(translation=NS(x=0., y=0., z=0.), rotation=NS(x=0., y=0., z=0., w=1.)))
     n.tf = NS(lookup_transform=lambda *args: tf)
     reports, phases = [], []
     n.report = lambda *args: reports.append(args)
     n.next_phase = lambda: phases.extend(n.phases)
+    from concurrent.futures import Future
+    n.pool = NS(submit=lambda *args: Future())
+    n.get_logger = lambda: NS(info=lambda *args: None)
     n.request(sequence)
     return n, reports, phases
 
@@ -271,7 +275,7 @@ def test_release_requires_fresh_box_and_completed_measured_hover():
     _, reports, phases = placement_request([.8, -.18, .85], stamp=-30)
     assert reports[-1][1] is False and not phases
     n, reports, phases = placement_request([.8, -.18, .85])
-    assert not reports and phases[0][0] == 'release_book'
+    assert not reports and not phases and n.phase == 'planning'  # Must plan a gentle descent before opening.
     assert n.active == 'finish_place'
 
 

@@ -134,7 +134,9 @@ def bin_node():
     node = PerceptionNode.__new__(PerceptionNode)
     node.image, node.depth_image, node.camera_to_odom = bin_scene()
     node.info = camera_info()
-    node.bin_candidate = node.bin_candidate_stamp = None
+    node.bin_candidate = node.bin_candidate_stamp = node.bin_stamp = None
+    node.warn = lambda *args: None
+    node.get_logger = lambda: NS(info=lambda *args: None)
     node.bin_hits = 0
     node.mode = 'bin'
     node.get_parameter = lambda name: NS(value=.006)
